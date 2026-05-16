@@ -33,7 +33,7 @@ Version: ${VER}
 Section: games
 Priority: optional
 Architecture: all
-Depends: python3 (>= 3.9), python3-tk, tar, bubblewrap, zstd, xdg-utils, ca-certificates, curl | wget
+Depends: python3 (>= 3.9), python3-tk, tar, bubblewrap, zstd, xdg-utils, x11-xserver-utils, ca-certificates, curl | wget
 Recommends: mesa-vulkan-drivers | nvidia-driver
 Maintainer: BedrockOnLinux contributors <noreply@bedrockonlinux.invalid>
 Homepage: https://github.com/BedrockOnLinux/BedrockOnLinux

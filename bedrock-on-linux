@@ -22,7 +22,7 @@ from pathlib import Path
 
 APP = "bedrock-on-linux"
 PRETTY = "BedrockOnLinux"
-VERSION = "0.3.3"
+VERSION = "0.3.4"
 
 HOME = Path.home()
 DATA = Path(os.environ.get("BOL_HOME", HOME / ".local/share" / APP))
@@ -824,10 +824,30 @@ def launch(pp: "ProxyPass" = None):
     env = proton_env()
     env["PROTON_LOG"] = "1"                   # so crashes are diagnosable
     env["PROTON_LOG_DIR"] = str(LOGS)
-    if os.environ.get("DISPLAY"):
-        env["DISPLAY"] = os.environ["DISPLAY"]
-        env.setdefault("XAUTHORITY",
-                        os.environ.get("XAUTHORITY", str(HOME / ".Xauthority")))
+    disp = os.environ.get("DISPLAY")
+    if disp:
+        env["DISPLAY"] = disp
+        xa = os.environ.get("XAUTHORITY")
+        for cand in (xa, str(HOME / ".Xauthority"),
+                     f"/run/user/{os.getuid()}/.mutter-Xwaylandauth.0"):
+            if cand and Path(cand).exists():
+                env["XAUTHORITY"] = cand
+                break
+        # The pressure-vessel container often can't use the host X cookie →
+        # "no driver could be loaded". Allow the local user explicitly.
+        if shutil.which("xhost"):
+            user = os.environ.get("USER") or os.environ.get("LOGNAME") or ""
+            for arg in (f"+SI:localuser:{user}", "+local:"):
+                try:
+                    # inherit the GUI's working X env (don't strip it)
+                    subprocess.run(["xhost", arg],
+                                    stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL, timeout=5)
+                except Exception:
+                    pass
+    elif os.environ.get("WAYLAND_DISPLAY"):
+        warn("Session Wayland sans DISPLAY X — installe XWayland, "
+             "ou lance depuis une session X11 (Wine-Wayland est instable).")
     exe = str(CONTENT / "Minecraft.Windows.exe")
     info("Launching Minecraft … (in game: Play ▸ Friends ▸ join the LAN game)")
     glog = open(LOGS / "minecraft.log", "w")
