@@ -22,7 +22,7 @@ from pathlib import Path
 
 APP = "bedrock-on-linux"
 PRETTY = "BedrockOnLinux"
-VERSION = "0.3.2"
+VERSION = "0.3.3"
 
 HOME = Path.home()
 DATA = Path(os.environ.get("BOL_HOME", HOME / ".local/share" / APP))
@@ -667,6 +667,27 @@ def setup_prefix(game_dir: Path):
     ok("Wine prefix ready")
 
 
+def kill_wine():
+    """Kill leftover wine/wineserver for our Proton (a hard-killed hung run
+    locks the prefix → next launch: 'no driver could be loaded')."""
+    for pat in ("wineserver", "winedevice.exe", "GDK-Proton",
+                "Minecraft.Windows.exe", "umu_run.py", "umu-shim",
+                "pv-adverb"):
+        _pkill(pat)
+
+
+def reset_prefix():
+    """Repair a corrupted Wine prefix (rebuilt on next launch)."""
+    kill_wine()
+    time.sleep(1)
+    if PREFIX.exists():
+        shutil.rmtree(PREFIX, ignore_errors=True)
+    s = load_settings()
+    s["prefix_ready"] = False
+    save_settings(s)
+    ok("Wine prefix reset — it will be rebuilt cleanly on next launch.")
+
+
 OPTIONS_REL = ("drive_c/users/steamuser/AppData/Roaming/Minecraft Bedrock/"
                "Users/Shared/games/com.mojang/minecraftpe/options.txt")
 
@@ -752,6 +773,11 @@ _DIAG_RULES = [
      r"RPC_S_SERVER_UNAVAILABLE",
      "Service GameInput indisponible (instable sous Wine) — souvent lié au "
      "gel ci-dessus ; l'alignement de versions le contourne en pratique."),
+    (r"nodrv_CreateWindow|no driver could be loaded|"
+     r"explorer process failed to start",
+     "Prefix Wine CASSÉ (souvent après un arrêt forcé du jeu) : le jeu sort "
+     "sans fenêtre. Clique « Réparer » (ou: bedrock-on-linux repair) puis "
+     "relance."),
 ]
 
 
@@ -794,7 +820,7 @@ def launch(pp: "ProxyPass" = None):
     if not pp.running():
         info("Starting ProxyPass (multiplayer relay) …")
         pp.start()
-    _pkill("Minecraft.Windows.exe")          # no stale game instance
+    kill_wine()                              # clear any hung/locking wine
     env = proton_env()
     env["PROTON_LOG"] = "1"                   # so crashes are diagnosable
     env["PROTON_LOG_DIR"] = str(LOGS)
@@ -1040,6 +1066,10 @@ def gui():
                command=lambda: subprocess.Popen(
                    ["xdg-open", str(LOGS)], stdout=subprocess.DEVNULL,
                    stderr=subprocess.DEVNULL)).pack(side="left", padx=10)
+    ttk.Button(foot, text="🛠  Réparer",
+               command=lambda: threading.Thread(
+                   target=reset_prefix, daemon=True).start()
+               ).pack(side="left")
     btn_play = ttk.Button(foot, text="▶    JOUER", style="Accent.TButton",
                           command=lambda: act("play"))
     btn_play.pack(side="right")
@@ -1134,6 +1164,7 @@ def main():
     cf = sub.add_parser("config", help="show/set settings")
     cf.add_argument("--server", help="destination server  host:port")
     sub.add_parser("doctor", help="check host requirements")
+    sub.add_parser("repair", help="reset a broken Wine prefix")
     sub.add_parser("gui", help="graphical launcher")
 
     a = p.parse_args()
@@ -1167,6 +1198,8 @@ def main():
                 print(json.dumps(st, indent=2))
         elif a.cmd == "doctor":
             sys.exit(0 if doctor() else 1)
+        elif a.cmd == "repair":
+            reset_prefix()
         elif a.cmd == "gui":
             gui()
         else:
