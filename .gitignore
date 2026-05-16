@@ -1,0 +1,7 @@
+dist/
+*.part
+*.bol-orig
+__pycache__/
+*.pyc
+.idea/
+.vscode/

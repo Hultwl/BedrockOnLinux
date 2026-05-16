@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=BedrockOnLinux
+GenericName=Minecraft Bedrock Launcher
+Comment=Run Minecraft Bedrock (Windows GDK) on Linux, multiplayer included
+Exec=bedrock-on-linux gui
+Icon=bedrock-on-linux
+Terminal=false
+Categories=Game;
+Keywords=minecraft;bedrock;gdk;wine;proton;
+StartupNotify=true

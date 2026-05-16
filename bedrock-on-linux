@@ -1,0 +1,899 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+#
+# BedrockOnLinux — Run Minecraft Bedrock (Windows GDK build) on any Linux,
+# multiplayer included, with everything bundled. No 40 apps to install.
+#
+# SPDX-License-Identifier: MIT
+# Project: https://github.com/BedrockOnLinux/BedrockOnLinux  (placeholder)
+#
+# What it does, fully automatically, in ONE binary:
+#   * downloads GDK-Proton (Weather-OS) and binary-patches it so Minecraft
+#     Bedrock GDK actually launches under Wine (combase.RoOriginateErrorW +
+#     ntdll stub_entry_point — the two fixes that make it work);
+#   * downloads umu-launcher (Steam Linux Runtime) so it runs on every distro;
+#   * downloads a bundled Java 25 + the ProxyPass build matching YOUR Minecraft
+#     version, and runs it in the background so multiplayer works (WineGDK has
+#     no in-game Microsoft login; ProxyPass authenticates outside Wine);
+#   * sets up the Wine prefix, SSL/curl, GameInput, options.txt;
+#   * launches the game.
+#
+# It NEVER downloads Minecraft itself. You must provide your own legally
+# obtained Bedrock GDK files (extracted from your Windows/Xbox install).
+#
+# Host requirements (present on virtually every Linux): python3, tar,
+# curl OR wget, and bubblewrap (`bwrap`). Run `bedrock-on-linux doctor`.
+
+import argparse
+import json
+import os
+import re
+import shutil
+import signal
+import struct
+import subprocess
+import sys
+import tarfile
+import threading
+import time
+import urllib.request
+import urllib.error
+from pathlib import Path
+
+APP = "bedrock-on-linux"
+VERSION = "0.1.0"
+
+HOME = Path.home()
+DATA = Path(os.environ.get("BOL_HOME", HOME / ".local/share" / APP))
+PROTON_DIR = DATA / "proton"
+UMU_DIR = DATA / "umu"
+JRE_DIR = DATA / "jre"
+PROXY_DIR = DATA / "proxypass"
+PREFIX = DATA / "prefix"
+CONTENT = DATA / "content"          # symlink -> user's Bedrock GDK folder
+CACHE = DATA / "cache"
+LOGS = DATA / "logs"
+SETTINGS = DATA / "settings.json"
+
+GDK_PROTON_REPO = "Weather-OS/GDK-Proton"
+UMU_REPO = "Open-Wine-Components/umu-launcher"
+PROXYPASS_REPO = "Kas-tle/ProxyPass"
+MINGW_CURL = "https://mirror.msys2.org/mingw/mingw64/mingw-w64-x86_64-curl-8.17.0-1-any.pkg.tar.zst"
+CACERT_URL = "https://curl.se/ca/cacert.pem"
+TEMURIN_JRE25 = "https://api.adoptium.net/v3/binary/latest/25/ga/linux/x64/jre/hotspot/normal/eclipse"
+
+IS_TTY = sys.stdout.isatty()
+
+
+# --------------------------------------------------------------------------- #
+#  small utilities
+# --------------------------------------------------------------------------- #
+def c(txt, color):
+    if not IS_TTY:
+        return txt
+    codes = {"g": "32", "y": "33", "r": "31", "b": "34", "c": "36", "d": "2"}
+    return f"\033[{codes.get(color,'0')}m{txt}\033[0m"
+
+
+def info(m): print(f"{c('::','c')} {m}", flush=True)
+def ok(m):   print(f"{c('OK','g')} {m}", flush=True)
+def warn(m): print(f"{c('!!','y')} {m}", flush=True)
+def err(m):  print(f"{c('xx','r')} {m}", file=sys.stderr, flush=True)
+
+
+def die(m, code=1):
+    err(m)
+    sys.exit(code)
+
+
+def run(cmd, **kw):
+    kw.setdefault("check", True)
+    return subprocess.run(cmd, **kw)
+
+
+def mkdirs():
+    for d in (DATA, PROTON_DIR, UMU_DIR, JRE_DIR, PROXY_DIR, CACHE, LOGS):
+        d.mkdir(parents=True, exist_ok=True)
+
+
+def load_settings():
+    if SETTINGS.exists():
+        try:
+            return json.loads(SETTINGS.read_text())
+        except Exception:
+            pass
+    return {}
+
+
+def save_settings(s):
+    DATA.mkdir(parents=True, exist_ok=True)
+    SETTINGS.write_text(json.dumps(s, indent=2))
+
+
+def http_json(url):
+    req = urllib.request.Request(url, headers={"User-Agent": APP, "Accept": "application/vnd.github+json"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.loads(r.read().decode())
+
+
+def download(url, dest: Path, label=None):
+    label = label or dest.name
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    req = urllib.request.Request(url, headers={"User-Agent": APP})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            total = int(r.headers.get("Content-Length", 0))
+            got = 0
+            with open(tmp, "wb") as f:
+                while True:
+                    chunk = r.read(1 << 16)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    got += len(chunk)
+                    if IS_TTY and total:
+                        pct = got * 100 // total
+                        print(f"\r{c('::','c')} {label}: {pct:3d}%  "
+                              f"({got>>20}/{total>>20} MiB)", end="", flush=True)
+        if IS_TTY:
+            print()
+    except urllib.error.URLError as e:
+        die(f"Download failed for {url}: {e}")
+    tmp.replace(dest)
+    return dest
+
+
+def gh_latest(repo):
+    return http_json(f"https://api.github.com/repos/{repo}/releases/latest")
+
+
+def gh_releases(repo, per_page=40):
+    return http_json(f"https://api.github.com/repos/{repo}/releases?per_page={per_page}")
+
+
+def asset_url(release, predicate):
+    for a in release.get("assets", []):
+        if predicate(a["name"]):
+            return a["browser_download_url"], a["name"]
+    return None, None
+
+
+# --------------------------------------------------------------------------- #
+#  minimal PE reader (pure stdlib) — RVA/offset maps + exports (PE32+/x64)
+# --------------------------------------------------------------------------- #
+class PE:
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        d = self.data = self.path.read_bytes()
+        if d[:2] != b"MZ":
+            raise ValueError("not a PE")
+        e = struct.unpack_from("<I", d, 0x3C)[0]
+        if d[e:e + 4] != b"PE\0\0":
+            raise ValueError("bad PE signature")
+        coff = e + 4
+        nsec = struct.unpack_from("<H", d, coff + 2)[0]
+        opt = coff + 20
+        if struct.unpack_from("<H", d, opt)[0] != 0x20B:
+            raise ValueError("not PE32+")
+        self.exp_rva = struct.unpack_from("<I", d, opt + 112)[0]
+        sect = opt + struct.unpack_from("<H", d, coff + 16)[0]
+        self.secs = []
+        for i in range(nsec):
+            b = sect + i * 40
+            vsz, va, rsz, raw = struct.unpack_from("<IIII", d, b + 8)
+            self.secs.append((va, vsz, raw, rsz))
+
+    def rva2off(self, rva):
+        for va, vsz, raw, rsz in self.secs:
+            if va <= rva < va + max(vsz, rsz):
+                return raw + (rva - va)
+        return None
+
+    def off2rva(self, off):
+        for va, vsz, raw, rsz in self.secs:
+            if raw <= off < raw + rsz:
+                return va + (off - raw)
+        return None
+
+    def export_rva(self, name):
+        d = self.data
+        eo = self.rva2off(self.exp_rva)
+        if eo is None:
+            return None
+        nn = struct.unpack_from("<I", d, eo + 24)[0]
+        af = self.rva2off(struct.unpack_from("<I", d, eo + 28)[0])
+        an = self.rva2off(struct.unpack_from("<I", d, eo + 32)[0])
+        ao = self.rva2off(struct.unpack_from("<I", d, eo + 36)[0])
+        t = name.encode()
+        for i in range(nn):
+            no = self.rva2off(struct.unpack_from("<I", d, an + 4 * i)[0])
+            if d[no:d.index(b"\0", no)] == t:
+                od = struct.unpack_from("<H", d, ao + 2 * i)[0]
+                return struct.unpack_from("<I", d, af + 4 * od)[0]
+        return None
+
+    def export_off(self, name):
+        r = self.export_rva(name)
+        return self.rva2off(r) if r is not None else None
+
+
+def _backup_once(path: Path):
+    bk = path.with_suffix(path.suffix + ".bol-orig")
+    if not bk.exists():
+        shutil.copy2(path, bk)
+    return bk
+
+
+def apply_patch(path: Path, off: int, expect: bytes, new: bytes, what: str):
+    """Idempotent, reversible single patch with a safety check."""
+    raw = bytearray(path.read_bytes())
+    if bytes(raw[off:off + len(new)]) == new:
+        info(f"{what}: already patched")
+        return False
+    if bytes(raw[off:off + len(expect)]) != expect:
+        die(f"{what}: unexpected bytes at 0x{off:x} "
+            f"({bytes(raw[off:off+len(expect)]).hex()}) — refusing to patch.")
+    _backup_once(path)
+    raw[off:off + len(new)] = new
+    path.write_bytes(raw)
+    ok(f"{what}: patched at 0x{off:x}")
+    return True
+
+
+# --------------------------------------------------------------------------- #
+#  step 1 — GDK-Proton (download + the two essential patches)
+# --------------------------------------------------------------------------- #
+def proton_path():
+    s = load_settings()
+    p = s.get("proton")
+    return Path(p) if p else None
+
+
+def ensure_proton(force=False):
+    s = load_settings()
+    cur = proton_path()
+    if cur and cur.exists() and not force:
+        return cur
+    info("Fetching latest GDK-Proton release …")
+    rel = gh_latest(GDK_PROTON_REPO)
+    tag = rel["tag_name"]
+    url, fname = asset_url(rel, lambda n: n.endswith(".tar.gz"))
+    if not url:
+        die("No GDK-Proton tarball asset found.")
+    tar = CACHE / fname
+    if not tar.exists():
+        download(url, tar, f"GDK-Proton {tag}")
+    info("Extracting GDK-Proton (this is ~1.5 GiB) …")
+    for d in PROTON_DIR.glob("GDK-Proton*"):
+        shutil.rmtree(d, ignore_errors=True)
+    with tarfile.open(tar) as t:
+        t.extractall(PROTON_DIR)
+    root = next(PROTON_DIR.glob("GDK-Proton*"))
+    if not (root / "proton").exists():
+        die("Extracted GDK-Proton looks wrong (no 'proton' entrypoint).")
+    s["proton"] = str(root)
+    s["proton_tag"] = tag
+    save_settings(s)
+    ok(f"GDK-Proton {tag} → {root}")
+    patch_proton(root)
+    return root
+
+
+def patch_proton(root: Path):
+    """The two fixes that make Minecraft Bedrock GDK 1.26 run under Wine.
+    Idempotent and version-robust: locations are found structurally, not
+    hardcoded, and the originals are kept as *.bol-orig."""
+    wine = root / "files/lib/wine/x86_64-windows"
+    combase = wine / "combase.dll"
+    ntdll = wine / "ntdll.dll"
+    if not combase.exists() or not ntdll.exists():
+        die(f"GDK-Proton Wine DLLs not found under {wine}")
+
+    # (1) combase.dll: RoOriginateErrorW is a __wine_stub_ that aborts the
+    #     game during the package-identity check. -> `xor eax,eax; ret`.
+    off = PE(combase).export_off("RoOriginateErrorW")
+    if off is None:
+        die("Could not locate RoOriginateErrorW export in combase.dll")
+    apply_patch(combase, off,
+                bytes.fromhex("4883ec28"),                  # sub $0x28,%rsp
+                bytes.fromhex("31c0c3") + b"\x90" * 21,      # xor eax,eax; ret
+                "combase.RoOriginateErrorW")
+
+    # (2) ntdll.dll: Wine routes unimplemented imports (NtQueryWnfStateData via
+    #     GameInput) through stub funnels that raise EXCEPTION_WINE_STUB and
+    #     kill the game ~10 min in. ntdll has SEVERAL identical funnels; we
+    #     neutralise every one that provably is such a funnel:
+    #       prologue 55 53 48 81 EC C8 00 00 00 48 8D AC 24 C0 00 00 00
+    #       + `mov rcx,rbx; call <rel32>` whose target == RtlRaiseException
+    #       + immediately followed by `EB F6` (jmp-loop: it never returns)
+    #     -> entry becomes `mov eax,0xC0000002 (STATUS_NOT_IMPLEMENTED); ret`.
+    pe = PE(ntdll)
+    rre = pe.export_rva("RtlRaiseException")
+    if rre is None:
+        die("Could not resolve RtlRaiseException in ntdll.dll")
+    d = pe.data
+    sig = bytes.fromhex("55534881ecc8000000488dac24c0000000")
+    new = bytes.fromhex("b8020000c0c3") + b"\x90\x90"       # mov eax,..; ret
+    funnels, i = [], d.find(sig)
+    while i >= 0:
+        j = d.find(bytes.fromhex("4889d9e8"), i, i + 0x90)   # mov rcx,rbx; call
+        if j >= 0:
+            callfo = j + 3                                   # offset of E8
+            rel = struct.unpack_from("<i", d, callfo + 1)[0]
+            if (pe.off2rva(callfo) + 5 + rel == rre
+                    and d[callfo + 5:callfo + 7] == b"\xeb\xf6"):
+                funnels.append(i)
+        i = d.find(sig, i + 1)
+
+    if funnels:
+        raw = bytearray(d)
+        for off in funnels:
+            raw[off:off + len(new)] = new
+        _backup_once(ntdll)
+        ntdll.write_bytes(raw)
+        ok(f"ntdll: neutralised {len(funnels)} unimplemented-stub funnel(s)")
+    else:
+        # already patched? our patch leaves bytes [6:] = 90 90 00 48 8D AC ...
+        if d.count(new + bytes.fromhex("00488dac24c0000000")) > 0:
+            info("ntdll: already patched")
+        else:
+            die("ntdll: no stub funnel matched — Proton layout changed.")
+
+
+# --------------------------------------------------------------------------- #
+#  step 2 — umu-launcher (Steam Linux Runtime → runs on every distro)
+# --------------------------------------------------------------------------- #
+def umu_run_bin():
+    cand = UMU_DIR / "umu-run"
+    return cand if cand.exists() else None
+
+
+def ensure_umu(force=False):
+    if umu_run_bin() and not force:
+        return umu_run_bin()
+    info("Fetching umu-launcher …")
+    rel = gh_latest(UMU_REPO)
+    url, fname = asset_url(rel, lambda n: n.endswith("zipapp.tar") or n == "umu-run")
+    if not url:
+        # fall back: any tarball, look for umu-run inside
+        url, fname = asset_url(rel, lambda n: n.endswith(".tar") or n.endswith(".tar.gz"))
+    if not url:
+        die("No umu-launcher asset found.")
+    pkg = CACHE / fname
+    download(url, pkg, "umu-launcher")
+    if fname == "umu-run":
+        shutil.copy2(pkg, UMU_DIR / "umu-run")
+    else:
+        with tarfile.open(pkg) as t:
+            t.extractall(UMU_DIR)
+        found = next((p for p in UMU_DIR.rglob("umu-run")), None)
+        if not found:
+            die("umu-run not found in umu-launcher package.")
+        if found != UMU_DIR / "umu-run":
+            shutil.copy2(found, UMU_DIR / "umu-run")
+    os.chmod(UMU_DIR / "umu-run", 0o755)
+    ok(f"umu-run → {UMU_DIR/'umu-run'}")
+    return UMU_DIR / "umu-run"
+
+
+# --------------------------------------------------------------------------- #
+#  step 3 — bundled Java 25 (ProxyPass requires class-file 69 = Java 25)
+# --------------------------------------------------------------------------- #
+def java_bin():
+    j = JRE_DIR / "bin/java"
+    return j if j.exists() else None
+
+
+def ensure_jre(force=False):
+    if java_bin() and not force:
+        return java_bin()
+    info("Fetching bundled Java 25 (Temurin) …")
+    tgz = CACHE / "temurin-jre25.tar.gz"
+    download(TEMURIN_JRE25, tgz, "Java 25")
+    for x in JRE_DIR.iterdir() if JRE_DIR.exists() else []:
+        shutil.rmtree(x, ignore_errors=True) if x.is_dir() else x.unlink()
+    JRE_DIR.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(tgz) as t:
+        members = t.getmembers()
+        top = members[0].name.split("/")[0]
+        t.extractall(JRE_DIR)
+    extracted = JRE_DIR / top
+    for item in extracted.iterdir():
+        shutil.move(str(item), str(JRE_DIR / item.name))
+    extracted.rmdir()
+    os.chmod(JRE_DIR / "bin/java", 0o755)
+    ok(f"Java 25 → {JRE_DIR/'bin/java'}")
+    return JRE_DIR / "bin/java"
+
+
+# --------------------------------------------------------------------------- #
+#  step 4 — ProxyPass build matching the user's Minecraft version
+# --------------------------------------------------------------------------- #
+def mc_version(game_dir: Path):
+    """Derive Bedrock game version 'MAJOR.MINOR.PATCH' from appxmanifest."""
+    man = game_dir / "appxmanifest.xml"
+    if not man.exists():
+        man = game_dir / "AppxManifest.xml"
+    if man.exists():
+        m = re.search(r'Identity[^>]*Version="(\d+)\.(\d+)\.(\d+)\.(\d+)"',
+                      man.read_text(errors="ignore"))
+        if m:
+            mj, mn, p3 = m.group(1), m.group(2), m.group(3)
+            patch = int(p3[:2]) if len(p3) >= 2 else int(p3)
+            return f"{mj}.{mn}.{patch}"
+    return None
+
+
+def _ver_tuple(v):
+    try:
+        return tuple(int(x) for x in v.split("."))
+    except Exception:
+        return (0,)
+
+
+def pick_proxypass(game_dir: Path):
+    ver = mc_version(game_dir)
+    rels = gh_releases(PROXYPASS_REPO, 50)
+    pres = []
+    for r in rels:
+        t = r["tag_name"]
+        m = re.match(r"pre/(\d+\.\d+\.\d+)-\d+$", t)
+        if m:
+            pres.append((m.group(1), r))
+    chosen = None
+    if ver and pres:
+        exact = [r for v, r in pres if v == ver]
+        if exact:
+            chosen = exact[0]
+        else:
+            le = sorted([(v, r) for v, r in pres if _ver_tuple(v) <= _ver_tuple(ver)],
+                        key=lambda x: _ver_tuple(x[0]))
+            if le:
+                chosen = le[-1][1]
+    if not chosen:
+        chosen = next((r for r in rels if r["tag_name"].startswith("master-")), rels[0])
+    return chosen, ver
+
+
+def ensure_proxypass(game_dir: Path, force=False):
+    jar = PROXY_DIR / "ProxyPass.jar"
+    s = load_settings()
+    if jar.exists() and not force and s.get("proxypass_tag"):
+        return jar
+    rel, ver = pick_proxypass(game_dir)
+    url, _ = asset_url(rel, lambda n: n == "ProxyPass.jar")
+    if not url:
+        die("ProxyPass.jar asset not found.")
+    PROXY_DIR.mkdir(parents=True, exist_ok=True)
+    download(url, jar, f"ProxyPass {rel['tag_name']}")
+    s["proxypass_tag"] = rel["tag_name"]
+    s["mc_version"] = ver
+    save_settings(s)
+    ok(f"ProxyPass {rel['tag_name']} (Minecraft {ver or '?'}) → {jar}")
+    return jar
+
+
+def proxypass_config(server_host, server_port):
+    PROXY_DIR.mkdir(parents=True, exist_ok=True)
+    cfg = PROXY_DIR / "config.yml"
+    cfg.write_text(f"""## Auto-generated by {APP}. Edit 'destination' for another server.
+proxy:
+  host: 0.0.0.0      # discovered by Minecraft as a LAN game (Friends tab)
+  port: 19132
+destination:
+  host: {server_host}
+  port: {server_port}
+online-mode: true     # ProxyPass authenticates your Microsoft account
+save-auth-details: true
+broadcast-session: false
+max-clients: 0
+packet-testing: false
+log-packets: false
+log-to: file
+enable-ui: false
+follow-transfers: true
+download-packs: true
+invert-ignored-list: false
+ignored-packets:
+  - "NetworkStackLatencyPacket"
+  - "LevelChunkPacket"
+  - "MovePlayerPacket"
+  - "PlayerAuthInputPacket"
+  - "NetworkChunkPublisherUpdatePacket"
+  - "ClientCacheBlobStatusPacket"
+  - "ClientCacheMissResponsePacket"
+""")
+    return cfg
+
+
+# --------------------------------------------------------------------------- #
+#  step 5 — game content (SSL/curl fix) + Wine prefix + options.txt
+# --------------------------------------------------------------------------- #
+def link_content(game_dir: Path):
+    game_dir = game_dir.expanduser().resolve()
+    exe = game_dir / "Minecraft.Windows.exe"
+    if not exe.exists():
+        die(f"Minecraft.Windows.exe not found in {game_dir}")
+    if CONTENT.is_symlink() or CONTENT.exists():
+        if CONTENT.is_symlink():
+            CONTENT.unlink()
+        else:
+            shutil.rmtree(CONTENT)
+    CONTENT.symlink_to(game_dir)
+    s = load_settings()
+    s["game_dir"] = str(game_dir)
+    save_settings(s)
+    return game_dir
+
+
+def fix_curl_ssl(game_dir: Path):
+    """Replace stub XCurl.dll with real libcurl + CA bundle (online play)."""
+    xcurl = game_dir / "XCurl.dll"
+    if (game_dir / "XCurl.dll.bol-orig").exists():
+        return
+    info("Installing real libcurl + CA certificates …")
+    pkg = CACHE / "mingw-curl.pkg.tar.zst"
+    if not pkg.exists():
+        download(MINGW_CURL, pkg, "libcurl")
+    extract = CACHE / "mingw-curl"
+    extract.mkdir(exist_ok=True)
+    try:
+        run(["tar", "--use-compress-program=unzstd", "-xf", str(pkg),
+             "-C", str(extract)], capture_output=True)
+    except Exception:
+        run(["tar", "-xf", str(pkg), "-C", str(extract)])
+    libcurl = next(extract.rglob("libcurl-4.dll"))
+    if xcurl.exists() and not (game_dir / "XCurl.dll.bol-orig").exists():
+        shutil.copy2(xcurl, game_dir / "XCurl.dll.bol-orig")
+    for nm in ("XCurl.dll", "Xcurl.dll"):
+        shutil.copy2(libcurl, game_dir / nm)
+    certs = PREFIX / "etc/ssl/certs"
+    certs.mkdir(parents=True, exist_ok=True)
+    if not (certs / "ca-bundle.crt").exists():
+        download(CACERT_URL, certs / "ca-bundle.crt", "CA bundle")
+    ok("libcurl + SSL ready")
+
+
+def proton_env(extra=None):
+    root = proton_path()
+    env = dict(os.environ)
+    env.update({
+        "GAMEID": "0",
+        "PROTONPATH": str(root),
+        "PROTON_VERB": "run",
+        "WINEPREFIX": str(PREFIX),
+        "STEAM_COMPAT_CLIENT_INSTALL_PATH": str(HOME / ".steam/steam"),
+        "UMU_RUNTIME_UPDATE": "0",
+    })
+    (HOME / ".steam/steam").mkdir(parents=True, exist_ok=True)
+    if extra:
+        env.update(extra)
+    return env
+
+
+def umu(args, env=None, **kw):
+    return run([sys.executable, str(ensure_umu())] + args,
+               env=env or proton_env(), **kw)
+
+
+def setup_prefix(game_dir: Path):
+    PREFIX.mkdir(parents=True, exist_ok=True)
+    s = load_settings()
+    if not s.get("prefix_ready"):
+        info("Initialising Wine prefix (first time, please wait) …")
+        umu(["wineboot", "--init"], capture_output=True)
+        msi = game_dir / "Installers/GameInputRedist.msi"
+        if msi.exists():
+            info("Installing GameInput redistributable …")
+            try:
+                umu(["msiexec", "/i", str(msi), "/qn"], capture_output=True)
+            except subprocess.CalledProcessError:
+                warn("GameInputRedist.msi returned non-zero (often harmless).")
+        s["prefix_ready"] = True
+        save_settings(s)
+        ok("Wine prefix ready")
+
+
+OPTIONS_REL = ("drive_c/users/steamuser/AppData/Roaming/Minecraft Bedrock/"
+               "Users/Shared/games/com.mojang/minecraftpe/options.txt")
+
+
+def patch_options():
+    opt = PREFIX / OPTIONS_REL
+    if not opt.exists():
+        return
+    lines = opt.read_text(errors="ignore").splitlines()
+    kv, order = {}, []
+    for l in lines:
+        if ":" in l:
+            k, _, v = l.partition(":")
+            k = k.strip()
+            if k not in kv:
+                order.append(k)
+            kv[k] = v.strip()
+    if kv.get("do_not_show_multiplayer_online_safety_warning") == "1":
+        return
+    if "do_not_show_multiplayer_online_safety_warning" not in order:
+        order.append("do_not_show_multiplayer_online_safety_warning")
+    kv["do_not_show_multiplayer_online_safety_warning"] = "1"
+    opt.write_text("\n".join(f"{k}:{kv[k]}" for k in order) + "\n")
+    ok("options.txt: multiplayer safety warning disabled")
+
+
+# --------------------------------------------------------------------------- #
+#  ProxyPass background process (with Microsoft device-code surfacing)
+# --------------------------------------------------------------------------- #
+class ProxyPass:
+    def __init__(self):
+        self.proc = None
+        self.auth = None      # (url, code) when login is required
+
+    def start(self, on_auth=None):
+        jar = PROXY_DIR / "ProxyPass.jar"
+        log = open(LOGS / "proxypass.log", "w")
+        self.proc = subprocess.Popen(
+            [str(ensure_jre()), "-jar", str(jar)],
+            cwd=str(PROXY_DIR), stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, bufsize=1)
+
+        def pump():
+            for line in self.proc.stdout:
+                log.write(line)
+                log.flush()
+                m = re.search(r"(https?://\S*microsoft\.com/link\S*)", line, re.I)
+                m2 = re.search(r"code\s+([A-Z0-9]{6,9})", line)
+                if m or m2:
+                    url = (m.group(1) if m else "https://www.microsoft.com/link")
+                    code = m2.group(1) if m2 else None
+                    self.auth = (url, code)
+                    if on_auth:
+                        on_auth(url, code)
+                    info(c(f"ProxyPass login: open {url} and enter code "
+                            f"{code or '(see logs)'}", "y"))
+        threading.Thread(target=pump, daemon=True).start()
+
+    def stop(self):
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(5)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+
+
+# --------------------------------------------------------------------------- #
+#  doctor — verify host has the (very few) required tools
+# --------------------------------------------------------------------------- #
+def detect_pm():
+    for pm, hint in (("apt-get", "sudo apt install {}"),
+                     ("dnf", "sudo dnf install {}"),
+                     ("pacman", "sudo pacman -S {}"),
+                     ("zypper", "sudo zypper install {}")):
+        if shutil.which(pm):
+            return hint
+    return "install with your package manager: {}"
+
+
+def doctor():
+    info(f"{APP} {VERSION} — host check")
+    hint = detect_pm()
+    pkgs = {"bwrap": "bubblewrap", "tar": "tar", "curl": "curl"}
+    missing = []
+    print(f"  python3 : {sys.version.split()[0]}")
+    for tool, pkg in pkgs.items():
+        have = shutil.which(tool)
+        print(f"  {tool:8}: {c('found','g') if have else c('MISSING','r')}")
+        if not have and not (tool == "curl" and shutil.which("wget")):
+            missing.append(pkg)
+    if missing:
+        warn("Missing tools. Install them with:")
+        print("   " + hint.format(" ".join(sorted(set(missing)))))
+        return False
+    ok("Host is ready.")
+    return True
+
+
+# --------------------------------------------------------------------------- #
+#  high-level commands
+# --------------------------------------------------------------------------- #
+def cmd_setup(args):
+    mkdirs()
+    if not doctor():
+        die("Fix host requirements first (see above).")
+    game = args.game_dir or load_settings().get("game_dir")
+    if not game:
+        die("Provide your Bedrock GDK folder:  "
+            f"{APP} setup --game-dir /path/to/'Minecraft for Windows'")
+    game = Path(game).expanduser()
+    link_content(game)
+    ensure_proton(force=args.force)
+    ensure_umu(force=args.force)
+    ensure_jre(force=args.force)
+    ensure_proxypass(game, force=args.force)
+    fix_curl_ssl(game)
+    setup_prefix(game)
+    s = load_settings()
+    s.setdefault("server", {"host": "geo.hivebedrock.network", "port": 19132})
+    save_settings(s)
+    proxypass_config(s["server"]["host"], s["server"]["port"])
+    ok("Setup complete.  Launch with:  " + c(f"{APP} play", "g"))
+
+
+def cmd_config(args):
+    s = load_settings()
+    srv = s.setdefault("server", {"host": "geo.hivebedrock.network", "port": 19132})
+    if args.server:
+        host, _, port = args.server.partition(":")
+        srv["host"] = host
+        srv["port"] = int(port) if port else 19132
+        save_settings(s)
+        proxypass_config(srv["host"], srv["port"])
+        ok(f"Server set to {srv['host']}:{srv['port']}")
+    else:
+        print(json.dumps(s, indent=2))
+
+
+def preflight():
+    s = load_settings()
+    game = s.get("game_dir")
+    if not game or not Path(game, "Minecraft.Windows.exe").exists():
+        die(f"Not set up. Run:  {APP} setup --game-dir <folder>")
+    if not proton_path():
+        die(f"GDK-Proton missing. Run:  {APP} setup")
+    return Path(game)
+
+
+def cmd_play(args):
+    game = preflight()
+    s = load_settings()
+    patch_proton(proton_path())          # idempotent — survives Proton updates
+    proxypass_config(s["server"]["host"], s["server"]["port"])
+
+    pp = ProxyPass()
+    info("Starting ProxyPass (multiplayer relay) in background …")
+    pp.start()
+
+    env = proton_env()
+    # We default to X11 (Wine-Wayland proved fragile); pass session through.
+    if os.environ.get("DISPLAY"):
+        env["DISPLAY"] = os.environ["DISPLAY"]
+        env.setdefault("XAUTHORITY", os.environ.get(
+            "XAUTHORITY", str(HOME / ".Xauthority")))
+    exe = str(CONTENT / "Minecraft.Windows.exe")
+    info(c("Launching Minecraft Bedrock …", "g"))
+    print(c("  → In game: Play ▸ Friends tab ▸ join the LAN game "
+            "(NOT 'Servers'/'Add server', which WineGDK greys out).", "d"))
+    glog = open(LOGS / "minecraft.log", "w")
+    try:
+        subprocess.run([sys.executable, str(ensure_umu()), exe],
+                       env=env, cwd=str(CONTENT),
+                       stdout=glog, stderr=subprocess.STDOUT)
+    finally:
+        patch_options()                  # safe now that the game has exited
+        pp.stop()
+        ok("Game closed; ProxyPass stopped.")
+
+
+def cmd_doctor(args):
+    sys.exit(0 if doctor() else 1)
+
+
+def cmd_gui(args):
+    try:
+        import tkinter as tk
+        from tkinter import filedialog, messagebox
+    except Exception:
+        warn("Tkinter not available; falling back to CLI.")
+        return cmd_play(args) if load_settings().get("game_dir") else cmd_setup(args)
+
+    s = load_settings()
+    root = tk.Tk()
+    root.title(f"BedrockOnLinux {VERSION}")
+    root.geometry("560x360")
+    pad = {"padx": 10, "pady": 6}
+
+    tk.Label(root, text="Minecraft Bedrock — Linux", font=("", 15, "bold")).pack(**pad)
+
+    frm = tk.Frame(root)
+    frm.pack(fill="x", **pad)
+    tk.Label(frm, text="Bedrock GDK folder:").grid(row=0, column=0, sticky="w")
+    gv = tk.StringVar(value=s.get("game_dir", ""))
+    tk.Entry(frm, textvariable=gv, width=44).grid(row=0, column=1)
+
+    def browse():
+        d = filedialog.askdirectory(title="Folder with Minecraft.Windows.exe")
+        if d:
+            gv.set(d)
+    tk.Button(frm, text="…", command=browse).grid(row=0, column=2)
+
+    tk.Label(frm, text="Server (host:port):").grid(row=1, column=0, sticky="w", pady=4)
+    sv = tk.StringVar(value=f"{s.get('server',{}).get('host','geo.hivebedrock.network')}:"
+                            f"{s.get('server',{}).get('port',19132)}")
+    tk.Entry(frm, textvariable=sv, width=44).grid(row=1, column=1)
+
+    status = tk.StringVar(value="Ready.")
+    tk.Label(root, textvariable=status, fg="#555").pack(**pad)
+    log = tk.Text(root, height=7, width=64, bg="#111", fg="#3f3")
+    log.pack(**pad)
+
+    def logln(m):
+        log.insert("end", m + "\n")
+        log.see("end")
+        root.update()
+
+    def do(action):
+        st = load_settings()
+        host, _, port = sv.get().partition(":")
+        st["server"] = {"host": host, "port": int(port or 19132)}
+        if gv.get():
+            st["game_dir"] = gv.get()
+        save_settings(st)
+
+        def worker():
+            try:
+                if action == "setup":
+                    status.set("Setting up… (downloads, one time)")
+                    logln(":: Setup started")
+                    a = argparse.Namespace(game_dir=gv.get(), force=False)
+                    cmd_setup(a)
+                    logln("OK Setup complete")
+                    status.set("Setup complete — press Play.")
+                else:
+                    status.set("Launching… ProxyPass + Minecraft")
+                    logln(":: Launching")
+                    cmd_play(argparse.Namespace())
+            except SystemExit as e:
+                logln(f"xx {e}")
+                status.set("Error — see log / terminal.")
+            except Exception as e:
+                logln(f"xx {e}")
+                status.set("Error.")
+        threading.Thread(target=worker, daemon=True).start()
+
+    bar = tk.Frame(root)
+    bar.pack(**pad)
+    tk.Button(bar, text="Setup / Update", width=16,
+              command=lambda: do("setup")).grid(row=0, column=0, padx=6)
+    tk.Button(bar, text="▶ Play", width=16, bg="#2e7d32", fg="white",
+              command=lambda: do("play")).grid(row=0, column=1, padx=6)
+    root.mainloop()
+
+
+def main():
+    p = argparse.ArgumentParser(
+        prog=APP, description="Run Minecraft Bedrock (GDK) on any Linux, "
+                              "multiplayer included — everything bundled.")
+    sub = p.add_subparsers(dest="cmd")
+
+    sp = sub.add_parser("setup", help="download & prepare everything")
+    sp.add_argument("--game-dir", help="folder containing Minecraft.Windows.exe")
+    sp.add_argument("--force", action="store_true", help="re-download components")
+    sp.set_defaults(func=cmd_setup)
+
+    pl = sub.add_parser("play", help="launch the game + ProxyPass")
+    pl.set_defaults(func=cmd_play)
+
+    cf = sub.add_parser("config", help="show/set settings")
+    cf.add_argument("--server", help="destination server  host:port")
+    cf.set_defaults(func=cmd_config)
+
+    sub.add_parser("doctor", help="check host requirements").set_defaults(func=cmd_doctor)
+    sub.add_parser("gui", help="graphical launcher").set_defaults(func=cmd_gui)
+
+    args = p.parse_args()
+    if not args.cmd:
+        # default: GUI if a display exists, else help
+        if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+            return cmd_gui(args)
+        p.print_help()
+        return
+    args.func(args)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print()
+        sys.exit(130)
