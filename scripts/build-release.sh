@@ -55,4 +55,4 @@ ls -1sh "$OUT" 2>/dev/null | grep -E '\.(deb|AppImage|tar\.gz)$' || true
 echo
 echo "Tag & publish (needs a GitHub remote + gh):"
 echo "  git tag -a v$VER -m 'BedrockOnLinux v$VER' && git push origin v$VER"
-echo "  gh release create v$VER dist/* -F RELEASE.md -t 'BedrockOnLinux v$VER'"
+echo "  gh release create v$VER dist/* -t 'BedrockOnLinux v$VER'"

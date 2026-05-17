@@ -33,13 +33,13 @@ Version: ${VER}
 Section: games
 Priority: optional
 Architecture: all
-Depends: python3 (>= 3.9), python3-tk, tar, bubblewrap, zstd, xdg-utils, x11-xserver-utils, ca-certificates, curl | wget
+Depends: python3 (>= 3.9), python3-tk, tar, zstd, xdg-utils, x11-xserver-utils, ca-certificates, curl | wget
 Recommends: mesa-vulkan-drivers | nvidia-driver
 Maintainer: BedrockOnLinux contributors <noreply@bedrockonlinux.invalid>
 Homepage: https://github.com/BedrockOnLinux/BedrockOnLinux
 Description: Run Minecraft Bedrock (Windows GDK) on Linux, multiplayer included
  One graphical launcher that downloads and binary-patches GDK-Proton,
- umu-launcher, a bundled Java and the matching ProxyPass, then launches
+ a bundled Java and the matching ProxyPass relay, then launches
  Minecraft Bedrock with multiplayer working via a background relay.
  No game files are shipped; you supply your own.
 EOF
@@ -55,6 +55,10 @@ chmod 755 "$PKG/DEBIAN/postinst"
 
 DEB="$OUT/bedrock-on-linux_${VER}_all.deb"
 dpkg-deb --build --root-owner-group "$PKG" "$DEB" >/dev/null
+rm -rf "$PKG"
+ls "$OUT"/*.deb 2>/dev/null | grep -v "_${VER}_" | xargs -r rm -f
+ls "$OUT"/*.AppImage 2>/dev/null | grep -v "${VER}" | xargs -r rm -f
+ls "$OUT"/*portable.tar.gz 2>/dev/null | grep -v "${VER}" | xargs -r rm -f
 echo "Built: $DEB"
 dpkg-deb -I "$DEB" | sed -n '1,12p'
 echo "Install:  sudo apt install $DEB     (or: sudo dpkg -i $DEB)"

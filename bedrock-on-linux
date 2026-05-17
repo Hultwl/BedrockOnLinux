@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # BedrockOnLinux — install & run Minecraft Bedrock (Windows GDK) on Linux.
-# One app: GDK-Proton (auto-patched) + umu + ProxyPass + bundled Java.
+# GDK-Proton (auto-patched) + ProxyPass relay + bundled Java.
 # SPDX-License-Identifier: MIT
 
 import argparse
@@ -22,7 +22,7 @@ from pathlib import Path
 
 APP = "bedrock-on-linux"
 PRETTY = "BedrockOnLinux"
-VERSION = "0.3.5"
+VERSION = "0.5.0"
 
 HOME = Path.home()
 DATA = Path(os.environ.get("BOL_HOME", HOME / ".local/share" / APP))
@@ -30,7 +30,8 @@ PROTON_DIR = DATA / "proton"
 UMU_DIR = DATA / "umu"
 JRE_DIR = DATA / "jre"
 PROXY_DIR = DATA / "proxypass"
-PREFIX = DATA / "prefix"
+COMPAT = DATA / "compatdata"          # Proton-managed Wine prefix lives here
+PFX = COMPAT / "pfx"
 GAMES = DATA / "games"
 CONTENT = DATA / "content"
 CACHE = DATA / "cache"
@@ -80,7 +81,8 @@ def run(cmd, **kw):
 
 
 def mkdirs():
-    for d in (DATA, PROTON_DIR, UMU_DIR, JRE_DIR, PROXY_DIR, CACHE, LOGS, GAMES):
+    for d in (DATA, PROTON_DIR, UMU_DIR, JRE_DIR, PROXY_DIR, CACHE, LOGS,
+              GAMES):
         d.mkdir(parents=True, exist_ok=True)
 
 
@@ -217,14 +219,14 @@ def _backup_once(path: Path):
 def apply_patch(path: Path, off, expect, new, what):
     raw = bytearray(path.read_bytes())
     if bytes(raw[off:off + len(new)]) == new:
-        info(f"{what}: already patched")
+        info(f"{what} : déjà patché")
         return False
     if bytes(raw[off:off + len(expect)]) != expect:
-        die(f"{what}: unexpected bytes at 0x{off:x} — refusing to patch.")
+        die(f"{what} : octets inattendus à 0x{off:x} — patch annulé.")
     _backup_once(path)
     raw[off:off + len(new)] = new
     path.write_bytes(raw)
-    ok(f"{what}: patched at 0x{off:x}")
+    ok(f"{what} : patché")
     return True
 
 
@@ -248,37 +250,40 @@ def ensure_proton(tag=None, force=False, progress=None):
     rel = (next((r for r in gh_releases(GDK_PROTON_REPO, 20)
                  if r["tag_name"] == tag), None) if tag else gh_latest(GDK_PROTON_REPO))
     if not rel:
-        die(f"GDK-Proton release '{tag}' not found")
+        die(f"Version GDK-Proton « {tag} » introuvable.")
     tag = rel["tag_name"]
+    if cur and cur.exists() and s.get("proton_tag") == tag:
+        info(f"GDK-Proton déjà à jour ({tag})")
+        return cur
     url, fname, _ = asset_url(rel, lambda n: n.endswith(".tar.gz"))
     if not url:
-        die("No GDK-Proton tarball asset.")
+        die("Archive GDK-Proton introuvable.")
     tar = CACHE / fname
     if not tar.exists():
-        info(f"Downloading GDK-Proton {tag} …")
+        info(f"Téléchargement de GDK-Proton {tag} …")
         download(url, tar, f"GDK-Proton {tag}", progress)
-    info("Extracting GDK-Proton (~1.5 GiB) …")
+    info("Extraction de GDK-Proton (~1.5 Gio) …")
     for d in PROTON_DIR.glob("GDK-Proton*"):
         shutil.rmtree(d, ignore_errors=True)
     with tarfile.open(tar) as t:
         t.extractall(PROTON_DIR)
     root = next(PROTON_DIR.glob("GDK-Proton*"))
     if not (root / "proton").exists():
-        die("Bad GDK-Proton archive.")
+        die("Archive GDK-Proton invalide.")
     s["proton"], s["proton_tag"] = str(root), tag
     save_settings(s)
-    ok(f"GDK-Proton {tag} ready")
+    ok(f"GDK-Proton {tag} prêt")
     patch_proton(root)
     return root
 
 
 def patch_proton(root: Path):
-    """The two fixes that make Bedrock GDK 1.26 run under Wine. Idempotent,
-    version-robust (locations found structurally), backups as *.bol-orig."""
+    """Two binary patches that let Bedrock GDK 1.26 run under Wine.
+    Idempotent; offsets found structurally; backups as *.bol-orig."""
     wine = root / "files/lib/wine/x86_64-windows"
     combase, ntdll = wine / "combase.dll", wine / "ntdll.dll"
     if not combase.exists() or not ntdll.exists():
-        die(f"Wine DLLs missing under {wine}")
+        die(f"DLL Wine manquantes dans {wine}")
 
     # (1) combase.RoOriginateErrorW stub aborts at the package-identity check.
     off = PE(combase).export_off("RoOriginateErrorW")
@@ -314,46 +319,18 @@ def patch_proton(root: Path):
             raw[o:o + len(new)] = new
         _backup_once(ntdll)
         ntdll.write_bytes(raw)
-        ok(f"ntdll: neutralised {len(funnels)} stub funnel(s)")
+        ok(f"ntdll : {len(funnels)} stub(s) neutralisé(s)")
     elif d.count(new + bytes.fromhex("00488dac24c0000000")):
-        info("ntdll: already patched")
+        info("ntdll : déjà patché")
     else:
-        die("ntdll: no stub funnel matched — Proton layout changed.")
-
-
-def ensure_umu(force=False):
-    binp = UMU_DIR / "umu-run"
-    if binp.exists() and not force:
-        return binp
-    rel = gh_latest(UMU_REPO)
-    url, fname, _ = asset_url(rel, lambda n: n.endswith("zipapp.tar") or n == "umu-run")
-    if not url:
-        url, fname, _ = asset_url(rel, lambda n: n.endswith((".tar", ".tar.gz")))
-    if not url:
-        die("No umu-launcher asset.")
-    pkg = CACHE / fname
-    info("Downloading umu-launcher …")
-    download(url, pkg, "umu-launcher")
-    if fname == "umu-run":
-        shutil.copy2(pkg, binp)
-    else:
-        with tarfile.open(pkg) as t:
-            t.extractall(UMU_DIR)
-        found = next((p for p in UMU_DIR.rglob("umu-run")), None)
-        if not found:
-            die("umu-run not in package.")
-        if found != binp:
-            shutil.copy2(found, binp)
-    os.chmod(binp, 0o755)
-    ok("umu-launcher ready")
-    return binp
+        die("ntdll : aucun stub trouvé — structure Proton modifiée.")
 
 
 def ensure_jre(force=False):
     j = JRE_DIR / "bin/java"
     if j.exists() and not force:
         return j
-    info("Downloading bundled Java 25 …")
+    info("Téléchargement de Java 25 …")
     tgz = CACHE / "temurin-jre25.tar.gz"
     download(TEMURIN_JRE25, tgz, "Java 25")
     if JRE_DIR.exists():
@@ -367,7 +344,7 @@ def ensure_jre(force=False):
         shutil.move(str(item), str(JRE_DIR / item.name))
     ext.rmdir()
     os.chmod(j, 0o755)
-    ok("Java 25 ready")
+    ok("Java 25 prêt")
     return j
 
 
@@ -385,34 +362,59 @@ def list_mc_versions(include_beta=True):
     return out
 
 
-def download_game(ver, progress=None):
-    """ver: dict from list_mc_versions(). Returns the game folder."""
+def _game_root(dest):
+    """Folder of a complete extracted build (exe + appxmanifest), else None
+    (a bare exe with no manifest means a truncated extract → reinstall)."""
+    if not dest.exists():
+        return None
+    for exe in dest.rglob("Minecraft.Windows.exe"):
+        if any((exe.parent / m).exists()
+               for m in ("appxmanifest.xml", "AppxManifest.xml")):
+            return exe.parent
+    return None
+
+
+def download_game(ver, progress=None, force=False):
+    """ver: a list_mc_versions() entry. force re-extracts (re-downloads
+    only if the archive isn't cached)."""
     GAMES.mkdir(parents=True, exist_ok=True)
     dest = GAMES / ver["tag"]
-    exe = next(dest.rglob("Minecraft.Windows.exe"), None) if dest.exists() else None
-    if exe:
-        return exe.parent
+    root = _game_root(dest)
+    if root and not force:
+        info(f"Minecraft {ver['tag']} déjà installé")
+        return root
     zp = CACHE / ver["name"]
     if not zp.exists():
-        info(f"Downloading Minecraft {ver['tag']} (~{ver['size']>>20} MiB) …")
+        info(f"Téléchargement de Minecraft {ver['tag']} "
+             f"(~{ver['size']>>20} Mio) …")
         download(ver["url"], zp, f"Minecraft {ver['tag']}", progress)
-    info("Extracting game …")
+    info(f"{'Réinstallation' if root else 'Installation'} de Minecraft "
+         f"{ver['tag']} …")
     if dest.exists():
         shutil.rmtree(dest)
     dest.mkdir(parents=True)
     with zipfile.ZipFile(zp) as z:
         z.extractall(dest)
-    exe = next(dest.rglob("Minecraft.Windows.exe"), None)
-    if not exe:
-        die("Minecraft.Windows.exe not found in archive.")
-    ok(f"Minecraft {ver['tag']} installed")
-    return exe.parent
+    root = _game_root(dest)
+    if not root:
+        die("Minecraft.Windows.exe absent de l'archive.")
+    ok(f"Minecraft {ver['tag']} installé")
+    return root
 
 
 def use_game_dir(folder):
     folder = Path(folder).expanduser().resolve()
     if not (folder / "Minecraft.Windows.exe").exists():
-        die(f"Minecraft.Windows.exe not found in {folder}")
+        # Often a parent of version sub-folders → take the newest build.
+        cands = list(folder.rglob("Minecraft.Windows.exe"))
+        if not cands:
+            die(f"Minecraft.Windows.exe introuvable dans {folder} (ni dans "
+                f"ses sous-dossiers). Choisis un dossier de version "
+                f"décompressée, ou utilise « ① Version Minecraft ».")
+        best = max(cands, key=lambda e: _vt(mc_version_str(e.parent) or "0"))
+        folder = best.parent
+        info(f"Minecraft trouvé : {folder} "
+             f"(version {mc_version_str(folder) or '?'})")
     if CONTENT.is_symlink() or CONTENT.exists():
         CONTENT.unlink() if CONTENT.is_symlink() else shutil.rmtree(CONTENT)
     CONTENT.symlink_to(folder)
@@ -451,26 +453,24 @@ def list_proxypass_tags():
 def pick_proxypass(game_dir):
     ver = mc_version_str(game_dir)
     rels = gh_releases(PROXYPASS_REPO, 50)
-    pres = [(m.group(1), r) for r in rels
-            for m in [re.match(r"pre/(\d+\.\d+\.\d+)-\d+$", r["tag_name"])] if m]
-    chosen = None
-    if ver and pres:
-        ex = [r for v, r in pres if v == ver]
-        le = sorted([(v, r) for v, r in pres if _vt(v) <= _vt(ver)],
-                    key=lambda x: _vt(x[0]))
-        chosen = ex[0] if ex else (le[-1][1] if le else None)
-    if not chosen:
-        chosen = next((r for r in rels if r["tag_name"].startswith("master-")),
-                      rels[0])
+    # ProxyPass must speak the client's exact Bedrock protocol or it drops
+    # the login silently (→ infinite "locating server"). pre/X.Y.Z is the
+    # protocol-matched build for MC X.Y.Z; master-* tracks an older protocol
+    # and only fits when no pre/ matches the installed version.
+    exact = next(
+        (r for r in rels
+         for m in [re.match(r"pre/(\d+\.\d+\.\d+)-\d+$", r["tag_name"])]
+         if m and ver and m.group(1) == ver), None)
+    chosen = exact or next(
+        (r for r in rels if r["tag_name"].startswith("master-")), rels[0])
     return chosen, ver
 
 
 def ensure_proxypass(game_dir, tag=None, force=False, progress=None):
     jar = PROXY_DIR / "ProxyPass.jar"
     s = load_settings()
-    if jar.exists() and not force and s.get("proxypass_tag") and \
-            (not tag or s.get("proxypass_tag") == tag):
-        return jar
+    # Resolve the wanted build first — in "auto" it depends on the chosen
+    # Minecraft version, so re-evaluate every time.
     if tag:
         rel = next((r for r in gh_releases(PROXYPASS_REPO, 50)
                     if r["tag_name"] == tag), None)
@@ -478,17 +478,22 @@ def ensure_proxypass(game_dir, tag=None, force=False, progress=None):
     else:
         rel, ver = pick_proxypass(game_dir)
     if not rel:
-        die(f"ProxyPass '{tag}' not found")
+        die(f"ProxyPass « {tag} » introuvable.")
+    want = rel["tag_name"]
+    if jar.exists() and not force and s.get("proxypass_tag") == want:
+        info(f"ProxyPass déjà à jour ({want}, MC {ver or '?'})")
+        return jar
+    prev = s.get("proxypass_tag")
     url, _, _ = asset_url(rel, lambda n: n == "ProxyPass.jar")
     if not url:
-        die("ProxyPass.jar asset missing.")
+        die("Asset ProxyPass.jar manquant.")
     PROXY_DIR.mkdir(parents=True, exist_ok=True)
-    info(f"Downloading ProxyPass {rel['tag_name']} …")
-    download(url, jar, f"ProxyPass {rel['tag_name']}", progress)
-    s["proxypass_tag"] = rel["tag_name"]
+    info(f"ProxyPass {prev or '∅'} → {want} (MC {ver or '?'}) …")
+    download(url, jar, f"ProxyPass {want}", progress)
+    s["proxypass_tag"] = want
     s["mc_version"] = ver
     save_settings(s)
-    ok(f"ProxyPass {rel['tag_name']} (MC {ver or '?'}) ready")
+    ok(f"ProxyPass {want} (MC {ver or '?'}) prêt")
     return jar
 
 
@@ -506,11 +511,11 @@ save-auth-details: true
 broadcast-session: false
 max-clients: 0
 packet-testing: false
-log-packets: false
-log-to: file
+log-packets: true
+log-to: both
 enable-ui: false
 follow-transfers: true
-download-packs: false
+download-packs: true
 invert-ignored-list: false
 ignored-packets:
   - "NetworkStackLatencyPacket"
@@ -524,7 +529,10 @@ ignored-packets:
 
 
 def proxypass_signed_in():
-    d = PROXY_DIR / "data"
+    f = PROXY_DIR / "auth.json"          # cached Microsoft token
+    if f.is_file() and f.stat().st_size > 2:
+        return True
+    d = PROXY_DIR / "data"          # older ProxyPass layout
     return d.is_dir() and any(d.iterdir())
 
 
@@ -546,19 +554,21 @@ def _pkill(pattern):
 
 
 class ProxyPass:
-    """Single global instance. Stale ProxyPass processes (from a previous
-    run / repeated clicks) are killed first, otherwise it fails to bind
-    0.0.0.0:19132 (BindException) and multiplayer silently breaks."""
+    """The multiplayer relay. Stale instances are killed before start so
+    the 0.0.0.0:19132 bind never fails."""
 
     def __init__(self):
         self.proc = None
         self.auth = None        # (url, code)
         self.online = False
+        self.dest = None        # (host, port) the running relay points at
+        self.client_seen = False
+        self.ready = False
 
     def running(self):
         return self.proc and self.proc.poll() is None
 
-    def start(self, on_auth=None, on_online=None):
+    def start(self, on_auth=None, on_online=None, dest=None):
         if self.running():
             return
         _pkill("ProxyPass.jar")          # free 19132 from any stale instance
@@ -568,6 +578,11 @@ class ProxyPass:
         log = open(LOGS / "proxypass.log", "w")
         self.auth = None
         self.online = False
+        self.client_seen = False
+        self.ready = False
+        self.dest = dest
+        if dest:
+            info(f"Relais → {dest[0]}:{dest[1]} (local :19132)")
         self.proc = subprocess.Popen(
             [str(java), "-jar", str(jar)], cwd=str(PROXY_DIR),
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
@@ -576,11 +591,11 @@ class ProxyPass:
             for line in self.proc.stdout:
                 log.write(line)
                 log.flush()
+                msg = line.strip().split("]: ")[-1].split(" - ")[-1]
                 if re.search(r"Address already in use|Failed to bind", line, re.I):
-                    err("ProxyPass: port 19132 occupé — relais multijoueur KO. "
-                        "Ferme les autres instances et relance.")
-                u = re.search(r"(https?://\S*microsoft\.com/(?:link|devicelogin)\S*)",
-                              line, re.I)
+                    err("Port 19132 occupé — ferme les autres instances.")
+                u = re.search(r"(https?://\S*microsoft\.com/"
+                              r"(?:link|devicelogin)\S*)", line, re.I)
                 cd = re.search(r"\bcode[:\s]+([A-Z0-9]{6,9})\b", line, re.I)
                 if u or cd:
                     self.auth = (u.group(1) if u else
@@ -588,14 +603,51 @@ class ProxyPass:
                                  cd.group(1) if cd else None)
                     if on_auth:
                         on_auth(*self.auth)
-                    info(f"Microsoft login → {self.auth[0]}  code {self.auth[1]}")
-                if re.search(r"logged in|authenticat|chain|XUID|Saved", line, re.I):
-                    if not self.online:
-                        self.online = True
-                        if on_online:
-                            on_online()
-                        ok("Microsoft account authenticated")
+                    info(f"Connexion Microsoft → {self.auth[0]} "
+                         f"code {self.auth[1]}")
+                if not self.online and re.search(
+                        r"logged in|authenticat|chain|XUID|Saved", line, re.I):
+                    self.online = True
+                    if on_online:
+                        on_online()
+                    ok("Compte Microsoft connecté")
+                if re.search(r"Resolving server address|Loading server",
+                             line, re.I):
+                    info(msg)
+                if not self.ready and re.search(
+                        r"(?:Bedrock|NetherNet) server started on",
+                        line, re.I):
+                    self.ready = True
+                    threading.Thread(target=self._watchdog,
+                                     daemon=True).start()
+                    ok("Relais prêt — en jeu : Jouer ▸ Mondes ▸ "
+                       "« BedrockOnLinux ».")
+                if not self.client_seen and re.search(
+                        r"Dispatching New Connection|Initializing proxy "
+                        r"session|LoginPacket|Player .*connect|"
+                        r"received .* from /", line, re.I):
+                    self.client_seen = True
+                    ok("Client en cours de connexion …")
+                if re.search(r"outdated client|outdated server|"
+                             r"ProtocolException", line, re.I):
+                    err("Décalage de version ProxyPass ↔ Minecraft.")
+                elif re.search(r"No route to host|UnknownHost|downstream "
+                               r"server.*(?:refused|timed? ?out)", line, re.I):
+                    err(f"Serveur {self.dest} injoignable — {msg}")
+                elif re.search(r"disconnect|kicked|Connection "
+                               r"(?:reset|closed|refused)", line, re.I):
+                    warn(msg)
+                elif re.search(r"Exception|ERROR|SEVERE", line) and \
+                        "StaticLoggerBinder" not in line:
+                    warn(msg[:200])
         threading.Thread(target=pump, daemon=True).start()
+
+    def _watchdog(self):
+        time.sleep(50)
+        if self.client_seen or not self.running():
+            return
+        warn("Aucun client après 50 s — en jeu : Jouer ▸ Mondes ▸ "
+             "« BedrockOnLinux ». Sinon ouvre « Logs ProxyPass ».")
 
     def stop(self):
         if self.running():
@@ -607,25 +659,89 @@ class ProxyPass:
         _pkill("ProxyPass.jar")
 
 
-def proton_env():
+def ensure_umu(force=False):
+    binp = UMU_DIR / "umu-run"
+    if binp.exists() and not force:
+        return binp
+    rel = gh_latest(UMU_REPO)
+    url, fname, _ = asset_url(
+        rel, lambda n: n.endswith("zipapp.tar") or n == "umu-run")
+    if not url:
+        url, fname, _ = asset_url(rel, lambda n: n.endswith((".tar", ".tar.gz")))
+    if not url:
+        die("Asset umu-launcher introuvable.")
+    pkg = CACHE / fname
+    info("Téléchargement de umu-launcher …")
+    download(url, pkg, "umu-launcher")
+    if fname == "umu-run":
+        shutil.copy2(pkg, binp)
+    else:
+        with tarfile.open(pkg) as t:
+            t.extractall(UMU_DIR)
+        found = next((p for p in UMU_DIR.rglob("umu-run")), None)
+        if not found:
+            die("umu-run absent du paquet.")
+        if found != binp:
+            shutil.copy2(found, binp)
+    os.chmod(binp, 0o755)
+    ok("umu-launcher prêt")
+    return binp
+
+
+def _heroic_pfx():
+    """A Heroic-built GDK prefix that already runs Minecraft (the inbob1
+    tutorial setup) is the most reliable environment. Reuse it verbatim if
+    present rather than rebuild an equivalent."""
+    base = HOME / "Games/Heroic/Prefixes"
+    if not base.is_dir():
+        return None
+    for d in sorted(base.iterdir()):
+        p = d / "pfx" if (d / "pfx").is_dir() else d
+        if (p / "drive_c/Program Files/Microsoft GameInput").is_dir():
+            return p
+    return None
+
+
+def proton_umu_cmd(exe):
+    """Launch GDK-Proton through umu-launcher (Steam Linux Runtime), the way
+    Heroic actually does it — the GDK networking the LAN join needs only
+    works inside that runtime, not with a bare `proton run`."""
+    hp = _heroic_pfx()
+    if hp:
+        prefix = hp
+        info(f"Prefix Heroic réutilisé : {hp}")
+    else:
+        prefix = PFX
+        COMPAT.mkdir(parents=True, exist_ok=True)
+        if PFX.is_symlink():               # drop any legacy symlink layout
+            PFX.unlink()
+            for junk in ("pfx.lock", "version", "tracked_files",
+                         "config_info"):
+                (COMPAT / junk).unlink(missing_ok=True)
+    (HOME / ".steam/steam").mkdir(parents=True, exist_ok=True)
     env = dict(os.environ)
     env.update({"GAMEID": "0", "PROTONPATH": str(proton_path()),
-                "PROTON_VERB": "run", "WINEPREFIX": str(PREFIX),
+                "PROTON_VERB": "run", "WINEPREFIX": str(prefix),
                 "STEAM_COMPAT_CLIENT_INSTALL_PATH": str(HOME / ".steam/steam"),
                 "UMU_RUNTIME_UPDATE": "0"})
-    (HOME / ".steam/steam").mkdir(parents=True, exist_ok=True)
-    return env
-
-
-def umu(args, **kw):
-    return run([sys.executable, str(ensure_umu())] + args,
-               env=proton_env(), **kw)
+    return [sys.executable, str(ensure_umu()), exe], env
 
 
 def fix_curl_ssl(game_dir: Path):
+    """GDK's XCurl.dll is broken under Wine — swap in MinGW libcurl — and
+    GDK-Proton requires a CA bundle at etc/ssl/certs/ca-bundle.crt next to
+    the game, else every TLS call (Xbox/online) fails and the server join
+    hangs forever. Cert step runs every time (idempotent)."""
+    cacert = CACHE / "cacert.pem"
+    if not cacert.exists():
+        download(CACERT_URL, cacert, "certificats SSL")
+    for base in (game_dir, game_dir.parent):
+        crt = base / "etc" / "ssl" / "certs" / "ca-bundle.crt"
+        crt.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(cacert, crt)
     if (game_dir / "XCurl.dll.bol-orig").exists():
         return
-    info("Installing libcurl + CA certificates …")
+    info("Installation de libcurl + certificats …")
     pkg = CACHE / "mingw-curl.pkg.tar.zst"
     if not pkg.exists():
         download(MINGW_CURL, pkg, "libcurl")
@@ -641,51 +757,23 @@ def fix_curl_ssl(game_dir: Path):
         shutil.copy2(game_dir / "XCurl.dll", game_dir / "XCurl.dll.bol-orig")
     for nm in ("XCurl.dll", "Xcurl.dll"):
         shutil.copy2(libcurl, game_dir / nm)
-    certs = PREFIX / "etc/ssl/certs"
-    certs.mkdir(parents=True, exist_ok=True)
-    if not (certs / "ca-bundle.crt").exists():
-        download(CACERT_URL, certs / "ca-bundle.crt", "CA bundle")
-    ok("libcurl + SSL ready")
-
-
-def setup_prefix(game_dir: Path):
-    PREFIX.mkdir(parents=True, exist_ok=True)
-    s = load_settings()
-    if s.get("prefix_ready"):
-        return
-    info("Initialising Wine prefix (first time) …")
-    umu(["wineboot", "--init"], capture_output=True)
-    msi = game_dir / "Installers/GameInputRedist.msi"
-    if msi.exists():
-        info("Installing GameInput redistributable …")
-        try:
-            umu(["msiexec", "/i", str(msi), "/qn"], capture_output=True)
-        except subprocess.CalledProcessError:
-            warn("GameInputRedist.msi non-zero (often harmless).")
-    s["prefix_ready"] = True
-    save_settings(s)
-    ok("Wine prefix ready")
+    ok("libcurl prêt")
 
 
 def kill_wine():
-    """Kill leftover wine/wineserver for our Proton (a hard-killed hung run
-    locks the prefix → next launch: 'no driver could be loaded')."""
+    """Kill leftover wine/Proton (a hung run locks the prefix)."""
     for pat in ("wineserver", "winedevice.exe", "GDK-Proton",
                 "Minecraft.Windows.exe", "umu_run.py", "umu-shim",
-                "pv-adverb"):
+                "pv-adverb", "pressure-vessel"):
         _pkill(pat)
 
 
 def reset_prefix():
-    """Repair a corrupted Wine prefix (rebuilt on next launch)."""
     kill_wine()
     time.sleep(1)
-    if PREFIX.exists():
-        shutil.rmtree(PREFIX, ignore_errors=True)
-    s = load_settings()
-    s["prefix_ready"] = False
-    save_settings(s)
-    ok("Wine prefix reset — it will be rebuilt cleanly on next launch.")
+    if COMPAT.exists():
+        shutil.rmtree(COMPAT, ignore_errors=True)
+    ok("Prefix Wine réinitialisé — reconstruit au prochain lancement.")
 
 
 OPTIONS_REL = ("drive_c/users/steamuser/AppData/Roaming/Minecraft Bedrock/"
@@ -693,7 +781,7 @@ OPTIONS_REL = ("drive_c/users/steamuser/AppData/Roaming/Minecraft Bedrock/"
 
 
 def patch_options():
-    opt = PREFIX / OPTIONS_REL
+    opt = PFX / OPTIONS_REL
     if not opt.exists():
         return
     kv, order = {}, []
@@ -710,7 +798,16 @@ def patch_options():
         order.append("do_not_show_multiplayer_online_safety_warning")
     kv["do_not_show_multiplayer_online_safety_warning"] = "1"
     opt.write_text("\n".join(f"{k}:{kv[k]}" for k in order) + "\n")
-    ok("options.txt: multiplayer warning disabled")
+    ok("Avertissement multijoueur désactivé")
+
+
+def _auto_mc_version(s):
+    vs = list_mc_versions(False) or list_mc_versions(True)
+    if not vs:
+        die("Aucune version Minecraft disponible (vérifie le réseau).")
+    want = (s.get("mc_version") or "").strip()
+    return next((v for v in vs if v["tag"] == want
+                 or v["tag"].startswith(want + ".")), vs[0]) if want else vs[0]
 
 
 def do_setup(game_dir=None, mc_ver=None, proton_tag=None, pp_tag=None,
@@ -718,91 +815,83 @@ def do_setup(game_dir=None, mc_ver=None, proton_tag=None, pp_tag=None,
     mkdirs()
     s = load_settings()
     if mc_ver:                                 # download chosen MC version
-        gd = download_game(mc_ver, progress)
-        use_game_dir(gd)
-    elif game_dir:
+        use_game_dir(download_game(mc_ver, progress, force=force))
+    elif game_dir and _game_root(Path(game_dir).expanduser()):
         use_game_dir(game_dir)
-    gd = load_settings().get("game_dir")
-    if not gd:
-        die("No game selected. Pick a Minecraft version or a folder.")
-    gd = Path(gd)
+    # First run, or the configured folder was deleted → auto-(re)install
+    # the last/newest version into games/, never anywhere else.
+    cur = load_settings().get("game_dir")
+    if not cur or not _game_root(Path(cur)):
+        use_game_dir(download_game(_auto_mc_version(s), progress, force=force))
+    gd = Path(load_settings()["game_dir"])
     ensure_proton(proton_tag, force, progress)
     ensure_umu(force)
     ensure_jre(force)
     ensure_proxypass(gd, pp_tag, force, progress)
     fix_curl_ssl(gd)
-    setup_prefix(gd)
     s = load_settings()
     s.setdefault("server", {"host": "play.linesia.net", "port": 19132})
     save_settings(s)
     proxypass_config(s["server"]["host"], s["server"]["port"])
-    ok("Setup complete.")
+    ok("Installation terminée.")
 
 
 _DIAG_RULES = [
     (r"Unimplemented function combase\.dll\.RoOriginateError|"
-     r"RoOriginateErrorW", "combase non patché : relance « Installer / Mettre "
-     "à jour » (le patch GDK-Proton n'est pas appliqué)."),
+     r"RoOriginateErrorW",
+     "Patch combase absent — relance « Installer / Mettre à jour »."),
     (r"NtQueryWnfStateData|Unimplemented function .*aborting",
-     "Un stub Wine a tué le jeu (patch ntdll absent) : relance « Installer / "
-     "Mettre à jour »."),
+     "Patch ntdll absent — relance « Installer / Mettre à jour »."),
     (r"vkGetPhysicalDeviceSurfaceFormatsKHR|Can't open display|x11drv: Can't",
-     "Problème d'affichage (pas de serveur X/Wayland accessible)."),
+     "Affichage inaccessible (pas de serveur X/Wayland)."),
     (r"VK_ERROR_DEVICE_LOST|device removed|DXGI_ERROR|vkd3d.*fatal|"
      r"VK_ERROR_OUT_OF_DEVICE_MEMORY",
-     "Crash GPU/Vulkan : mets à jour ton pilote (Mesa/NVIDIA), baisse les "
-     "graphismes, ou essaie une autre version GDK-Proton."),
+     "Crash GPU/Vulkan — mets à jour le pilote ou baisse les graphismes."),
     (r"Cannot allocate memory|OutOfMemory|std::bad_alloc",
      "Mémoire insuffisante (RAM/VRAM)."),
     (r"Address already in use|Failed to bind RakNet",
-     "ProxyPass n'a pas pu ouvrir le port 19132 (instance déjà lancée). "
-     "Ferme les autres BedrockOnLinux/ProxyPass."),
-    (r"outdated client|outdated server|getSendSession\(\)\" is null|"
-     r"ProtocolException",
-     "Décalage de version ProxyPass ↔ Minecraft : choisis une autre build "
-     "ProxyPass (ou laisse « auto »)."),
+     "Port 19132 occupé — ferme les autres instances ProxyPass."),
+    (r"outdated client|outdated server|ProtocolException",
+     "Décalage de version ProxyPass ↔ Minecraft — change la build "
+     "ProxyPass (master-… suit le protocole récent)."),
     (r"Authentication failed|invalid_grant|login.*failed",
-     "Échec de connexion Microsoft : reclique « Se connecter »."),
-    (r"RtlpWaitForCriticalSection.*MSVCRT_file_cs.*timed out|"
-     r"wait timed out in thread.*blocked by",
-     "Le jeu s'est FIGÉ (deadlock Wine sur le verrou fichier), pas un vrai "
-     "crash. Déclenché en général par une jonction serveur qui échoue : "
-     "aligne les versions — Minecraft 1.26.20.4 + ProxyPass pre/1.26.20-1, "
-     "ou ProxyPass master-65."),
-    (r"device_notify_proc failed to get event, error 1726|"
-     r"RPC_S_SERVER_UNAVAILABLE",
-     "Service GameInput indisponible (instable sous Wine) — souvent lié au "
-     "gel ci-dessus ; l'alignement de versions le contourne en pratique."),
+     "Échec de connexion Microsoft — reclique « Se connecter »."),
     (r"nodrv_CreateWindow|no driver could be loaded|"
      r"explorer process failed to start",
-     "Prefix Wine CASSÉ (souvent après un arrêt forcé du jeu) : le jeu sort "
-     "sans fenêtre. Clique « Réparer » (ou: bedrock-on-linux repair) puis "
-     "relance."),
+     "Prefix Wine cassé — clique « Réparer » puis relance."),
 ]
 
 
 def diagnose():
-    """Scan the game + ProxyPass logs and surface a human cause, if any."""
+    """Scan game + relay logs and surface a likely cause."""
     blobs = []
-    for name in ("proton.log", "steam-0.log", "minecraft.log", "proxypass.log"):
-        p = LOGS / name
+    paths = [LOGS / n for n in ("proton.log", "minecraft.log",
+                                "proxypass.log")]
+    paths.append(PROXY_DIR / "logs" / "latest.log")
+    for p in paths:
         if p.exists():
             try:
                 blobs.append(p.read_text(errors="ignore")[-200000:])
             except Exception:
                 pass
     text = "\n".join(blobs)
-    hits = []
-    for pat, msg in _DIAG_RULES:
-        if re.search(pat, text, re.I):
-            hits.append(msg)
+    hits = [msg for pat, msg in _DIAG_RULES if re.search(pat, text, re.I)]
+    relay_up = re.search(r"(?:Bedrock|NetherNet) server started on", text)
+    joined = re.search(r"Dispatching New Connection|Initializing proxy "
+                       r"session|LoginPacket|Player .*connect|"
+                       r"received .* from /", text, re.I)
+    if relay_up and not joined:
+        hits.append("Relais OK mais aucun client connecté — en jeu : "
+                    "Jouer ▸ Mondes ▸ « BedrockOnLinux ».")
+    elif not relay_up:
+        hits.append("Le relais n'a pas démarré — voir « Logs ProxyPass » "
+                    "(souvent : compte Microsoft à reconnecter).")
     if hits:
-        warn("Cause probable du crash :")
+        warn("Cause probable :")
         for h in dict.fromkeys(hits):
             warn("  • " + h)
     else:
-        info("Aucune cause connue détectée. Détail : " + str(LOGS))
-    info(f"Logs complets : {LOGS}")
+        info(f"Aucune cause connue. Logs : {LOGS}")
     return hits
 
 
@@ -810,93 +899,97 @@ def launch(pp: "ProxyPass" = None):
     s = load_settings()
     gd = s.get("game_dir")
     if not gd or not Path(gd, "Minecraft.Windows.exe").exists():
-        die("Not set up — pick a Minecraft version first.")
+        die("Pas de jeu — choisis d'abord une version Minecraft.")
     if not proton_path():
-        die("GDK-Proton missing — run setup.")
+        die("GDK-Proton manquant — relance l'installation.")
     patch_proton(proton_path())
-    proxypass_config(s["server"]["host"], s["server"]["port"])
+
+    # Warn only if a version-locked pre/<ver> ProxyPass is older than MC.
+    mc_ver = mc_version_str(Path(gd))
+    pp_tag = s.get("proxypass_tag", "") or ""
+    m = re.match(r"pre/(\d+\.\d+\.\d+)-\d+$", pp_tag)
+    if mc_ver and m and _vt(mc_ver) > _vt(m.group(1)):
+        warn(f"ProxyPass {pp_tag} ne gère que MC {m.group(1)} (tu es en "
+             f"{mc_ver}) — choisis une build « master-… ».")
+
+    dest = (s["server"]["host"], int(s["server"]["port"]))
+    proxypass_config(*dest)
     if pp is None:
         pp = ProxyPass()
+    # The relay reads config.yml only at startup → restart it if the
+    # chosen server changed.
+    if pp.running() and pp.dest != dest:
+        info(f"Serveur changé → redémarrage du relais ({dest})")
+        pp.stop()
+        time.sleep(1)
     if not pp.running():
-        info("Starting ProxyPass (multiplayer relay) …")
-        pp.start()
-    kill_wine()                              # clear any hung/locking wine
-    env = proton_env()
-    env["PROTON_LOG"] = "1"                   # so crashes are diagnosable
+        info("Démarrage du relais …")
+        pp.start(dest=dest)
+    else:
+        info(f"Relais déjà actif → {dest[0]}:{dest[1]}")
+    kill_wine()
+    exe = str(CONTENT / "Minecraft.Windows.exe")
+    cmd, env = proton_umu_cmd(exe)
+    env["PROTON_LOG"] = "1"
     env["PROTON_LOG_DIR"] = str(LOGS)
     disp = os.environ.get("DISPLAY")
     if disp:
         env["DISPLAY"] = disp
-        xa = os.environ.get("XAUTHORITY")
-        for cand in (xa, str(HOME / ".Xauthority"),
+        for cand in (os.environ.get("XAUTHORITY"), str(HOME / ".Xauthority"),
                      f"/run/user/{os.getuid()}/.mutter-Xwaylandauth.0"):
             if cand and Path(cand).exists():
                 env["XAUTHORITY"] = cand
                 break
-        # The pressure-vessel container often can't use the host X cookie →
-        # "no driver could be loaded". Allow the local user explicitly.
         if shutil.which("xhost"):
             user = os.environ.get("USER") or os.environ.get("LOGNAME") or ""
-            granted = False
             for arg in (f"+SI:localuser:{user}", "+local:"):
                 try:
-                    r = subprocess.run(["xhost", arg], timeout=5,
-                                       stdout=subprocess.DEVNULL,
-                                       stderr=subprocess.DEVNULL)
-                    granted = granted or r.returncode == 0
+                    subprocess.run(["xhost", arg], timeout=5,
+                                   stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL)
                 except Exception:
                     pass
-            info(f"X: accès local accordé via xhost (DISPLAY={disp}, "
-                 f"XAUTHORITY={env.get('XAUTHORITY','?')})" if granted
-                 else "X: xhost a échoué — l'affichage risque d'échouer.")
-        else:
-            warn("xhost absent (installe x11-xserver-utils) — l'affichage "
-                 "dans le conteneur risque d'échouer.")
     elif os.environ.get("WAYLAND_DISPLAY"):
-        warn("Session Wayland sans DISPLAY X — installe XWayland, "
-             "ou lance depuis une session X11 (Wine-Wayland est instable).")
-    exe = str(CONTENT / "Minecraft.Windows.exe")
-    info("Launching Minecraft … (in game: Play ▸ Friends ▸ join the LAN game)")
+        warn("Session Wayland sans DISPLAY X — installe XWayland.")
+    info("Lancement de Minecraft … En jeu : Jouer ▸ Mondes ▸ le "
+         "monde LAN « ProxyPass ».")
     glog = open(LOGS / "minecraft.log", "w")
     rc = None
     try:
-        rc = subprocess.run([sys.executable, str(ensure_umu()), exe], env=env,
-                            cwd=str(CONTENT), stdout=glog,
+        rc = subprocess.run(cmd, env=env, cwd=str(CONTENT), stdout=glog,
                             stderr=subprocess.STDOUT).returncode
     finally:
         patch_options()
-        for pat in ("steam-0.log",):           # PROTON_LOG writes here
-            src = LOGS / pat
-            if src.exists():
-                src.replace(LOGS / "proton.log")
-        ok(f"Game closed (exit {rc}).")
+        src = LOGS / "steam-0.log"             # PROTON_LOG output
+        if src.exists():
+            src.replace(LOGS / "proton.log")
+        ok(f"Jeu fermé (code {rc}).")
         diagnose()
 
 
 def doctor():
-    info(f"{PRETTY} {VERSION} — host check")
+    info(f"{PRETTY} {VERSION} — vérification système")
     hint = next((h for pm, h in (
         ("apt-get", "sudo apt install {}"), ("dnf", "sudo dnf install {}"),
         ("pacman", "sudo pacman -S {}"), ("zypper", "sudo zypper in {}"))
-        if shutil.which(pm)), "install: {}")
+        if shutil.which(pm)), "installe : {}")
     miss = []
     print(f"  python3 : {sys.version.split()[0]}")
-    for tool, pkg in (("bwrap", "bubblewrap"), ("tar", "tar"),
-                      ("curl", "curl"), ("unzstd", "zstd")):
+    for tool, pkg in (("tar", "tar"), ("curl", "curl"), ("unzstd", "zstd")):
         have = shutil.which(tool)
-        print(f"  {tool:8}: {'found' if have else 'MISSING'}")
+        print(f"  {tool:8}: {'OK' if have else 'MANQUANT'}")
         if not have and not (tool == "curl" and shutil.which("wget")):
             miss.append(pkg)
     try:
         import tkinter  # noqa
-        print("  tkinter : found")
+        print("  tkinter : OK")
     except Exception:
-        print("  tkinter : MISSING")
+        print("  tkinter : MANQUANT")
         miss.append("python3-tk")
     if miss:
-        warn("Install: " + hint.format(" ".join(sorted(set(miss)))))
+        warn("À installer : " + hint.format(" ".join(sorted(set(miss)))))
         return False
-    ok("Host ready.")
+    ok("Système prêt.")
     return True
 
 
@@ -1001,11 +1094,22 @@ def gui():
                     command=lambda: threading.Thread(
                         target=refresh_mc, daemon=True).start()
                     ).grid(row=0, column=1, padx=12)
-    own = tk.StringVar(value=s.get("game_dir", ""))
+    # Only a genuinely custom folder belongs here; a managed games/ path
+    # would override the version dropdown.
+    _saved_gd = s.get("game_dir", "")
+    try:
+        _is_custom = bool(_saved_gd) and Path(_saved_gd).exists() and \
+            GAMES.resolve() not in Path(_saved_gd).resolve().parents
+    except Exception:
+        _is_custom = bool(_saved_gd) and Path(_saved_gd).exists()
+    own = tk.StringVar(value=_saved_gd if _is_custom else "")
     ttk.Button(cv, text="… dossier perso",
                command=lambda: own.set(
                    filedialog.askdirectory() or own.get())
                ).grid(row=0, column=2, padx=4)
+    # Choosing a version is an explicit switch to a managed build — drop
+    # the custom folder so it stops overriding the dropdown.
+    mc_cb.bind("<<ComboboxSelected>>", lambda e: own.set(""))
 
     ce = card("②  Moteur (téléchargé & patché automatiquement)")
     tk.Label(ce, text="GDK-Proton", bg=CARD, fg=SUB).grid(row=0, column=0, sticky="w")
@@ -1027,21 +1131,46 @@ def gui():
     ttk.Entry(cs, textvariable=port_var, width=8).grid(row=0, column=3, padx=8)
 
     cm = card("④  Compte Microsoft (requis pour le multijoueur)")
-    signed = proxypass_signed_in()
-    ms_state = tk.StringVar(value="Connecté ✓" if signed else "Non connecté")
+    ms_state = tk.StringVar()
     msl = tk.Label(cm, textvariable=ms_state, bg=CARD,
-                   fg=ACC2 if signed else SUB, font=("", 10, "bold"))
+                   font=("", 10, "bold"))
     msl.grid(row=0, column=0, sticky="w")
+    ms_code = tk.StringVar(value="")
+    tk.Label(cm, textvariable=ms_code, bg=CARD, fg="#e0b341"
+             ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
+
+    # phase: "in" (connecté) / "auth" (code à saisir) / "out" (à connecter)
+    def set_phase(ph):
+        if ph == "in":
+            ms_state.set("Connecté ✓")
+            msl.configure(fg=ACC2)
+            ms_code.set("")
+            b_login.grid_remove()
+            b_link.grid_remove()
+            b_code.grid_remove()
+            b_logout.grid()
+        elif ph == "auth":
+            ms_state.set("Connexion requise — ouvre le lien et saisis le code")
+            msl.configure(fg="#e0b341")
+            b_login.grid_remove()
+            b_logout.grid_remove()
+            b_link.grid()
+            b_code.grid()
+        else:
+            ms_state.set("Non connecté")
+            msl.configure(fg=SUB)
+            ms_code.set("")
+            b_link.grid_remove()
+            b_code.grid_remove()
+            b_logout.grid_remove()
+            b_login.grid()
 
     def on_auth(u, code):
-        ms_state.set("Connexion requise")
-        msl.configure(fg="#e0b341")
-        ms_code.set(f"➜  {u}     code : {code}")
+        root.after(0, lambda: (ms_code.set(f"➜  {u}     code : {code}"),
+                               set_phase("auth")))
 
     def on_online():
-        ms_state.set("Connecté ✓")
-        msl.configure(fg=ACC2)
-        ms_code.set("")
+        root.after(0, lambda: set_phase("in"))
 
     def open_link():
         if pp.auth:
@@ -1054,16 +1183,29 @@ def gui():
             root.clipboard_clear()
             root.clipboard_append(pp.auth[1])
 
-    ttk.Button(cm, text="Se connecter", command=lambda: threading.Thread(
-        target=lambda: (ensure_jre(), pp.start(on_auth, on_online)),
-        daemon=True).start()).grid(row=0, column=1, padx=6)
-    ttk.Button(cm, text="Ouvrir le lien", command=open_link
-               ).grid(row=0, column=2, padx=6)
-    ttk.Button(cm, text="Copier le code", command=copy_code
-               ).grid(row=0, column=3, padx=6)
-    ms_code = tk.StringVar(value="")
-    tk.Label(cm, textvariable=ms_code, bg=CARD, fg="#e0b341"
-             ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
+    def do_logout():
+        for n in ("auth.json", "data"):
+            p = PROXY_DIR / n
+            try:
+                shutil.rmtree(p) if p.is_dir() else p.unlink(missing_ok=True)
+            except Exception:
+                pass
+        pp.stop()
+        set_phase("out")
+
+    b_login = ttk.Button(cm, text="Se connecter",
+                         command=lambda: threading.Thread(
+                             target=lambda: (ensure_jre(),
+                                             pp.start(on_auth, on_online)),
+                             daemon=True).start())
+    b_login.grid(row=0, column=1, padx=6)
+    b_link = ttk.Button(cm, text="Ouvrir le lien", command=open_link)
+    b_link.grid(row=0, column=2, padx=6)
+    b_code = ttk.Button(cm, text="Copier le code", command=copy_code)
+    b_code.grid(row=0, column=3, padx=6)
+    b_logout = ttk.Button(cm, text="Se déconnecter", command=do_logout)
+    b_logout.grid(row=0, column=1, padx=6)
+    set_phase("in" if proxypass_signed_in() else "out")
 
     prog = ttk.Progressbar(root, style="Bar.Horizontal.TProgressbar",
                            mode="determinate")
@@ -1093,6 +1235,53 @@ def gui():
                command=lambda: subprocess.Popen(
                    ["xdg-open", str(LOGS)], stdout=subprocess.DEVNULL,
                    stderr=subprocess.DEVNULL)).pack(side="left", padx=10)
+
+    def show_pp_log():
+        win = tk.Toplevel(root)
+        win.title("Logs ProxyPass — relais multijoueur (live)")
+        win.configure(bg=BG)
+        win.geometry("900x520")
+        txt = tk.Text(win, bg="#0c0c0c", fg="#d6d6d6", insertbackground="#d6d6d6",
+                      font=("monospace", 9), wrap="none", borderwidth=0)
+        sb = ttk.Scrollbar(win, command=txt.yview)
+        txt.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        txt.pack(fill="both", expand=True, padx=6, pady=6)
+        lf = PROXY_DIR / "logs" / "latest.log"
+        st = {"sz": 0, "alive": True}
+
+        def tick():
+            if not st["alive"] or not win.winfo_exists():
+                return
+            try:
+                if lf.exists():
+                    sz = lf.stat().st_size
+                    if sz < st["sz"]:           # rotated → reload
+                        st["sz"] = 0
+                        txt.delete("1.0", "end")
+                    if sz > st["sz"]:
+                        with open(lf, "r", errors="ignore") as fh:
+                            fh.seek(st["sz"])
+                            chunk = fh.read()
+                        st["sz"] = sz
+                        at_end = txt.yview()[1] > 0.999
+                        txt.insert("end", chunk)
+                        if at_end:
+                            txt.see("end")
+                else:
+                    if not txt.get("1.0", "1.5"):
+                        txt.insert("end", "(ProxyPass pas encore lancé — "
+                                   "clique JOUER)\n")
+            except Exception as e:
+                txt.insert("end", f"\n[lecture log: {e}]\n")
+            win.after(700, tick)
+
+        win.protocol("WM_DELETE_WINDOW",
+                     lambda: (st.update(alive=False), win.destroy()))
+        tick()
+
+    ttk.Button(foot, text="🔌  Logs ProxyPass",
+               command=show_pp_log).pack(side="left", padx=(0, 10))
     ttk.Button(foot, text="🛠  Réparer",
                command=lambda: threading.Thread(
                    target=reset_prefix, daemon=True).start()
@@ -1110,7 +1299,11 @@ def gui():
             def ap():
                 mc_cb.configure(values=vals)
                 if vals and not mc_var.get():
-                    mc_var.set(vals[0])
+                    cur = (load_settings().get("mc_version") or "")
+                    pick = next((v for v in vals if v.split("  ")[0] == cur
+                                 or v.split("  ")[0].startswith(cur + ".")),
+                                vals[0])
+                    mc_var.set(pick)
             root.after(0, ap)
         except Exception as e:
             _LOG_SINK(f"xx versions MC: {e}")
@@ -1153,8 +1346,11 @@ def gui():
         def work():
             try:
                 mc, pt, ppt = collect()
+                # « Installer / Mettre à jour » force un vrai rafraîchis-
+                # sement ; JOUER reste rapide (cache).
                 do_setup(game_dir=own.get() or None, mc_ver=mc,
-                         proton_tag=pt, pp_tag=ppt, progress=set_progress)
+                         proton_tag=pt, pp_tag=ppt,
+                         force=(kind == "setup"), progress=set_progress)
                 if kind == "play":
                     launch(pp)
                 else:
@@ -1202,9 +1398,9 @@ def main():
                 vs = list_mc_versions(True)
                 mc = next((v for v in vs if v["tag"] == a.mc), None)
                 if not mc:
-                    die(f"MC version '{a.mc}' not found in archive.")
+                    die(f"Version Minecraft « {a.mc} » introuvable.")
             do_setup(a.game_dir, mc, a.proton, a.proxypass, a.force)
-            ok(f"Done. Launch:  {APP} play")
+            ok(f"Terminé. Lance :  {APP} play")
         elif a.cmd == "play":
             launch()
         elif a.cmd == "versions":
@@ -1220,7 +1416,7 @@ def main():
                 srv.update(host=h, port=int(pt or 19132))
                 save_settings(st)
                 proxypass_config(srv["host"], srv["port"])
-                ok(f"Server = {srv['host']}:{srv['port']}")
+                ok(f"Serveur = {srv['host']}:{srv['port']}")
             else:
                 print(json.dumps(st, indent=2))
         elif a.cmd == "doctor":
