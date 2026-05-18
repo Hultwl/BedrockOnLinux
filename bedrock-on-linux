@@ -64,6 +64,17 @@ WINEGDK_BRANCH = "master"
 WINEGDK_SRC = DATA / "winegdk-src"
 WINEGDK_OUT = PROTON_DIR / "GDK-Proton-xuser"
 
+# Direct package list for a 64-bit WineGDK build that can display/run the
+# game — avoids `apt build-dep wine` (needs deb-src, absent on Mint/LMDE).
+WINE_BUILD_PKGS = (
+    "flex bison gcc-mingw-w64-x86-64 pkg-config "
+    "libx11-dev libxext-dev libxrandr-dev libxrender-dev libxi-dev "
+    "libxcursor-dev libxcomposite-dev libxinerama-dev libxfixes-dev "
+    "libxxf86vm-dev libfreetype-dev libfontconfig1-dev libgl1-mesa-dev "
+    "libvulkan-dev libgnutls28-dev libpulse-dev libasound2-dev "
+    "libudev-dev libsdl2-dev libusb-1.0-0-dev libpcap-dev "
+    "libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev")
+
 IS_TTY = sys.stdout.isatty()
 _LOG_SINK = None       # GUI hook: callable(str)
 
@@ -918,9 +929,8 @@ def ensure_winegdk(force=False, progress=None):
                              "x86_64-w64-mingw32-gcc") if not shutil.which(t)]
         if need:
             die("Build tools missing: " + " ".join(need) + "\n"
-                "  Debian/Ubuntu:  sudo apt build-dep wine  &&  "
-                + _pm_hint().format("flex bison gcc-mingw-w64-x86-64 "
-                "pkg-config libfreetype-dev libvulkan-dev libgnutls28-dev")
+                "  Install (no deb-src needed):\n  "
+                + _pm_hint().format(WINE_BUILD_PKGS)
                 + "\n  then re-run Install / Update.")
         base = _stock_proton_root(progress)
         bdir = WINEGDK_SRC / "build-bol"

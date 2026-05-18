@@ -40,10 +40,14 @@ done
 if [ "${#miss[@]}" -gt 0 ]; then
   cat >&2 <<EOF
 xx Missing build tools: ${miss[*]}
-   Debian/Ubuntu (64-bit WineGDK build):
-     sudo apt build-dep wine        # or wine-development
+   Install (Debian/Mint/LMDE — no deb-src needed):
      sudo apt install flex bison gcc-mingw-w64-x86-64 pkg-config \\
-       libfreetype-dev libvulkan-dev libgnutls28-dev
+       libx11-dev libxext-dev libxrandr-dev libxrender-dev libxi-dev \\
+       libxcursor-dev libxcomposite-dev libxinerama-dev libxfixes-dev \\
+       libxxf86vm-dev libfreetype-dev libfontconfig1-dev libgl1-mesa-dev \\
+       libvulkan-dev libgnutls28-dev libpulse-dev libasound2-dev \\
+       libudev-dev libsdl2-dev libusb-1.0-0-dev libpcap-dev \\
+       libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
    Then re-run this script.
 EOF
   exit 1
