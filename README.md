@@ -74,8 +74,14 @@ bedrock-on-linux play           # then join your server in-game (Play ▸ Server
 ```
 
 In the GUI it's the *"In-game login — no ProxyPass"* checkbox in card ④.
-Default behaviour is unchanged. Design and the exact upstream contract:
-[`docs/native-login.md`](docs/native-login.md).
+Default behaviour is unchanged.
+
+> **Status (2026-05-18):** no public GDK-Proton ships WineGDK `XUser` yet,
+> so on the stock build the game shows *"Authentication failed (0x80004001)"*.
+> Until an XUser-capable engine exists, use ProxyPass. To point the launcher
+> at a self-built engine: `config --proton-dir <dir>` / `--proton-url <url>`
+> (`--proton-auto` reverts). Design: [`docs/native-login.md`](docs/native-login.md);
+> building the engine: [`docs/build-xuser-engine.md`](docs/build-xuser-engine.md).
 
 ## If something fails
 

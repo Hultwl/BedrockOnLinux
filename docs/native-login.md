@@ -77,9 +77,18 @@ the MSA device-code flow** — pure `urllib`, **no ECDSA/crypto, no Java**:
   `bedrock-on-linux config --native-login on|off`.
 - When off, the ProxyPass path is byte-for-byte unchanged.
 - Native login only works on a GDK-Proton build that includes the WineGDK
-  `XUser` implementation (PR #33 merged, or a custom build). The launcher
-  cannot introspect the bundled `xgameruntime.dll`, so it cannot auto-detect
-  this — it warns and the user must opt in knowingly.
+  `XUser` implementation. The launcher cannot introspect the bundled
+  `xgameruntime.dll`, so it cannot auto-detect this — it warns and the user
+  must opt in knowingly.
+- **Verified 2026-05-18**: with stock GDK-Proton the game shows
+  *"Authentication failed — 0x80004001"* (`E_NOTIMPL`, the XUser-absent
+  signature). `diagnose()` now recognises this and points back to ProxyPass.
+  No public XUser-capable build exists yet — assembling one is upstream
+  C/Wine work, see [`build-xuser-engine.md`](build-xuser-engine.md).
+- To use a self-built / community engine, point the launcher at it:
+  `bedrock-on-linux config --proton-dir <dir>` or `--proton-url <url>`
+  (`--proton-auto` reverts). Custom builds patch non-strict
+  (`patch_proton(strict=False)`).
 
 ## Testing notes
 

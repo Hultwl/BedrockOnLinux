@@ -248,13 +248,17 @@ def _backup_once(path: Path):
         shutil.copy2(path, bk)
 
 
-def apply_patch(path: Path, off, expect, new, what):
+def apply_patch(path: Path, off, expect, new, what, strict=True):
     raw = bytearray(path.read_bytes())
     if bytes(raw[off:off + len(new)]) == new:
         info(f"{what}: already patched")
         return False
     if bytes(raw[off:off + len(expect)]) != expect:
-        die(f"{what}: unexpected bytes at 0x{off:x} — patch aborted.")
+        msg = f"{what}: unexpected bytes at 0x{off:x} — patch skipped."
+        if strict:
+            die(msg)
+        warn(msg)
+        return False
     _backup_once(path)
     raw[off:off + len(new)] = new
     path.write_bytes(raw)
@@ -267,6 +271,13 @@ def proton_path():
     return Path(p) if p else None
 
 
+def custom_proton():
+    """A user-supplied GDK-Proton (e.g. a fork built with WineGDK XUser).
+    When set, our combase/ntdll offsets may not match — patch non-strict."""
+    s = load_settings()
+    return bool(s.get("proton_dir") or s.get("proton_url"))
+
+
 def list_proton_tags():
     try:
         return [r["tag_name"] for r in gh_releases(GDK_PROTON_REPO, 20)]
@@ -277,6 +288,49 @@ def list_proton_tags():
 def ensure_proton(tag=None, force=False, progress=None):
     s = load_settings()
     cur = proton_path()
+
+    # (A) User-supplied build directory — a fork built with WineGDK XUser,
+    #     etc. Used verbatim; never downloaded or auto-updated.
+    pdir = s.get("proton_dir")
+    if pdir:
+        root = Path(pdir).expanduser()
+        if not (root / "proton").exists():
+            die(f"proton_dir has no 'proton' executable: {root}")
+        s["proton"], s["proton_tag"] = str(root), "custom-dir"
+        save_settings(s)
+        ok(f"GDK-Proton (custom dir): {root}")
+        patch_proton(root, strict=False)
+        return root
+
+    # (B) User-supplied archive URL.
+    purl = s.get("proton_url")
+    if purl:
+        want = "custom-url:" + purl
+        if cur and cur.exists() and not force and s.get("proton_tag") == want:
+            info("GDK-Proton (custom URL) already installed")
+            return cur
+        fname = purl.rsplit("/", 1)[-1] or "gdk-proton-custom.tar.gz"
+        tar = CACHE / ("custom-" + fname)
+        if not tar.exists() or force:
+            info("Downloading custom GDK-Proton …")
+            download(purl, tar, "GDK-Proton (custom)", progress)
+        info("Extracting custom GDK-Proton …")
+        for d in PROTON_DIR.iterdir() if PROTON_DIR.exists() else []:
+            if d.is_dir():
+                shutil.rmtree(d, ignore_errors=True)
+        with tarfile.open(tar) as t:
+            t.extractall(PROTON_DIR)
+        root = next((p for p in sorted(PROTON_DIR.glob("*"))
+                     if (p / "proton").exists()), None)
+        if not root:
+            die("Invalid custom GDK-Proton archive (no 'proton' inside).")
+        s["proton"], s["proton_tag"] = str(root), want
+        save_settings(s)
+        ok(f"GDK-Proton (custom URL) ready: {root}")
+        patch_proton(root, strict=False)
+        return root
+
+    # (C) Default: Weather-OS/GDK-Proton releases.
     if cur and cur.exists() and not force and (not tag or s.get("proton_tag") == tag):
         return cur
     rel = (next((r for r in gh_releases(GDK_PROTON_REPO, 20)
@@ -309,21 +363,28 @@ def ensure_proton(tag=None, force=False, progress=None):
     return root
 
 
-def patch_proton(root: Path):
+def patch_proton(root: Path, strict=True):
     """Two binary patches that let Bedrock GDK 1.26 run under Wine.
-    Idempotent; offsets found structurally; backups as *.bol-orig."""
+    Idempotent; offsets found structurally; backups as *.bol-orig.
+    strict=False (custom builds): a mismatch warns instead of aborting —
+    a fork may already handle this or use a different Wine."""
+    def fail(m):
+        if strict:
+            die(m)
+        warn(m + " (custom build — continuing)")
+
     wine = root / "files/lib/wine/x86_64-windows"
     combase, ntdll = wine / "combase.dll", wine / "ntdll.dll"
     if not combase.exists() or not ntdll.exists():
-        die(f"Wine DLLs missing in {wine}")
+        return fail(f"Wine DLLs missing in {wine}")
 
     # (1) combase.RoOriginateErrorW stub aborts at the package-identity check.
     off = PE(combase).export_off("RoOriginateErrorW")
     if off is None:
-        die("RoOriginateErrorW not found in combase.dll")
+        return fail("RoOriginateErrorW not found in combase.dll")
     apply_patch(combase, off, bytes.fromhex("4883ec28"),
                 bytes.fromhex("31c0c3") + b"\x90" * 21,
-                "combase.RoOriginateErrorW")
+                "combase.RoOriginateErrorW", strict=strict)
 
     # (2) ntdll: neutralise every unimplemented-stub funnel (prologue + call
     #     to RtlRaiseException + EB F6 never-return loop) so unimplemented
@@ -332,7 +393,7 @@ def patch_proton(root: Path):
     pe = PE(ntdll)
     rre = pe.export_rva("RtlRaiseException")
     if rre is None:
-        die("RtlRaiseException not resolved in ntdll.dll")
+        return fail("RtlRaiseException not resolved in ntdll.dll")
     d = pe.data
     sig = bytes.fromhex("55534881ecc8000000488dac24c0000000")
     new = bytes.fromhex("b8020000c0c3") + b"\x90\x90"
@@ -355,7 +416,7 @@ def patch_proton(root: Path):
     elif d.count(new + bytes.fromhex("00488dac24c0000000")):
         info("ntdll: already patched")
     else:
-        die("ntdll: no stub found — Proton layout changed.")
+        fail("ntdll: no stub found — Proton layout changed.")
 
 
 def ensure_jre(force=False):
@@ -1099,7 +1160,7 @@ def launch(pp: "ProxyPass" = None):
         die("No game — choose a Minecraft version first.")
     if not proton_path():
         die("GDK-Proton missing — re-run setup.")
-    patch_proton(proton_path())
+    patch_proton(proton_path(), strict=not custom_proton())
 
     native = bool(s.get("native_login"))
     if native:
@@ -1342,6 +1403,43 @@ def gui():
     pp_var = tk.StringVar(value="auto")
     pp_cb = ttk.Combobox(ce, textvariable=pp_var, width=18, state="readonly")
     pp_cb.grid(row=0, column=3, padx=8)
+    cust_lbl = tk.StringVar(
+        value=("custom: " + Path(s["proton_dir"]).name)
+        if s.get("proton_dir") else
+        ("custom URL set" if s.get("proton_url") else ""))
+
+    def pick_custom_proton():
+        d = filedialog.askdirectory()
+        if not d:
+            return
+        st = load_settings()
+        if (Path(d) / "proton").exists():
+            st["proton_dir"] = d
+            for k in ("proton_url", "proton", "proton_tag"):
+                st.pop(k, None)
+            save_settings(st)
+            cust_lbl.set("custom: " + Path(d).name)
+            _LOG_SINK(f"OK Custom GDK-Proton: {d}")
+        else:
+            _LOG_SINK("xx No 'proton' executable in that folder")
+
+    def clear_custom_proton():
+        st = load_settings()
+        for k in ("proton_dir", "proton_url", "proton", "proton_tag"):
+            st.pop(k, None)
+        save_settings(st)
+        cust_lbl.set("")
+        _LOG_SINK("OK GDK-Proton = auto (Weather-OS)")
+
+    ttk.Button(ce, text="… custom build (XUser)",
+               command=pick_custom_proton).grid(row=1, column=0,
+                                                columnspan=2, sticky="w",
+                                                pady=(8, 0))
+    tk.Label(ce, textvariable=cust_lbl, bg=CARD, fg="#e0b341"
+             ).grid(row=1, column=2, sticky="w", pady=(8, 0))
+    ttk.Button(ce, text="auto", width=5,
+               command=clear_custom_proton).grid(row=1, column=3,
+                                                 sticky="w", pady=(8, 0))
 
     cs = card("③  Multiplayer server (ProxyPass relay)")
     host_var = tk.StringVar(value=srv.get("host", "play.linesia.net"))
@@ -1639,6 +1737,13 @@ def main():
     cf.add_argument("--server", help="destination server  host:port")
     cf.add_argument("--native-login", choices=["on", "off"],
                     help="in-game Microsoft login (no ProxyPass, experimental)")
+    cf.add_argument("--proton-dir", metavar="PATH",
+                    help="use a local GDK-Proton build (e.g. a fork with "
+                         "WineGDK XUser)")
+    cf.add_argument("--proton-url", metavar="URL",
+                    help="download a custom GDK-Proton .tar.gz")
+    cf.add_argument("--proton-auto", action="store_true",
+                    help="revert to Weather-OS/GDK-Proton releases")
     sub.add_parser("login", help="link a Microsoft account (in-game login mode)")
     sub.add_parser("doctor", help="check host requirements")
     sub.add_parser("repair", help="reset a broken Wine prefix")
@@ -1677,6 +1782,31 @@ def main():
                 st["native_login"] = (a.native_login == "on")
                 save_settings(st)
                 ok(f"In-game login (no ProxyPass) = {a.native_login}")
+                touched = True
+            if a.proton_dir:
+                pth = str(Path(a.proton_dir).expanduser())
+                if not (Path(pth) / "proton").exists():
+                    die(f"No 'proton' executable in {pth}")
+                st["proton_dir"] = pth
+                st.pop("proton_url", None)
+                st.pop("proton", None)
+                st.pop("proton_tag", None)
+                save_settings(st)
+                ok(f"Custom GDK-Proton dir = {pth}")
+                touched = True
+            if a.proton_url:
+                st["proton_url"] = a.proton_url
+                st.pop("proton_dir", None)
+                st.pop("proton", None)
+                st.pop("proton_tag", None)
+                save_settings(st)
+                ok("Custom GDK-Proton URL set — runs on next setup/play.")
+                touched = True
+            if a.proton_auto:
+                for k in ("proton_dir", "proton_url", "proton", "proton_tag"):
+                    st.pop(k, None)
+                save_settings(st)
+                ok("GDK-Proton = auto (Weather-OS releases)")
                 touched = True
             if not touched:
                 print(json.dumps(st, indent=2))
