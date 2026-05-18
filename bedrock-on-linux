@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # BedrockOnLinux — install & run Minecraft Bedrock (Windows GDK) on Linux.
-# GDK-Proton (auto-patched) + ProxyPass relay + bundled Java.
+# GDK-Proton built from a WineGDK fork — native in-game Microsoft login.
 # SPDX-License-Identifier: MIT
 
 import argparse
@@ -29,8 +29,6 @@ HOME = Path.home()
 DATA = Path(os.environ.get("BOL_HOME", HOME / ".local/share" / APP))
 PROTON_DIR = DATA / "proton"
 UMU_DIR = DATA / "umu"
-JRE_DIR = DATA / "jre"
-PROXY_DIR = DATA / "proxypass"
 COMPAT = DATA / "compatdata"          # Proton-managed Wine prefix lives here
 PFX = COMPAT / "pfx"
 GAMES = DATA / "games"
@@ -42,11 +40,9 @@ SETTINGS = DATA / "settings.json"
 
 GDK_PROTON_REPO = "Weather-OS/GDK-Proton"
 UMU_REPO = "Open-Wine-Components/umu-launcher"
-PROXYPASS_REPO = "Kas-tle/ProxyPass"
 GAME_ARCHIVE_REPO = "bubbles-wow/mcbe-gdk-unpack-archive"
 MINGW_CURL = "https://mirror.msys2.org/mingw/mingw64/mingw-w64-x86_64-curl-8.17.0-1-any.pkg.tar.zst"
 CACERT_URL = "https://curl.se/ca/cacert.pem"
-TEMURIN_JRE25 = "https://api.adoptium.net/v3/binary/latest/25/ga/linux/x64/jre/hotspot/normal/eclipse"
 
 # Native in-game login (no ProxyPass). WineGDK's XUser (Weather-OS/WineGDK
 # PR #33) has no sign-in UI: it reads an MSA OAuth refresh token from the
@@ -103,18 +99,25 @@ def run(cmd, **kw):
 
 
 def mkdirs():
-    for d in (DATA, PROTON_DIR, UMU_DIR, JRE_DIR, PROXY_DIR, CACHE, LOGS,
-              GAMES):
+    for d in (DATA, PROTON_DIR, UMU_DIR, CACHE, LOGS, GAMES):
         d.mkdir(parents=True, exist_ok=True)
 
 
 def load_settings():
+    s = {}
     if SETTINGS.exists():
         try:
-            return json.loads(SETTINGS.read_text())
+            s = json.loads(SETTINGS.read_text())
         except Exception:
-            pass
-    return {}
+            s = {}
+    # This branch is in-game login only (no ProxyPass): always build/use
+    # the WineGDK fork unless the user pointed at another custom build.
+    s.setdefault("native_login", True)
+    if not s.get("proton_dir") and not s.get("proton_url"):
+        s.setdefault("proton_source", "winegdk")
+        s.setdefault("winegdk_repo", WINEGDK_REPO)
+        s.setdefault("winegdk_branch", WINEGDK_BRANCH)
+    return s
 
 
 def save_settings(s):
@@ -427,26 +430,6 @@ def patch_proton(root: Path, strict=True):
         fail("ntdll: no stub found — Proton layout changed.")
 
 
-def ensure_jre(force=False):
-    j = JRE_DIR / "bin/java"
-    if j.exists() and not force:
-        return j
-    info("Downloading Java 25 …")
-    tgz = CACHE / "temurin-jre25.tar.gz"
-    download(TEMURIN_JRE25, tgz, "Java 25")
-    if JRE_DIR.exists():
-        shutil.rmtree(JRE_DIR)
-    JRE_DIR.mkdir(parents=True)
-    with tarfile.open(tgz) as t:
-        top = t.getmembers()[0].name.split("/")[0]
-        t.extractall(JRE_DIR)
-    ext = JRE_DIR / top
-    for item in ext.iterdir():
-        shutil.move(str(item), str(JRE_DIR / item.name))
-    ext.rmdir()
-    os.chmod(j, 0o755)
-    ok("Java 25 ready")
-    return j
 
 
 def list_mc_versions(include_beta=True):
@@ -544,99 +527,6 @@ def _vt(v):
         return (0,)
 
 
-def list_proxypass_tags():
-    try:
-        return [r["tag_name"] for r in gh_releases(PROXYPASS_REPO, 50)]
-    except Exception:
-        return []
-
-
-def pick_proxypass(game_dir):
-    ver = mc_version_str(game_dir)
-    rels = gh_releases(PROXYPASS_REPO, 50)
-    # ProxyPass must speak the client's exact Bedrock protocol or it drops
-    # the login silently (→ infinite "locating server"). pre/X.Y.Z is the
-    # protocol-matched build for MC X.Y.Z; master-* tracks an older protocol
-    # and only fits when no pre/ matches the installed version.
-    exact = next(
-        (r for r in rels
-         for m in [re.match(r"pre/(\d+\.\d+\.\d+)-\d+$", r["tag_name"])]
-         if m and ver and m.group(1) == ver), None)
-    chosen = exact or next(
-        (r for r in rels if r["tag_name"].startswith("master-")), rels[0])
-    return chosen, ver
-
-
-def ensure_proxypass(game_dir, tag=None, force=False, progress=None):
-    jar = PROXY_DIR / "ProxyPass.jar"
-    s = load_settings()
-    # Resolve the wanted build first — in "auto" it depends on the chosen
-    # Minecraft version, so re-evaluate every time.
-    if tag:
-        rel = next((r for r in gh_releases(PROXYPASS_REPO, 50)
-                    if r["tag_name"] == tag), None)
-        ver = mc_version_str(game_dir)
-    else:
-        rel, ver = pick_proxypass(game_dir)
-    if not rel:
-        die(f"ProxyPass '{tag}' not found.")
-    want = rel["tag_name"]
-    if jar.exists() and not force and s.get("proxypass_tag") == want:
-        info(f"ProxyPass already up to date ({want}, MC {ver or '?'})")
-        return jar
-    prev = s.get("proxypass_tag")
-    url, _, _ = asset_url(rel, lambda n: n == "ProxyPass.jar")
-    if not url:
-        die("ProxyPass.jar asset missing.")
-    PROXY_DIR.mkdir(parents=True, exist_ok=True)
-    info(f"ProxyPass {prev or '∅'} → {want} (MC {ver or '?'}) …")
-    download(url, jar, f"ProxyPass {want}", progress)
-    s["proxypass_tag"] = want
-    s["mc_version"] = ver
-    save_settings(s)
-    ok(f"ProxyPass {want} (MC {ver or '?'}) ready")
-    return jar
-
-
-def proxypass_config(host, port):
-    PROXY_DIR.mkdir(parents=True, exist_ok=True)
-    (PROXY_DIR / "config.yml").write_text(f"""## generated by {APP}
-proxy:
-  host: 0.0.0.0
-  port: 19132
-destination:
-  host: {host}
-  port: {port}
-online-mode: true
-save-auth-details: true
-broadcast-session: false
-max-clients: 0
-packet-testing: false
-log-packets: true
-log-to: both
-enable-ui: false
-follow-transfers: true
-download-packs: true
-invert-ignored-list: false
-ignored-packets:
-  - "NetworkStackLatencyPacket"
-  - "LevelChunkPacket"
-  - "MovePlayerPacket"
-  - "PlayerAuthInputPacket"
-  - "NetworkChunkPublisherUpdatePacket"
-  - "ClientCacheBlobStatusPacket"
-  - "ClientCacheMissResponsePacket"
-""")
-
-
-def proxypass_signed_in():
-    f = PROXY_DIR / "auth.json"          # cached Microsoft token
-    if f.is_file() and f.stat().st_size > 2:
-        return True
-    d = PROXY_DIR / "data"          # older ProxyPass layout
-    return d.is_dir() and any(d.iterdir())
-
-
 def _pkill(pattern):
     """Best-effort kill of processes whose cmdline matches `pattern`."""
     if shutil.which("pkill"):
@@ -654,115 +544,10 @@ def _pkill(pattern):
             pass
 
 
-class ProxyPass:
-    """The multiplayer relay. Stale instances are killed before start so
-    the 0.0.0.0:19132 bind never fails."""
+# ----------------------------------------------------------------------
+# In-game Microsoft login (this branch: no ProxyPass at all)
+# ----------------------------------------------------------------------
 
-    def __init__(self):
-        self.proc = None
-        self.auth = None        # (url, code)
-        self.online = False
-        self.dest = None        # (host, port) the running relay points at
-        self.client_seen = False
-        self.ready = False
-
-    def running(self):
-        return self.proc and self.proc.poll() is None
-
-    def start(self, on_auth=None, on_online=None, dest=None):
-        if self.running():
-            return
-        _pkill("ProxyPass.jar")          # free 19132 from any stale instance
-        time.sleep(1)
-        jar = PROXY_DIR / "ProxyPass.jar"
-        java = JRE_DIR / "bin/java"
-        log = open(LOGS / "proxypass.log", "w")
-        self.auth = None
-        self.online = False
-        self.client_seen = False
-        self.ready = False
-        self.dest = dest
-        if dest:
-            info(f"Relay → {dest[0]}:{dest[1]} (local :19132)")
-        self.proc = subprocess.Popen(
-            [str(java), "-jar", str(jar)], cwd=str(PROXY_DIR),
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-
-        def pump():
-            for line in self.proc.stdout:
-                log.write(line)
-                log.flush()
-                msg = line.strip().split("]: ")[-1].split(" - ")[-1]
-                if re.search(r"Address already in use|Failed to bind", line, re.I):
-                    err("Port 19132 in use — close other instances.")
-                u = re.search(r"(https?://\S*microsoft\.com/"
-                              r"(?:link|devicelogin)\S*)", line, re.I)
-                cd = re.search(r"\bcode[:\s]+([A-Z0-9]{6,9})\b", line, re.I)
-                if u or cd:
-                    self.auth = (u.group(1) if u else
-                                 "https://www.microsoft.com/link",
-                                 cd.group(1) if cd else None)
-                    if on_auth:
-                        on_auth(*self.auth)
-                    info(f"Microsoft sign-in → {self.auth[0]} "
-                         f"code {self.auth[1]}")
-                if not self.online and re.search(
-                        r"logged in|authenticat|chain|XUID|Saved", line, re.I):
-                    self.online = True
-                    if on_online:
-                        on_online()
-                    ok("Microsoft account connected")
-                if re.search(r"Resolving server address|Loading server",
-                             line, re.I):
-                    info(msg)
-                if not self.ready and re.search(
-                        r"(?:Bedrock|NetherNet) server started on",
-                        line, re.I):
-                    self.ready = True
-                    threading.Thread(target=self._watchdog,
-                                     daemon=True).start()
-                    ok("Relay ready — in game: Play ▸ Worlds ▸ "
-                       "'ProxyPass'.")
-                if not self.client_seen and re.search(
-                        r"Dispatching New Connection|Initializing proxy "
-                        r"session|LoginPacket|Player .*connect|"
-                        r"received .* from /", line, re.I):
-                    self.client_seen = True
-                    ok("Client connecting …")
-                if re.search(r"outdated client|outdated server|"
-                             r"ProtocolException", line, re.I):
-                    err("ProxyPass ↔ Minecraft version mismatch.")
-                elif re.search(r"No route to host|UnknownHost|downstream "
-                               r"server.*(?:refused|timed? ?out)", line, re.I):
-                    err(f"Server {self.dest} unreachable — {msg}")
-                elif re.search(r"disconnect|kicked|Connection "
-                               r"(?:reset|closed|refused)", line, re.I):
-                    warn(msg)
-                elif re.search(r"Exception|ERROR|SEVERE", line) and \
-                        "StaticLoggerBinder" not in line:
-                    warn(msg[:200])
-        threading.Thread(target=pump, daemon=True).start()
-
-    def _watchdog(self):
-        time.sleep(50)
-        if self.client_seen or not self.running():
-            return
-        warn("No client after 50 s — in game: Play ▸ Worlds ▸ "
-             "'ProxyPass'. Otherwise open 'ProxyPass logs'.")
-
-    def stop(self):
-        if self.running():
-            self.proc.terminate()
-            try:
-                self.proc.wait(5)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
-        _pkill("ProxyPass.jar")
-
-
-# ---------------------------------------------------------------------------
-# Native in-game login (no ProxyPass) — see docs/native-login.md
-# ---------------------------------------------------------------------------
 
 def msa_load():
     f = MSA_DIR / "token.json"
@@ -804,8 +589,8 @@ def msa_refresh(refresh_token):
     return t if t.get("refresh_token") else None
 
 
-def account_signed_in(native):
-    return msa_signed_in() if native else proxypass_signed_in()
+def account_signed_in(*_):
+    return msa_signed_in()
 
 
 class NativeAuth:
@@ -1210,19 +995,10 @@ def do_setup(game_dir=None, mc_ver=None, proton_tag=None, pp_tag=None,
     if load_settings().get("proton_source") == "winegdk":
         ensure_winegdk(force, progress)        # build from the WineGDK fork
     else:
-        ensure_proton(proton_tag, force, progress)
+        ensure_proton(proton_tag, force, progress)  # user-supplied dir/url
     ensure_umu(force)
-    ensure_jre(force)
-    native = bool(load_settings().get("native_login"))
-    if not native:                             # ProxyPass is the fallback path
-        ensure_proxypass(gd, pp_tag, force, progress)
     fix_curl_ssl(gd)
-    s = load_settings()
-    s.setdefault("server", {"host": "play.linesia.net", "port": 19132})
-    save_settings(s)
-    if not native:
-        proxypass_config(s["server"]["host"], s["server"]["port"])
-    ok("Setup complete.")
+    ok("Setup complete — click PLAY, then sign in to Microsoft in-game.")
 
 
 _DIAG_RULES = [
@@ -1238,31 +1014,24 @@ _DIAG_RULES = [
      "GPU/Vulkan crash — update the driver or lower graphics."),
     (r"Cannot allocate memory|OutOfMemory|std::bad_alloc",
      "Out of memory (RAM/VRAM)."),
-    (r"Address already in use|Failed to bind RakNet",
-     "Port 19132 in use — close other ProxyPass instances."),
-    (r"outdated client|outdated server|ProtocolException",
-     "ProxyPass ↔ Minecraft version mismatch — change the ProxyPass "
-     "build (master-… follows the recent protocol)."),
     (r"Authentication failed|invalid_grant|login.*failed",
-     "Microsoft sign-in failed — click 'Sign in' again."),
+     "Microsoft sign-in failed in-game — sign in again "
+     "(open the link, enter the code)."),
     (r"nodrv_CreateWindow|no driver could be loaded|"
      r"explorer process failed to start",
      "Wine prefix broken — click 'Repair' then relaunch."),
     (r"0x80004001|E_NOTIMPL|XUserAddAsync|xgameruntime.*(?:unimpl|stub)|"
      r"QueryApiImpl.*unimpl",
-     "In-game login: this GDK-Proton has no WineGDK XUser, so native "
-     "Microsoft sign-in cannot work yet (upstream WIP). Use ProxyPass: "
-     "'bedrock-on-linux config --native-login off'."),
+     "The GDK-Proton in use has no WineGDK XUser — rebuild from your "
+     "fork: 'bedrock-on-linux setup --winegdk --force'."),
 ]
 
 
 def diagnose():
-    """Scan game + relay logs and surface a likely cause."""
+    """Scan game logs and surface a likely cause."""
     blobs = []
-    paths = [LOGS / n for n in ("proton.log", "minecraft.log",
-                                "proxypass.log")]
-    paths.append(PROXY_DIR / "logs" / "latest.log")
-    for p in paths:
+    for p in (LOGS / "proton.log", LOGS / "minecraft.log",
+              LOGS / "winegdk-build.log"):
         if p.exists():
             try:
                 blobs.append(p.read_text(errors="ignore")[-200000:])
@@ -1270,24 +1039,9 @@ def diagnose():
                 pass
     text = "\n".join(blobs)
     hits = [msg for pat, msg in _DIAG_RULES if re.search(pat, text, re.I)]
-    if load_settings().get("native_login"):
-        # No relay in native mode — relay checks would only mislead.
-        hits.append("In-game login is ON. It needs a GDK-Proton built with "
-                    "WineGDK XUser (upstream PR #33, not released yet); with "
-                    "the stock build the game shows 'Authentication failed' "
-                    "(0x80004001). Working path today: "
-                    "'bedrock-on-linux config --native-login off' (ProxyPass).")
-    else:
-        relay_up = re.search(r"(?:Bedrock|NetherNet) server started on", text)
-        joined = re.search(r"Dispatching New Connection|Initializing proxy "
-                           r"session|LoginPacket|Player .*connect|"
-                           r"received .* from /", text, re.I)
-        if relay_up and not joined:
-            hits.append("Relay OK but no client connected — in game: "
-                        "Play ▸ Worlds ▸ 'ProxyPass'.")
-        elif not relay_up:
-            hits.append("The relay did not start — see 'ProxyPass logs' "
-                        "(often: reconnect the Microsoft account).")
+    if not msa_signed_in():
+        hits.append("No Microsoft account linked — click 'Sign in' "
+                    "before PLAY.")
     if hits:
         warn("Likely cause:")
         for h in dict.fromkeys(hits):
@@ -1297,57 +1051,28 @@ def diagnose():
     return hits
 
 
-def launch(pp: "ProxyPass" = None):
+def launch(_pp=None):
     s = load_settings()
     gd = s.get("game_dir")
     if not gd or not Path(gd, "Minecraft.Windows.exe").exists():
         die("No game — choose a Minecraft version first.")
     if not proton_path():
-        die("GDK-Proton missing — re-run setup.")
+        die("GDK-Proton missing — run Install / Update.")
     patch_proton(proton_path(), strict=not custom_proton())
 
-    native = bool(s.get("native_login"))
-    if native:
-        tok = msa_load().get("refresh_token")
-        if not tok:
-            die("In-game login is enabled but no Microsoft account is "
-                "linked — click 'Sign in' first.")
-        info("In-game login mode — ProxyPass disabled.")
-        try:
-            fresh = msa_refresh(tok)
-        except Exception as e:
-            fresh = None
-            warn(f"Token refresh skipped ({e}) — using cached token.")
-        if fresh:
-            msa_save({"refresh_token": fresh["refresh_token"],
-                      "obtained": int(time.time())})
-            tok = fresh["refresh_token"]
-        wine_reg_set_refresh_token(tok)
-        warn("Needs a GDK-Proton with WineGDK XUser (PR #33). Sign-in and "
-             "server join happen inside Minecraft (no LAN relay).")
-    else:
-        # Warn only if a version-locked pre/<ver> ProxyPass is older than MC.
-        mc_ver = mc_version_str(Path(gd))
-        pp_tag = s.get("proxypass_tag", "") or ""
-        m = re.match(r"pre/(\d+\.\d+\.\d+)-\d+$", pp_tag)
-        if mc_ver and m and _vt(mc_ver) > _vt(m.group(1)):
-            warn(f"ProxyPass {pp_tag} only supports MC {m.group(1)} (you are "
-                 f"on {mc_ver}) — choose a 'master-…' build.")
-        dest = (s["server"]["host"], int(s["server"]["port"]))
-        proxypass_config(*dest)
-        if pp is None:
-            pp = ProxyPass()
-        # The relay reads config.yml only at startup → restart it if the
-        # chosen server changed.
-        if pp.running() and pp.dest != dest:
-            info(f"Server changed → restarting the relay ({dest})")
-            pp.stop()
-            time.sleep(1)
-        if not pp.running():
-            info("Starting the relay …")
-            pp.start(dest=dest)
-        else:
-            info(f"Relay already active → {dest[0]}:{dest[1]}")
+    tok = msa_load().get("refresh_token")
+    if not tok:
+        die("No Microsoft account linked — click 'Sign in' first.")
+    try:
+        fresh = msa_refresh(tok)
+    except Exception as e:
+        fresh = None
+        warn(f"Token refresh skipped ({e}) — using cached token.")
+    if fresh:
+        msa_save({"refresh_token": fresh["refresh_token"],
+                  "obtained": int(time.time())})
+        tok = fresh["refresh_token"]
+    wine_reg_set_refresh_token(tok)
     kill_wine()
     exe = str(CONTENT / "Minecraft.Windows.exe")
     cmd, env = proton_umu_cmd(exe)
@@ -1372,12 +1097,8 @@ def launch(pp: "ProxyPass" = None):
                     pass
     elif os.environ.get("WAYLAND_DISPLAY"):
         warn("Wayland session without X DISPLAY — install XWayland.")
-    if native:
-        info("Launching Minecraft … Sign in with Microsoft, then add and "
-             "join your server in-game (Play ▸ Servers).")
-    else:
-        info("Launching Minecraft … In game: Play ▸ Worlds ▸ the "
-             "LAN world 'ProxyPass'.")
+    info("Launching Minecraft … sign in with Microsoft in-game, then "
+         "join your server from the Servers tab.")
     glog = open(LOGS / "minecraft.log", "w")
     rc = None
     try:
@@ -1430,10 +1151,9 @@ def gui():
     FG, SUB, ACC, ACC2, FIELD = "#e8eaed", "#9aa0aa", "#43a047", "#4caf50", "#21262f"
 
     s = load_settings()
-    srv = s.get("server", {})
     root = tk.Tk()
     root.title(f"{PRETTY} {VERSION}")
-    root.minsize(720, 690)
+    root.minsize(720, 660)
     root.configure(bg=BG)
 
     icon_img = None
@@ -1467,19 +1187,15 @@ def gui():
     stl.configure("TCombobox", fieldbackground=FIELD, background=FIELD,
                   foreground=FG, arrowcolor=FG, borderwidth=0, padding=4)
     stl.map("TCombobox", fieldbackground=[("readonly", FIELD)])
-    stl.configure("TEntry", fieldbackground=FIELD, foreground=FG,
-                  insertcolor=FG, borderwidth=0, padding=4)
     stl.configure("TCheckbutton", background=CARD, foreground=SUB)
-    stl.map("TCheckbutton", background=[("active", CARD)])
     stl.configure("Bar.Horizontal.TProgressbar", background=ACC2,
                   troughcolor=CARD2, borderwidth=0)
     root.option_add("*TCombobox*Listbox.background", FIELD)
     root.option_add("*TCombobox*Listbox.foreground", FG)
     root.option_add("*TCombobox*Listbox.selectBackground", ACC)
 
-    pp = ProxyPass()
     na = NativeAuth()
-    versions = {"mc": [], "proton": [], "pp": []}
+    versions = {"mc": []}
 
     head = tk.Frame(root, bg=BG)
     head.pack(fill="x", padx=20, pady=(18, 8))
@@ -1495,7 +1211,7 @@ def gui():
     ht.pack(side="left", anchor="w")
     tk.Label(ht, text="BedrockOnLinux", bg=BG, fg=FG,
              font=("", 19, "bold")).pack(anchor="w")
-    tk.Label(ht, text="Minecraft Bedrock — install, configure, play.",
+    tk.Label(ht, text="Minecraft Bedrock — WineGDK in-game login.",
              bg=BG, fg=SUB).pack(anchor="w")
 
     def card(title):
@@ -1511,7 +1227,7 @@ def gui():
         body.pack(fill="x")
         return body
 
-    cv = card("①  Minecraft version")
+    cv = card("\u2460  Minecraft version")
     beta_var = tk.BooleanVar(value=False)
     mc_var = tk.StringVar()
     mc_cb = ttk.Combobox(cv, textvariable=mc_var, width=28, state="readonly")
@@ -1520,8 +1236,6 @@ def gui():
                     command=lambda: threading.Thread(
                         target=refresh_mc, daemon=True).start()
                     ).grid(row=0, column=1, padx=12)
-    # Only a genuinely custom folder belongs here; a managed games/ path
-    # would override the version dropdown.
     _saved_gd = s.get("game_dir", "")
     try:
         _is_custom = bool(_saved_gd) and Path(_saved_gd).exists() and \
@@ -1529,29 +1243,31 @@ def gui():
     except Exception:
         _is_custom = bool(_saved_gd) and Path(_saved_gd).exists()
     own = tk.StringVar(value=_saved_gd if _is_custom else "")
-    ttk.Button(cv, text="… custom folder",
+    ttk.Button(cv, text="\u2026 custom folder",
                command=lambda: own.set(
                    filedialog.askdirectory() or own.get())
                ).grid(row=0, column=2, padx=4)
-    # Choosing a version is an explicit switch to a managed build — drop
-    # the custom folder so it stops overriding the dropdown.
     mc_cb.bind("<<ComboboxSelected>>", lambda e: own.set(""))
 
-    ce = card("②  Engine (downloaded & patched automatically)")
-    tk.Label(ce, text="GDK-Proton", bg=CARD, fg=SUB).grid(row=0, column=0, sticky="w")
-    proton_var = tk.StringVar()
-    proton_cb = ttk.Combobox(ce, textvariable=proton_var, width=20,
-                             state="readonly")
-    proton_cb.grid(row=0, column=1, padx=8)
-    tk.Label(ce, text="ProxyPass", bg=CARD, fg=SUB).grid(row=0, column=2, padx=(18, 0))
-    pp_var = tk.StringVar(value="auto")
-    pp_cb = ttk.Combobox(ce, textvariable=pp_var, width=18, state="readonly")
-    pp_cb.grid(row=0, column=3, padx=8)
-    cust_lbl = tk.StringVar(
-        value="WineGDK build (in-game login)"
-        if s.get("proton_source") == "winegdk" else
-        ("custom: " + Path(s["proton_dir"]).name) if s.get("proton_dir") else
-        ("custom URL set" if s.get("proton_url") else ""))
+    ce = card("\u2461  Engine \u2014 GDK-Proton built from your WineGDK fork")
+    eng_lbl = tk.StringVar(
+        value=("custom dir: " + Path(s["proton_dir"]).name)
+        if s.get("proton_dir") else
+        ("custom URL set" if s.get("proton_url") else
+         "build from WineGDK (Wyze3306/WineGDK)"))
+
+    def use_winegdk():
+        st = load_settings()
+        st["proton_source"] = "winegdk"
+        st.setdefault("winegdk_repo", WINEGDK_REPO)
+        st.setdefault("winegdk_branch", WINEGDK_BRANCH)
+        for k in ("proton_dir", "proton_url", "proton", "proton_tag",
+                  "winegdk_built"):
+            st.pop(k, None)
+        save_settings(st)
+        eng_lbl.set("build from WineGDK (Wyze3306/WineGDK)")
+        _LOG_SINK("OK Engine = WineGDK fork. Click 'Install / Update' "
+                  "(first build is long).")
 
     def pick_custom_proton():
         d = filedialog.askdirectory()
@@ -1563,152 +1279,72 @@ def gui():
             for k in ("proton_url", "proton", "proton_tag", "proton_source"):
                 st.pop(k, None)
             save_settings(st)
-            cust_lbl.set("custom: " + Path(d).name)
+            eng_lbl.set("custom dir: " + Path(d).name)
             _LOG_SINK(f"OK Custom GDK-Proton: {d}")
         else:
             _LOG_SINK("xx No 'proton' executable in that folder")
 
-    def use_winegdk():
-        st = load_settings()
-        st["proton_source"] = "winegdk"
-        st.setdefault("winegdk_repo", WINEGDK_REPO)
-        st.setdefault("winegdk_branch", WINEGDK_BRANCH)
-        st["native_login"] = True
-        for k in ("proton_dir", "proton_url", "proton", "proton_tag",
-                  "winegdk_built"):
-            st.pop(k, None)
-        save_settings(st)
-        cust_lbl.set("WineGDK build (in-game login)")
-        _LOG_SINK("OK Engine = build from WineGDK. Click 'Install / Update' "
-                  "(long: a full Wine build).")
+    ttk.Button(ce, text="\u2699 build from WineGDK",
+               command=use_winegdk).grid(row=0, column=0, sticky="w")
+    ttk.Button(ce, text="\u2026 custom dir",
+               command=pick_custom_proton).grid(row=0, column=1, padx=8)
+    tk.Label(ce, textvariable=eng_lbl, bg=CARD, fg="#e0b341"
+             ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
-    def clear_custom_proton():
-        st = load_settings()
-        for k in ("proton_dir", "proton_url", "proton", "proton_tag",
-                  "proton_source", "winegdk_repo", "winegdk_branch",
-                  "winegdk_built"):
-            st.pop(k, None)
-        save_settings(st)
-        cust_lbl.set("")
-        _LOG_SINK("OK GDK-Proton = auto (Weather-OS)")
-
-    ttk.Button(ce, text="⚙ build from WineGDK (login)",
-               command=use_winegdk).grid(row=1, column=0, columnspan=2,
-                                         sticky="w", pady=(8, 0))
-    ttk.Button(ce, text="… custom dir",
-               command=pick_custom_proton).grid(row=1, column=2,
-                                                sticky="w", pady=(8, 0))
-    ttk.Button(ce, text="auto", width=5,
-               command=clear_custom_proton).grid(row=1, column=3,
-                                                 sticky="w", pady=(8, 0))
-    tk.Label(ce, textvariable=cust_lbl, bg=CARD, fg="#e0b341"
-             ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(6, 0))
-
-    cs = card("③  Multiplayer server (ProxyPass relay)")
-    host_var = tk.StringVar(value=srv.get("host", "play.linesia.net"))
-    port_var = tk.StringVar(value=str(srv.get("port", 19132)))
-    tk.Label(cs, text="Address", bg=CARD, fg=SUB).grid(row=0, column=0, sticky="w")
-    ttk.Entry(cs, textvariable=host_var, width=30).grid(row=0, column=1, padx=8)
-    tk.Label(cs, text="Port", bg=CARD, fg=SUB).grid(row=0, column=2, padx=(16, 0))
-    ttk.Entry(cs, textvariable=port_var, width=8).grid(row=0, column=3, padx=8)
-
-    cm = card("④  Microsoft account (required for multiplayer)")
+    cm = card("\u2462  Microsoft account (sign in happens in-game too)")
     ms_state = tk.StringVar()
-    msl = tk.Label(cm, textvariable=ms_state, bg=CARD,
-                   font=("", 10, "bold"))
+    msl = tk.Label(cm, textvariable=ms_state, bg=CARD, font=("", 10, "bold"))
     msl.grid(row=0, column=0, sticky="w")
     ms_code = tk.StringVar(value="")
     tk.Label(cm, textvariable=ms_code, bg=CARD, fg="#e0b341"
              ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
 
-    native_var = tk.BooleanVar(value=bool(s.get("native_login")))
-
-    def cur_auth():
-        return na if native_var.get() else pp
-
-    def toggle_native():
-        st = load_settings()
-        st["native_login"] = bool(native_var.get())
-        save_settings(st)
-        (pp if native_var.get() else na).stop()
-        set_phase("in" if account_signed_in(native_var.get()) else "out")
-
-    ttk.Checkbutton(
-        cm, text="In-game login — no ProxyPass (experimental, needs a "
-        "GDK-Proton with WineGDK XUser)", variable=native_var,
-        command=toggle_native).grid(row=2, column=0, columnspan=4,
-                                    sticky="w", pady=(8, 0))
-
-    # phase: "in" (signed in) / "auth" (enter code) / "out" (signed out)
     def set_phase(ph):
         if ph == "in":
-            ms_state.set("Connected ✓")
+            ms_state.set("Connected \u2713")
             msl.configure(fg=ACC2)
             ms_code.set("")
-            b_login.grid_remove()
-            b_link.grid_remove()
-            b_code.grid_remove()
-            b_logout.grid()
+            b_login.grid_remove(); b_link.grid_remove()
+            b_code.grid_remove(); b_logout.grid()
         elif ph == "auth":
-            ms_state.set("Sign-in required — open the link and enter the code")
+            ms_state.set("Sign-in required \u2014 open the link, enter the code")
             msl.configure(fg="#e0b341")
-            b_login.grid_remove()
-            b_logout.grid_remove()
-            b_link.grid()
-            b_code.grid()
+            b_login.grid_remove(); b_logout.grid_remove()
+            b_link.grid(); b_code.grid()
         else:
             ms_state.set("Not connected")
             msl.configure(fg=SUB)
             ms_code.set("")
-            b_link.grid_remove()
-            b_code.grid_remove()
-            b_logout.grid_remove()
-            b_login.grid()
+            b_link.grid_remove(); b_code.grid_remove()
+            b_logout.grid_remove(); b_login.grid()
 
     def on_auth(u, code):
-        root.after(0, lambda: (ms_code.set(f"➜  {u}     code : {code}"),
+        root.after(0, lambda: (ms_code.set(f"\u2794  {u}     code : {code}"),
                                set_phase("auth")))
 
     def on_online():
         root.after(0, lambda: set_phase("in"))
 
     def open_link():
-        a = cur_auth()
-        if a.auth:
-            subprocess.Popen(["xdg-open", a.auth[0]],
+        if na.auth:
+            subprocess.Popen(["xdg-open", na.auth[0]],
                              stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL)
 
     def copy_code():
-        a = cur_auth()
-        if a.auth and a.auth[1]:
+        if na.auth and na.auth[1]:
             root.clipboard_clear()
-            root.clipboard_append(a.auth[1])
+            root.clipboard_append(na.auth[1])
 
     def do_logout():
-        if native_var.get():
-            msa_logout()
-            na.stop()
-        else:
-            for n in ("auth.json", "data"):
-                p = PROXY_DIR / n
-                try:
-                    shutil.rmtree(p) if p.is_dir() \
-                        else p.unlink(missing_ok=True)
-                except Exception:
-                    pass
-            pp.stop()
+        msa_logout()
+        na.stop()
         set_phase("out")
-
-    def _do_login():
-        a = cur_auth()
-        if a is pp:
-            ensure_jre()
-        a.start(on_auth, on_online)
 
     b_login = ttk.Button(cm, text="Sign in",
                          command=lambda: threading.Thread(
-                             target=_do_login, daemon=True).start())
+                             target=lambda: na.start(on_auth, on_online),
+                             daemon=True).start())
     b_login.grid(row=0, column=1, padx=6)
     b_link = ttk.Button(cm, text="Open link", command=open_link)
     b_link.grid(row=0, column=2, padx=6)
@@ -1716,14 +1352,14 @@ def gui():
     b_code.grid(row=0, column=3, padx=6)
     b_logout = ttk.Button(cm, text="Sign out", command=do_logout)
     b_logout.grid(row=0, column=1, padx=6)
-    set_phase("in" if account_signed_in(native_var.get()) else "out")
+    set_phase("in" if msa_signed_in() else "out")
 
     prog = ttk.Progressbar(root, style="Bar.Horizontal.TProgressbar",
                            mode="determinate")
     prog.pack(fill="x", padx=20, pady=(10, 4))
     lw = tk.Frame(root, bg=BG)
     lw.pack(fill="both", expand=True, padx=20, pady=4)
-    logbox = tk.Text(lw, height=8, bg="#0b0d11", fg="#79d279", bd=0,
+    logbox = tk.Text(lw, height=9, bg="#0b0d11", fg="#79d279", bd=0,
                      relief="flat", insertbackground="#79d279",
                      font=("monospace", 9), highlightthickness=0)
     logbox.pack(fill="both", expand=True)
@@ -1739,72 +1375,25 @@ def gui():
 
     foot = tk.Frame(root, bg=BG)
     foot.pack(fill="x", padx=20, pady=(8, 18))
-    btn_setup = ttk.Button(foot, text="⟳  Install / Update",
+    btn_setup = ttk.Button(foot, text="\u27f3  Install / Update",
                            command=lambda: act("setup"))
     btn_setup.pack(side="left")
-    ttk.Button(foot, text="🗎  Open logs",
+    ttk.Button(foot, text="\U0001f5ce  Open logs",
                command=lambda: subprocess.Popen(
                    ["xdg-open", str(LOGS)], stdout=subprocess.DEVNULL,
                    stderr=subprocess.DEVNULL)).pack(side="left", padx=10)
-
-    def show_pp_log():
-        win = tk.Toplevel(root)
-        win.title("ProxyPass logs — multiplayer relay (live)")
-        win.configure(bg=BG)
-        win.geometry("900x520")
-        txt = tk.Text(win, bg="#0c0c0c", fg="#d6d6d6", insertbackground="#d6d6d6",
-                      font=("monospace", 9), wrap="none", borderwidth=0)
-        sb = ttk.Scrollbar(win, command=txt.yview)
-        txt.configure(yscrollcommand=sb.set)
-        sb.pack(side="right", fill="y")
-        txt.pack(fill="both", expand=True, padx=6, pady=6)
-        lf = PROXY_DIR / "logs" / "latest.log"
-        st = {"sz": 0, "alive": True}
-
-        def tick():
-            if not st["alive"] or not win.winfo_exists():
-                return
-            try:
-                if lf.exists():
-                    sz = lf.stat().st_size
-                    if sz < st["sz"]:           # rotated → reload
-                        st["sz"] = 0
-                        txt.delete("1.0", "end")
-                    if sz > st["sz"]:
-                        with open(lf, "r", errors="ignore") as fh:
-                            fh.seek(st["sz"])
-                            chunk = fh.read()
-                        st["sz"] = sz
-                        at_end = txt.yview()[1] > 0.999
-                        txt.insert("end", chunk)
-                        if at_end:
-                            txt.see("end")
-                else:
-                    if not txt.get("1.0", "1.5"):
-                        txt.insert("end", "(ProxyPass not started yet — "
-                                   "click PLAY)\n")
-            except Exception as e:
-                txt.insert("end", f"\n[lecture log: {e}]\n")
-            win.after(700, tick)
-
-        win.protocol("WM_DELETE_WINDOW",
-                     lambda: (st.update(alive=False), win.destroy()))
-        tick()
-
-    ttk.Button(foot, text="🔌  ProxyPass logs",
-               command=show_pp_log).pack(side="left", padx=(0, 10))
-    ttk.Button(foot, text="🛠  Repair",
+    ttk.Button(foot, text="\U0001f6e0  Repair",
                command=lambda: threading.Thread(
                    target=reset_prefix, daemon=True).start()
                ).pack(side="left")
-    btn_play = ttk.Button(foot, text="▶    PLAY", style="Accent.TButton",
+    btn_play = ttk.Button(foot, text="\u25b6    PLAY", style="Accent.TButton",
                           command=lambda: act("play"))
     btn_play.pack(side="right")
 
     def refresh_mc():
         try:
             versions["mc"] = list_mc_versions(beta_var.get())
-            vals = [v["tag"] + ("  · beta" if v["beta"] else "")
+            vals = [v["tag"] + ("  \u00b7 beta" if v["beta"] else "")
                     for v in versions["mc"]]
 
             def ap():
@@ -1819,34 +1408,15 @@ def gui():
         except Exception as e:
             _LOG_SINK(f"xx versions MC: {e}")
 
-    def refresh_engine():
-        versions["proton"] = list_proton_tags() or ["latest"]
-        versions["pp"] = ["auto"] + list_proxypass_tags()
-
-        def ap():
-            proton_cb.configure(values=versions["proton"])
-            proton_var.set(versions["proton"][0])
-            pp_cb.configure(values=versions["pp"])
-            pp_var.set("auto")
-        root.after(0, ap)
-
     threading.Thread(target=refresh_mc, daemon=True).start()
-    threading.Thread(target=refresh_engine, daemon=True).start()
 
     def collect():
-        st = load_settings()
-        st["server"] = {"host": host_var.get().strip() or "play.linesia.net",
-                        "port": int(port_var.get() or 19132)}
-        st["native_login"] = bool(native_var.get())
-        save_settings(st)
         mc = None
         if not own.get() and mc_var.get() and versions["mc"]:
-            labels = [v["tag"] + ("  · beta" if v["beta"] else "")
+            labels = [v["tag"] + ("  \u00b7 beta" if v["beta"] else "")
                       for v in versions["mc"]]
             mc = versions["mc"][labels.index(mc_var.get())]
-        pt = None if proton_var.get() in ("", "latest") else proton_var.get()
-        ppt = None if pp_var.get() in ("", "auto") else pp_var.get()
-        return mc, pt, ppt
+        return mc
 
     def busy(on):
         for b in (btn_setup, btn_play):
@@ -1857,15 +1427,13 @@ def gui():
 
         def work():
             try:
-                mc, pt, ppt = collect()
-                # 'Install / Update' forces a real refresh; PLAY stays fast
+                mc = collect()
                 do_setup(game_dir=own.get() or None, mc_ver=mc,
-                         proton_tag=pt, pp_tag=ppt,
                          force=(kind == "setup"), progress=set_progress)
                 if kind == "play":
-                    launch(pp)
+                    launch()
                 else:
-                    _LOG_SINK("OK Ready — click PLAY")
+                    _LOG_SINK("OK Ready \u2014 click PLAY")
             except Exception as e:
                 _LOG_SINK(f"xx {e}")
             finally:
@@ -1873,7 +1441,6 @@ def gui():
         threading.Thread(target=work, daemon=True).start()
 
     def on_close():
-        pp.stop()
         na.stop()
         root.destroy()
     root.protocol("WM_DELETE_WINDOW", on_close)
@@ -1889,21 +1456,17 @@ def main():
     sp.add_argument("--mc", help="Minecraft version tag from the archive "
                                  "(e.g. 1.26.21.1)")
     sp.add_argument("--beta", action="store_true", help="allow beta versions")
-    sp.add_argument("--proton", help="GDK-Proton tag (default: latest)")
-    sp.add_argument("--proxypass", help="ProxyPass tag (default: auto)")
+    sp.add_argument("--proton", help="(advanced) Weather-OS GDK-Proton tag")
     sp.add_argument("--winegdk", action="store_true",
-                    help="build & use the WineGDK fork (in-game login)")
+                    help="(default) build & use the WineGDK fork")
     sp.add_argument("--force", action="store_true")
 
-    sub.add_parser("play", help="launch the game + ProxyPass")
+    sub.add_parser("play", help="launch the game (in-game Microsoft login)")
     lv = sub.add_parser("versions", help="list available Minecraft versions")
     lv.add_argument("--beta", action="store_true")
     cf = sub.add_parser("config", help="show/set settings")
-    cf.add_argument("--server", help="destination server  host:port")
-    cf.add_argument("--native-login", choices=["on", "off"],
-                    help="in-game Microsoft login (no ProxyPass, experimental)")
     cf.add_argument("--proton-dir", metavar="PATH",
-                    help="use a local GDK-Proton build (e.g. a fork with "
+                    help="use a local GDK-Proton build (a fork with "
                          "WineGDK XUser)")
     cf.add_argument("--proton-url", metavar="URL",
                     help="download a custom GDK-Proton .tar.gz")
@@ -1933,7 +1496,7 @@ def main():
                 st.setdefault("winegdk_branch", WINEGDK_BRANCH)
                 st["native_login"] = True
                 save_settings(st)
-            do_setup(a.game_dir, mc, a.proton, a.proxypass, a.force)
+            do_setup(a.game_dir, mc, a.proton, None, a.force)
             ok(f"Done. Run:  {APP} play")
         elif a.cmd == "play":
             launch()
@@ -1943,21 +1506,7 @@ def main():
                       f"   {v['size']>>20} MiB")
         elif a.cmd == "config":
             st = load_settings()
-            srv = st.setdefault("server",
-                                {"host": "play.linesia.net", "port": 19132})
             touched = False
-            if a.server:
-                h, _, pt = a.server.partition(":")
-                srv.update(host=h, port=int(pt or 19132))
-                save_settings(st)
-                proxypass_config(srv["host"], srv["port"])
-                ok(f"Server = {srv['host']}:{srv['port']}")
-                touched = True
-            if a.native_login:
-                st["native_login"] = (a.native_login == "on")
-                save_settings(st)
-                ok(f"In-game login (no ProxyPass) = {a.native_login}")
-                touched = True
             if a.proton_dir:
                 pth = str(Path(a.proton_dir).expanduser())
                 if not (Path(pth) / "proton").exists():
@@ -2002,9 +1551,6 @@ def main():
             if not touched:
                 print(json.dumps(st, indent=2))
         elif a.cmd == "login":
-            if not load_settings().get("native_login"):
-                die("Enable it first:  "
-                    f"{APP} config --native-login on")
             na = NativeAuth()
             if na.signed_in():
                 ok("A Microsoft account is already linked.")
