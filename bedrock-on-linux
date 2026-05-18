@@ -63,6 +63,8 @@ WINEGDK_REPO = "https://github.com/Wyze3306/WineGDK.git"
 WINEGDK_BRANCH = "master"
 WINEGDK_SRC = DATA / "winegdk-src"
 WINEGDK_OUT = PROTON_DIR / "GDK-Proton-xuser"
+# Bump when the build/packaging method changes → forces a clean rebuild.
+WINEGDK_BUILD_REV = "ovl2-prefix"
 
 # Direct package list for a 64-bit WineGDK build that can display/run the
 # game — avoids `apt build-dep wine` (needs deb-src, absent on Mint/LMDE).
@@ -920,8 +922,9 @@ def ensure_winegdk(force=False, progress=None):
     signing) and wire it in for native in-game login. The Wine build is
     long; results are cached by source commit."""
     commit = _winegdk_sync()
+    want = commit + ":" + WINEGDK_BUILD_REV
     s = load_settings()
-    if (WINEGDK_OUT / "proton").exists() and s.get("winegdk_built") == commit \
+    if (WINEGDK_OUT / "proton").exists() and s.get("winegdk_built") == want \
             and not force:
         info(f"WineGDK build up to date ({commit[:9]})")
     else:
@@ -933,8 +936,17 @@ def ensure_winegdk(force=False, progress=None):
                 + _pm_hint().format(WINE_BUILD_PKGS)
                 + "\n  then re-run Install / Update.")
         base = _stock_proton_root(progress)
+        # Build Wine straight into a fresh copy of the stock GDK-Proton's
+        # files/ — so wine, wine64, wineserver and libwine all come from the
+        # SAME build (a partial overlay gave "wineserver version mismatch
+        # 864/931" → instant crash). Proton's non-Wine bits (the proton
+        # script, dxvk, vkd3d) stay; only Wine is replaced, coherently.
+        info("Preparing GDK-Proton base …")
+        shutil.rmtree(WINEGDK_OUT, ignore_errors=True)
+        run(["cp", "-a", str(base), str(WINEGDK_OUT)])
+        prefix = WINEGDK_OUT / "files"
         bdir = WINEGDK_SRC / "build-bol"
-        inst = bdir / "_install"
+        cfg_stamp = bdir / ".bol-configured"
         logf = LOGS / "winegdk-build.log"
         LOGS.mkdir(parents=True, exist_ok=True)
         info(f"Building WineGDK — long (full Wine build); log: {logf}")
@@ -947,34 +959,19 @@ def ensure_winegdk(force=False, progress=None):
                                   stderr=subprocess.STDOUT).returncode:
                     die(f"WineGDK build failed: {' '.join(cmd[:2])} … — "
                         f"see {logf}")
-            if not (bdir / "Makefile").exists() or force:
+            if not cfg_stamp.exists() or force:
                 sh([str(WINEGDK_SRC / "configure"), "--enable-win64",
-                    "--disable-tests", f"--prefix={inst}"], bdir)
+                    "--disable-tests", f"--prefix={prefix}"], bdir)
+                cfg_stamp.write_text(str(prefix))
             info("  configure done — compiling (the long part) …")
             sh(["make", f"-j{os.cpu_count() or 2}"], bdir)
-            info("  compiled — staging …")
+            info("  compiled — installing Wine into the Proton tree …")
             sh(["make", "install"], bdir)
-        info("Packaging into GDK-Proton (overlay on stock) …")
-        shutil.rmtree(WINEGDK_OUT, ignore_errors=True)
-        run(["cp", "-a", str(base), str(WINEGDK_OUT)])
-        wsrc = next((p for p in inst.rglob("wine") if p.is_dir()
-                     and p.parent.name.startswith("lib")), None)
-        wdst = next((p for p in (WINEGDK_OUT / "files").rglob("wine")
-                     if p.is_dir() and p.parent.name.startswith("lib")), None)
-        if not wsrc or not wdst:
-            die(f"Built Wine libdir not found — see {logf}")
-        run(["cp", "-a", str(wsrc) + "/.", str(wdst) + "/"])
-        for b in ("wine", "wine64", "wineserver"):
-            sb = next((p for p in inst.rglob(b) if p.is_file()), None)
-            db = next((p for p in (WINEGDK_OUT / "files").rglob(b)
-                       if p.is_file()), None)
-            if sb and db:
-                shutil.copy2(sb, db)
-        if not any((WINEGDK_OUT / "files").rglob("xgameruntime.dll")):
-            warn("xgameruntime.dll absent from the overlay — build/layout "
-                 "may be off (see logs).")
+        if not any((prefix).rglob("xgameruntime.dll")):
+            warn("xgameruntime.dll absent after install — build/layout off "
+                 "(see logs).")
         s = load_settings()
-        s["winegdk_built"] = commit
+        s["winegdk_built"] = want
         save_settings(s)
         ok(f"WineGDK GDK-Proton ready ({commit[:9]})")
     s = load_settings()
@@ -1024,6 +1021,9 @@ _DIAG_RULES = [
      "GPU/Vulkan crash — update the driver or lower graphics."),
     (r"Cannot allocate memory|OutOfMemory|std::bad_alloc",
      "Out of memory (RAM/VRAM)."),
+    (r"wineserver.*version mismatch|wineserver binary was not upgraded",
+     "Broken WineGDK packaging (wine vs wineserver mismatch) — rebuild: "
+     "'bedrock-on-linux setup --winegdk --force'."),
     (r"Authentication failed|invalid_grant|login.*failed",
      "Microsoft sign-in failed in-game — sign in again "
      "(open the link, enter the code)."),
