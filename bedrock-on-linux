@@ -60,6 +60,14 @@ MSA_CONNECT = "https://login.live.com/oauth20_connect.srf"
 MSA_TOKEN = "https://login.live.com/oauth20_token.srf"
 WINEGDK_REG = r"Software\Wine\WineGDK"  # value RefreshToken (REG_SZ)
 
+# Build a GDK-Proton from the user's WineGDK fork (XUser + signing) so the
+# Microsoft login works in-game. Source is cloned/updated here and built;
+# the result is overlaid onto a stock GDK-Proton. See docs/build-xuser-engine.md.
+WINEGDK_REPO = "https://github.com/Wyze3306/WineGDK.git"
+WINEGDK_BRANCH = "master"
+WINEGDK_SRC = DATA / "winegdk-src"
+WINEGDK_OUT = PROTON_DIR / "GDK-Proton-xuser"
+
 IS_TTY = sys.stdout.isatty()
 _LOG_SINK = None       # GUI hook: callable(str)
 
@@ -1055,6 +1063,136 @@ def _auto_mc_version(s):
                  or v["tag"].startswith(want + ".")), vs[0]) if want else vs[0]
 
 
+def _pm_hint():
+    return next((h for pm, h in (
+        ("apt-get", "sudo apt install {}"), ("dnf", "sudo dnf install {}"),
+        ("pacman", "sudo pacman -S {}"), ("zypper", "sudo zypper in {}"))
+        if shutil.which(pm)), "install: {}")
+
+
+def _stock_proton_root(progress=None):
+    """Latest Weather-OS GDK-Proton extracted to PROTON_DIR/_stock — the
+    overlay base for a WineGDK build (kept apart from the active proton)."""
+    base = PROTON_DIR / "_stock"
+    root = next(base.glob("GDK-Proton*"), None) if base.exists() else None
+    if root and (root / "proton").exists():
+        return root
+    rel = gh_latest(GDK_PROTON_REPO)
+    url, fname, _ = asset_url(rel, lambda n: n.endswith(".tar.gz"))
+    if not url:
+        die("Stock GDK-Proton archive not found.")
+    tar = CACHE / fname
+    if not tar.exists():
+        info(f"Downloading base GDK-Proton {rel['tag_name']} …")
+        download(url, tar, "GDK-Proton (base)", progress)
+    info("Extracting base GDK-Proton …")
+    shutil.rmtree(base, ignore_errors=True)
+    base.mkdir(parents=True)
+    with tarfile.open(tar) as t:
+        t.extractall(base)
+    root = next(base.glob("GDK-Proton*"))
+    if not (root / "proton").exists():
+        die("Invalid base GDK-Proton archive.")
+    return root
+
+
+def _winegdk_sync():
+    """Clone or shallow-update the WineGDK fork; return its HEAD commit."""
+    s = load_settings()
+    repo = s.get("winegdk_repo") or WINEGDK_REPO
+    branch = s.get("winegdk_branch") or WINEGDK_BRANCH
+    if not shutil.which("git"):
+        die("git is required — " + _pm_hint().format("git"))
+    if (WINEGDK_SRC / ".git").is_dir():
+        info(f"Updating WineGDK ({branch}) …")
+        run(["git", "-C", str(WINEGDK_SRC), "fetch", "--depth=1", "origin",
+             branch], capture_output=True)
+        run(["git", "-C", str(WINEGDK_SRC), "checkout", "-q", "-B", branch,
+             "FETCH_HEAD"], capture_output=True)
+    else:
+        info(f"Cloning WineGDK {repo} ({branch}) — large, one time …")
+        shutil.rmtree(WINEGDK_SRC, ignore_errors=True)
+        run(["git", "clone", "--depth=1", "--branch", branch, repo,
+             str(WINEGDK_SRC)])
+    r = subprocess.run(["git", "-C", str(WINEGDK_SRC), "rev-parse", "HEAD"],
+                        capture_output=True, text=True)
+    return r.stdout.strip()
+
+
+def ensure_winegdk(force=False, progress=None):
+    """Build a GDK-Proton from the user's WineGDK fork (XUser + request
+    signing) and wire it in for native in-game login. The Wine build is
+    long; results are cached by source commit."""
+    commit = _winegdk_sync()
+    s = load_settings()
+    if (WINEGDK_OUT / "proton").exists() and s.get("winegdk_built") == commit \
+            and not force:
+        info(f"WineGDK build up to date ({commit[:9]})")
+    else:
+        need = [t for t in ("git", "gcc", "make", "flex", "bison",
+                             "x86_64-w64-mingw32-gcc") if not shutil.which(t)]
+        if need:
+            die("Build tools missing: " + " ".join(need) + "\n"
+                "  Debian/Ubuntu:  sudo apt build-dep wine  &&  "
+                + _pm_hint().format("flex bison gcc-mingw-w64-x86-64 "
+                "pkg-config libfreetype-dev libvulkan-dev libgnutls28-dev")
+                + "\n  then re-run Install / Update.")
+        base = _stock_proton_root(progress)
+        bdir = WINEGDK_SRC / "build-bol"
+        inst = bdir / "_install"
+        logf = LOGS / "winegdk-build.log"
+        LOGS.mkdir(parents=True, exist_ok=True)
+        info(f"Building WineGDK — long (full Wine build); log: {logf}")
+        bdir.mkdir(parents=True, exist_ok=True)
+        with open(logf, "w") as lf:
+            def sh(cmd, cwd):
+                lf.write("\n$ " + " ".join(cmd) + "\n")
+                lf.flush()
+                if subprocess.run(cmd, cwd=str(cwd), stdout=lf,
+                                  stderr=subprocess.STDOUT).returncode:
+                    die(f"WineGDK build failed: {' '.join(cmd[:2])} … — "
+                        f"see {logf}")
+            if not (bdir / "Makefile").exists() or force:
+                sh([str(WINEGDK_SRC / "configure"), "--enable-win64",
+                    "--disable-tests", f"--prefix={inst}"], bdir)
+            info("  configure done — compiling (the long part) …")
+            sh(["make", f"-j{os.cpu_count() or 2}"], bdir)
+            info("  compiled — staging …")
+            sh(["make", "install"], bdir)
+        info("Packaging into GDK-Proton (overlay on stock) …")
+        shutil.rmtree(WINEGDK_OUT, ignore_errors=True)
+        run(["cp", "-a", str(base), str(WINEGDK_OUT)])
+        wsrc = next((p for p in inst.rglob("wine") if p.is_dir()
+                     and p.parent.name.startswith("lib")), None)
+        wdst = next((p for p in (WINEGDK_OUT / "files").rglob("wine")
+                     if p.is_dir() and p.parent.name.startswith("lib")), None)
+        if not wsrc or not wdst:
+            die(f"Built Wine libdir not found — see {logf}")
+        run(["cp", "-a", str(wsrc) + "/.", str(wdst) + "/"])
+        for b in ("wine", "wine64", "wineserver"):
+            sb = next((p for p in inst.rglob(b) if p.is_file()), None)
+            db = next((p for p in (WINEGDK_OUT / "files").rglob(b)
+                       if p.is_file()), None)
+            if sb and db:
+                shutil.copy2(sb, db)
+        if not any((WINEGDK_OUT / "files").rglob("xgameruntime.dll")):
+            warn("xgameruntime.dll absent from the overlay — build/layout "
+                 "may be off (see logs).")
+        s = load_settings()
+        s["winegdk_built"] = commit
+        save_settings(s)
+        ok(f"WineGDK GDK-Proton ready ({commit[:9]})")
+    s = load_settings()
+    s["proton"] = str(WINEGDK_OUT)
+    s["proton_tag"] = "winegdk"
+    s["proton_dir"] = str(WINEGDK_OUT)   # so launch/patch treat it as custom
+    s["proton_source"] = "winegdk"
+    s["native_login"] = True             # the whole point of this engine
+    save_settings(s)
+    patch_proton(WINEGDK_OUT, strict=False)
+    return WINEGDK_OUT
+
+
 def do_setup(game_dir=None, mc_ver=None, proton_tag=None, pp_tag=None,
              force=False, progress=None):
     mkdirs()
@@ -1069,15 +1207,21 @@ def do_setup(game_dir=None, mc_ver=None, proton_tag=None, pp_tag=None,
     if not cur or not _game_root(Path(cur)):
         use_game_dir(download_game(_auto_mc_version(s), progress, force=force))
     gd = Path(load_settings()["game_dir"])
-    ensure_proton(proton_tag, force, progress)
+    if load_settings().get("proton_source") == "winegdk":
+        ensure_winegdk(force, progress)        # build from the WineGDK fork
+    else:
+        ensure_proton(proton_tag, force, progress)
     ensure_umu(force)
     ensure_jre(force)
-    ensure_proxypass(gd, pp_tag, force, progress)
+    native = bool(load_settings().get("native_login"))
+    if not native:                             # ProxyPass is the fallback path
+        ensure_proxypass(gd, pp_tag, force, progress)
     fix_curl_ssl(gd)
     s = load_settings()
     s.setdefault("server", {"host": "play.linesia.net", "port": 19132})
     save_settings(s)
-    proxypass_config(s["server"]["host"], s["server"]["port"])
+    if not native:
+        proxypass_config(s["server"]["host"], s["server"]["port"])
     ok("Setup complete.")
 
 
@@ -1404,8 +1548,9 @@ def gui():
     pp_cb = ttk.Combobox(ce, textvariable=pp_var, width=18, state="readonly")
     pp_cb.grid(row=0, column=3, padx=8)
     cust_lbl = tk.StringVar(
-        value=("custom: " + Path(s["proton_dir"]).name)
-        if s.get("proton_dir") else
+        value="WineGDK build (in-game login)"
+        if s.get("proton_source") == "winegdk" else
+        ("custom: " + Path(s["proton_dir"]).name) if s.get("proton_dir") else
         ("custom URL set" if s.get("proton_url") else ""))
 
     def pick_custom_proton():
@@ -1415,7 +1560,7 @@ def gui():
         st = load_settings()
         if (Path(d) / "proton").exists():
             st["proton_dir"] = d
-            for k in ("proton_url", "proton", "proton_tag"):
+            for k in ("proton_url", "proton", "proton_tag", "proton_source"):
                 st.pop(k, None)
             save_settings(st)
             cust_lbl.set("custom: " + Path(d).name)
@@ -1423,23 +1568,41 @@ def gui():
         else:
             _LOG_SINK("xx No 'proton' executable in that folder")
 
+    def use_winegdk():
+        st = load_settings()
+        st["proton_source"] = "winegdk"
+        st.setdefault("winegdk_repo", WINEGDK_REPO)
+        st.setdefault("winegdk_branch", WINEGDK_BRANCH)
+        st["native_login"] = True
+        for k in ("proton_dir", "proton_url", "proton", "proton_tag",
+                  "winegdk_built"):
+            st.pop(k, None)
+        save_settings(st)
+        cust_lbl.set("WineGDK build (in-game login)")
+        _LOG_SINK("OK Engine = build from WineGDK. Click 'Install / Update' "
+                  "(long: a full Wine build).")
+
     def clear_custom_proton():
         st = load_settings()
-        for k in ("proton_dir", "proton_url", "proton", "proton_tag"):
+        for k in ("proton_dir", "proton_url", "proton", "proton_tag",
+                  "proton_source", "winegdk_repo", "winegdk_branch",
+                  "winegdk_built"):
             st.pop(k, None)
         save_settings(st)
         cust_lbl.set("")
         _LOG_SINK("OK GDK-Proton = auto (Weather-OS)")
 
-    ttk.Button(ce, text="… custom build (XUser)",
-               command=pick_custom_proton).grid(row=1, column=0,
-                                                columnspan=2, sticky="w",
-                                                pady=(8, 0))
-    tk.Label(ce, textvariable=cust_lbl, bg=CARD, fg="#e0b341"
-             ).grid(row=1, column=2, sticky="w", pady=(8, 0))
+    ttk.Button(ce, text="⚙ build from WineGDK (login)",
+               command=use_winegdk).grid(row=1, column=0, columnspan=2,
+                                         sticky="w", pady=(8, 0))
+    ttk.Button(ce, text="… custom dir",
+               command=pick_custom_proton).grid(row=1, column=2,
+                                                sticky="w", pady=(8, 0))
     ttk.Button(ce, text="auto", width=5,
                command=clear_custom_proton).grid(row=1, column=3,
                                                  sticky="w", pady=(8, 0))
+    tk.Label(ce, textvariable=cust_lbl, bg=CARD, fg="#e0b341"
+             ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(6, 0))
 
     cs = card("③  Multiplayer server (ProxyPass relay)")
     host_var = tk.StringVar(value=srv.get("host", "play.linesia.net"))
@@ -1728,6 +1891,8 @@ def main():
     sp.add_argument("--beta", action="store_true", help="allow beta versions")
     sp.add_argument("--proton", help="GDK-Proton tag (default: latest)")
     sp.add_argument("--proxypass", help="ProxyPass tag (default: auto)")
+    sp.add_argument("--winegdk", action="store_true",
+                    help="build & use the WineGDK fork (in-game login)")
     sp.add_argument("--force", action="store_true")
 
     sub.add_parser("play", help="launch the game + ProxyPass")
@@ -1742,6 +1907,9 @@ def main():
                          "WineGDK XUser)")
     cf.add_argument("--proton-url", metavar="URL",
                     help="download a custom GDK-Proton .tar.gz")
+    cf.add_argument("--proton-winegdk", nargs="?", const="", metavar="REPO#BRANCH",
+                    help="build GDK-Proton from a WineGDK fork (in-game "
+                         "login); default: " + WINEGDK_REPO + "#" + WINEGDK_BRANCH)
     cf.add_argument("--proton-auto", action="store_true",
                     help="revert to Weather-OS/GDK-Proton releases")
     sub.add_parser("login", help="link a Microsoft account (in-game login mode)")
@@ -1758,6 +1926,13 @@ def main():
                 mc = next((v for v in vs if v["tag"] == a.mc), None)
                 if not mc:
                     die(f"Minecraft version '{a.mc}' not found.")
+            if a.winegdk:
+                st = load_settings()
+                st["proton_source"] = "winegdk"
+                st.setdefault("winegdk_repo", WINEGDK_REPO)
+                st.setdefault("winegdk_branch", WINEGDK_BRANCH)
+                st["native_login"] = True
+                save_settings(st)
             do_setup(a.game_dir, mc, a.proton, a.proxypass, a.force)
             ok(f"Done. Run:  {APP} play")
         elif a.cmd == "play":
@@ -1802,8 +1977,24 @@ def main():
                 save_settings(st)
                 ok("Custom GDK-Proton URL set — runs on next setup/play.")
                 touched = True
+            if a.proton_winegdk is not None:
+                repo, _, branch = a.proton_winegdk.partition("#")
+                st["proton_source"] = "winegdk"
+                st["winegdk_repo"] = repo or WINEGDK_REPO
+                st["winegdk_branch"] = branch or WINEGDK_BRANCH
+                st["native_login"] = True
+                for k in ("proton_dir", "proton_url", "proton", "proton_tag",
+                          "winegdk_built"):
+                    st.pop(k, None)
+                save_settings(st)
+                ok(f"GDK-Proton = build from {st['winegdk_repo']}"
+                   f"#{st['winegdk_branch']} (native login on). Run "
+                   "'Install / Update'.")
+                touched = True
             if a.proton_auto:
-                for k in ("proton_dir", "proton_url", "proton", "proton_tag"):
+                for k in ("proton_dir", "proton_url", "proton", "proton_tag",
+                          "proton_source", "winegdk_repo", "winegdk_branch",
+                          "winegdk_built"):
                     st.pop(k, None)
                 save_settings(st)
                 ok("GDK-Proton = auto (Weather-OS releases)")

@@ -59,7 +59,8 @@ say "Output         : $OUT"
 BD="$SRC/build-xuser"
 mkdir -p "$BD"
 say "configure (this is slow the first time) …"
-( cd "$BD" && ../configure --enable-win64 --without-x --disable-tests \
+# Keep X support — the game must display; do NOT pass --without-x.
+( cd "$BD" && ../configure --enable-win64 --disable-tests \
     --prefix="$BD/_install" )
 say "make -j$(nproc) … (long — a full Wine build)"
 ( cd "$BD" && make -j"$(nproc)" )

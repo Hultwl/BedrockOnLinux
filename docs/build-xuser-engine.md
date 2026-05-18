@@ -48,16 +48,25 @@ token may be needed (iterate from the build/run loop).
 
 ### Build & use it
 
+Integrated (recommended) — the launcher clones, builds, packages and wires
+it in, caching by source commit:
+
 ```bash
-scripts/build-winegdk-proton.sh        # builds ~/Bureau/WineGDK + overlays
-                                       # onto a copy of the stock GDK-Proton
-bedrock-on-linux config --proton-dir ~/.local/share/bedrock-on-linux/proton/GDK-Proton-xuser
-bedrock-on-linux config --native-login on && bedrock-on-linux login && bedrock-on-linux play
+bedrock-on-linux setup --winegdk     # or: config --proton-winegdk [REPO#BRANCH]
+bedrock-on-linux login && bedrock-on-linux play
 ```
 
-The script automates the mechanical steps but the Wine build + GDK-Proton
-overlay is **not verified by this repo** — test in-game. A full Wine build
-needs `flex bison gcc x86_64-w64-mingw32-gcc` + Wine build-deps.
+`ensure_winegdk()` does: shallow clone/update `Wyze3306/WineGDK` →
+`$BOL_HOME/winegdk-src`, check build tools (clear error if missing),
+`configure --enable-win64 --disable-tests` + `make` + `make install`
+(log: `$BOL_HOME/logs/winegdk-build.log`), overlay the built Wine tree
+onto a stock GDK-Proton → `$BOL_HOME/proton/GDK-Proton-xuser`, set it as
+the engine and turn on native login. Revert: `config --proton-auto`.
+
+`scripts/build-winegdk-proton.sh` is the standalone equivalent. Either
+way the Wine build + overlay is **not verified by this repo** — test
+in-game. Needs `flex bison gcc x86_64-w64-mingw32-gcc` + Wine build-deps
+(`sudo apt build-dep wine`).
 
 ## Assembly plan (if redoing from scratch)
 

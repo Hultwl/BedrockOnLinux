@@ -63,25 +63,31 @@ tar xzf bedrock-on-linux-*-portable.tar.gz && cd bedrock-on-linux
 ## Experimental: in-game login (no ProxyPass)
 
 This branch can sign in **inside** Minecraft instead of relaying through
-ProxyPass — the game then joins servers itself (real online play). It only
-works on a GDK-Proton build that includes the WineGDK `XUser` implementation
-(upstream WIP); otherwise keep the default ProxyPass path. Opt in:
+ProxyPass — the game then joins servers itself (real online play). It needs
+a GDK-Proton whose WineGDK implements `XUser` + request signing. The
+launcher can **build that for you** from the WineGDK fork:
 
 ```bash
-bedrock-on-linux config --native-login on
-bedrock-on-linux login          # link your Microsoft account
-bedrock-on-linux play           # then join your server in-game (Play ▸ Servers)
+bedrock-on-linux setup --winegdk     # clone + build the fork, package, wire in
+bedrock-on-linux login               # link your Microsoft account
+bedrock-on-linux play                # join your server in-game (Play ▸ Servers)
 ```
 
-In the GUI it's the *"In-game login — no ProxyPass"* checkbox in card ④.
-Default behaviour is unchanged.
+`setup --winegdk` (or GUI card ② → *"⚙ build from WineGDK (login)"*, then
+**Install / Update**) clones the fork, builds Wine, overlays it onto a
+stock GDK-Proton, and turns on in-game login. The Wine build is **long**
+and needs build tools — the launcher checks and tells you what to install
+(`sudo apt build-dep wine` + `flex bison gcc-mingw-w64-x86-64 …`). Builds
+are cached by source commit. Revert anytime: `config --proton-auto`
+(back to ProxyPass).
 
-> **Status (2026-05-18):** no public GDK-Proton ships WineGDK `XUser` yet,
-> so on the stock build the game shows *"Authentication failed (0x80004001)"*.
-> Until an XUser-capable engine exists, use ProxyPass. To point the launcher
-> at a self-built engine: `config --proton-dir <dir>` / `--proton-url <url>`
-> (`--proton-auto` reverts). Design: [`docs/native-login.md`](docs/native-login.md);
-> building the engine: [`docs/build-xuser-engine.md`](docs/build-xuser-engine.md).
+Default behaviour is unchanged (ProxyPass). Other engine options:
+`config --proton-dir <dir>` / `--proton-url <url>` for a build you supply.
+
+> The signing path is the standard proof-bound user-token scheme; if Xbox
+> rejects it a device/SISU token may be needed (iterate from the build/run
+> loop). Design: [`docs/native-login.md`](docs/native-login.md); the engine
+> build: [`docs/build-xuser-engine.md`](docs/build-xuser-engine.md).
 
 ## If something fails
 
@@ -95,7 +101,7 @@ live relay log. **🛠 Repair** rebuilds a broken Wine prefix.
 bedrock-on-linux versions
 bedrock-on-linux setup --mc 1.26.21.1
 bedrock-on-linux config --server play.linesia.net:19132
-bedrock-on-linux config --native-login on   # experimental, see above
+bedrock-on-linux setup --winegdk             # in-game login, see above
 bedrock-on-linux play
 bedrock-on-linux doctor
 ```
