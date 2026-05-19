@@ -1142,6 +1142,15 @@ def launch(_pp=None):
     # behaviour shows up in proton.log for diagnosis (force unless the user
     # set WINEDEBUG in the real environment).
     env["WINEDEBUG"] = os.environ.get("WINEDEBUG") or "+gdkc,fixme+all"
+    # Tune the PlayFab XSTS relying party WITHOUT rebuilding WineGDK
+    # (resolver honours WINEGDK_XSTS_RP_<HOST>). Iterate via
+    # `config --xsts-rp <value>`.
+    rp = s.get("xsts_rp")
+    if rp:
+        host = s.get("xsts_rp_host") or "b980a380.minecraft.playfabapi.com"
+        san = "".join(c.upper() if c.isalnum() else "_" for c in host)
+        env["WINEGDK_XSTS_RP_" + san] = rp
+        info(f"XSTS relying party override [{host}] = {rp}")
     disp = os.environ.get("DISPLAY")
     if disp:
         env["DISPLAY"] = disp
@@ -1534,6 +1543,12 @@ def main():
     lv = sub.add_parser("versions", help="list available Minecraft versions")
     lv.add_argument("--beta", action="store_true")
     cf = sub.add_parser("config", help="show/set settings")
+    cf.add_argument("--xsts-rp", metavar="RP",
+                    help="override the PlayFab XSTS relying party "
+                         "(no rebuild; '' clears)")
+    cf.add_argument("--xsts-rp-host", metavar="HOST",
+                    help="host the --xsts-rp override applies to "
+                         "(default: the MC PlayFab host)")
     cf.add_argument("--proton-dir", metavar="PATH",
                     help="use a local GDK-Proton build (a fork with "
                          "WineGDK XUser)")
@@ -1576,6 +1591,21 @@ def main():
         elif a.cmd == "config":
             st = load_settings()
             touched = False
+            if a.xsts_rp_host is not None:
+                st["xsts_rp_host"] = a.xsts_rp_host
+                save_settings(st)
+                ok(f"XSTS RP host = {a.xsts_rp_host or '(default)'}")
+                touched = True
+            if a.xsts_rp is not None:
+                if a.xsts_rp:
+                    st["xsts_rp"] = a.xsts_rp
+                    ok(f"XSTS relying party = {a.xsts_rp} "
+                       "(takes effect next PLAY, no rebuild)")
+                else:
+                    st.pop("xsts_rp", None)
+                    ok("XSTS relying party override cleared")
+                save_settings(st)
+                touched = True
             if a.proton_dir:
                 pth = str(Path(a.proton_dir).expanduser())
                 if not (Path(pth) / "proton").exists():
