@@ -59,8 +59,13 @@ WINEGDK_REG = r"Software\Wine\WineGDK"  # value RefreshToken (REG_SZ)
 # Build a GDK-Proton from the user's WineGDK fork (XUser + signing) so the
 # Microsoft login works in-game. Source is cloned/updated here and built;
 # the result is overlaid onto a stock GDK-Proton. See docs/build-xuser-engine.md.
-WINEGDK_REPO = "https://github.com/Wyze3306/WineGDK.git"
-WINEGDK_BRANCH = "master"
+WINEGDK_REPO = "https://github.com/minecraft-linux/mcpelauncher-gdk.git"
+WINEGDK_BRANCH = "xbox-live-dev"
+WINEGDK_REPO_OLD = "https://github.com/Wyze3306/WineGDK.git"
+# OSS replacements for the game's GDK Xbox-Live DLLs (ChristopherHX). These
+# + the xbox-live-dev WineGDK are what got past the title.auth wall.
+GDK_DEPS_URL = "https://github.com/minecraft-linux/mcpelauncher-gdk-dependencies/releases/download/v0.0.0"
+GDK_DEPS_DLLS = ("libHttpClient.GDK.dll", "XCurl.dll")
 WINEGDK_SRC = DATA / "winegdk-src"
 WINEGDK_OUT = PROTON_DIR / "GDK-Proton-xuser"
 # Bump when the build/packaging method changes → forces a clean rebuild.
@@ -130,6 +135,12 @@ def load_settings():
         s.setdefault("proton_source", "winegdk")
         s.setdefault("winegdk_repo", WINEGDK_REPO)
         s.setdefault("winegdk_branch", WINEGDK_BRANCH)
+    # Pivot: migrate the old Wyze3306 fork (topped out at title.auth) to
+    # ChristopherHX's xbox-live-dev, forcing a rebuild from the new source.
+    if s.get("winegdk_repo") == WINEGDK_REPO_OLD:
+        s["winegdk_repo"] = WINEGDK_REPO
+        s["winegdk_branch"] = WINEGDK_BRANCH
+        s.pop("winegdk_built", None)
     return s
 
 
@@ -811,6 +822,25 @@ def fix_curl_ssl(game_dir: Path):
     ok("libcurl ready")
 
 
+def install_gdk_xbox_dlls(game_dir: Path):
+    """Drop ChristopherHX's OSS GDK Xbox-Live DLLs into the game folder
+    (libHttpClient.GDK.dll, XCurl.dll), backing up originals. The XCurl
+    backup also makes fix_curl_ssl skip its libcurl swap so this one
+    stays. Idempotent."""
+    for nm in GDK_DEPS_DLLS:
+        dst = game_dir / nm
+        bak = Path(str(dst) + ".bol-orig")
+        if bak.exists():
+            continue
+        cached = CACHE / ("gdkdeps-" + nm)
+        if not cached.exists():
+            download(f"{GDK_DEPS_URL}/{nm}", cached, nm)
+        if dst.exists():
+            shutil.copy2(dst, bak)
+        shutil.copy2(cached, dst)
+    ok("Xbox-Live OSS DLLs installed")
+
+
 def kill_wine():
     """Kill leftover wine/Proton (a hung run locks the prefix)."""
     for pat in ("wineserver", "winedevice.exe", "GDK-Proton",
@@ -1000,8 +1030,9 @@ def do_setup(game_dir=None, mc_ver=None, proton_tag=None, pp_tag=None,
         use_game_dir(download_game(_auto_mc_version(s), progress, force=force))
     gd = Path(load_settings()["game_dir"])
     if load_settings().get("proton_source") == "winegdk":
-        ensure_winegdk(force, progress)        # build from the WineGDK fork
-    else:
+        ensure_winegdk(force, progress)        # ChristopherHX xbox-live-dev
+        install_gdk_xbox_dlls(gd)              # OSS Xbox-Live DLLs (before
+    else:                                     # fix_curl_ssl: keeps XCurl)
         ensure_proton(proton_tag, force, progress)  # user-supplied dir/url
     ensure_umu(force)
     fix_curl_ssl(gd)
