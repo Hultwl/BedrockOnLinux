@@ -59,9 +59,8 @@ WINEGDK_REG = r"Software\Wine\WineGDK"  # value RefreshToken (REG_SZ)
 # Build a GDK-Proton from the user's WineGDK fork (XUser + signing) so the
 # Microsoft login works in-game. Source is cloned/updated here and built;
 # the result is overlaid onto a stock GDK-Proton. See docs/build-xuser-engine.md.
-WINEGDK_REPO = "https://github.com/minecraft-linux/mcpelauncher-gdk.git"
-WINEGDK_BRANCH = "xbox-live-dev"
-WINEGDK_REPO_OLD = "https://github.com/Wyze3306/WineGDK.git"
+WINEGDK_REPO = "https://github.com/Wyze3306/WineGDK.git"
+WINEGDK_BRANCH = "xbox-live-dev"   # ChristopherHX's tree, mirrored into the fork
 # OSS replacements for the game's GDK Xbox-Live DLLs (ChristopherHX). These
 # + the xbox-live-dev WineGDK are what got past the title.auth wall.
 GDK_DEPS_URL = "https://github.com/minecraft-linux/mcpelauncher-gdk-dependencies/releases/download/v0.0.0"
@@ -135,12 +134,14 @@ def load_settings():
         s.setdefault("proton_source", "winegdk")
         s.setdefault("winegdk_repo", WINEGDK_REPO)
         s.setdefault("winegdk_branch", WINEGDK_BRANCH)
-    # Pivot: migrate the old Wyze3306 fork (topped out at title.auth) to
-    # ChristopherHX's xbox-live-dev, forcing a rebuild from the new source.
-    if s.get("winegdk_repo") == WINEGDK_REPO_OLD:
-        s["winegdk_repo"] = WINEGDK_REPO
-        s["winegdk_branch"] = WINEGDK_BRANCH
-        s.pop("winegdk_built", None)
+        # Pin to the single fork branch (the user's Wyze3306/WineGDK
+        # xbox-live-dev). If a stale repo/branch was persisted, repoint and
+        # force a clean rebuild from the new source.
+        if s.get("winegdk_repo") != WINEGDK_REPO \
+                or s.get("winegdk_branch") != WINEGDK_BRANCH:
+            s["winegdk_repo"] = WINEGDK_REPO
+            s["winegdk_branch"] = WINEGDK_BRANCH
+            s.pop("winegdk_built", None)
     return s
 
 
@@ -931,13 +932,23 @@ def _winegdk_sync():
     branch = s.get("winegdk_branch") or WINEGDK_BRANCH
     if not shutil.which("git"):
         die("git is required — " + _pm_hint().format("git"))
+    synced = False
     if (WINEGDK_SRC / ".git").is_dir():
         info(f"Updating WineGDK ({branch}) …")
-        run(["git", "-C", str(WINEGDK_SRC), "fetch", "--depth=1", "origin",
-             branch], capture_output=True)
-        run(["git", "-C", str(WINEGDK_SRC), "checkout", "-q", "-B", branch,
-             "FETCH_HEAD"], capture_output=True)
-    else:
+        # The configured repo/branch can change (pivot) — point origin at
+        # it before fetching.
+        subprocess.run(["git", "-C", str(WINEGDK_SRC), "remote", "set-url",
+                        "origin", repo], capture_output=True)
+        if subprocess.run(["git", "-C", str(WINEGDK_SRC), "fetch",
+                           "--depth=1", "origin", branch],
+                          capture_output=True).returncode == 0 and \
+           subprocess.run(["git", "-C", str(WINEGDK_SRC), "checkout", "-q",
+                           "-B", branch, "FETCH_HEAD"],
+                          capture_output=True).returncode == 0:
+            synced = True
+        else:
+            warn("WineGDK source out of sync — re-cloning cleanly.")
+    if not synced:
         info(f"Cloning WineGDK {repo} ({branch}) — large, one time …")
         shutil.rmtree(WINEGDK_SRC, ignore_errors=True)
         run(["git", "clone", "--depth=1", "--branch", branch, repo,
@@ -980,6 +991,10 @@ def ensure_winegdk(force=False, progress=None):
         logf = LOGS / "winegdk-build.log"
         LOGS.mkdir(parents=True, exist_ok=True)
         info(f"Building WineGDK — long (full Wine build); log: {logf}")
+        # Clean build dir: a rebuild means the source changed (or --force),
+        # and a build tree configured for a different WineGDK lineage must
+        # not be reused.
+        shutil.rmtree(bdir, ignore_errors=True)
         bdir.mkdir(parents=True, exist_ok=True)
         with open(logf, "w") as lf:
             def sh(cmd, cwd):
