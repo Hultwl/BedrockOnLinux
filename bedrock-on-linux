@@ -1066,6 +1066,34 @@ def ensure_winegdk(force=False, progress=None):
                     p.symlink_to("wine")
                 except OSError as e:
                     warn(f"wine binary symlink {legacy} failed: {e}")
+        # Wine 11 ntdll.so depends on libunwind.so.8, which the Steam Linux
+        # Runtime sniper container does NOT carry (host's libunwind isn't
+        # auto-mirrored either). Without it, ntdll.so fails to dlopen and
+        # `wine: could not load ntdll.so: …/lib/wine/ntdll.so` is the only
+        # symptom. Drop the host copy into files/lib/x86_64-linux-gnu so
+        # LD_LIBRARY_PATH (which Proton populates with that dir) resolves
+        # it inside the container.
+        for cand in ("/lib/x86_64-linux-gnu/libunwind.so.8.1.0",
+                     "/usr/lib/x86_64-linux-gnu/libunwind.so.8.1.0",
+                     "/lib/x86_64-linux-gnu/libunwind.so.8",
+                     "/usr/lib/x86_64-linux-gnu/libunwind.so.8"):
+            src = Path(cand)
+            if src.is_file():
+                real = src.resolve()
+                dest_dir = prefix / "lib" / "x86_64-linux-gnu"
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                try:
+                    shutil.copy2(real, dest_dir / real.name)
+                    link = dest_dir / "libunwind.so.8"
+                    if link.exists() or link.is_symlink():
+                        link.unlink()
+                    link.symlink_to(real.name)
+                except OSError as e:
+                    warn(f"libunwind staging failed: {e}")
+                break
+        else:
+            warn("libunwind.so.8 not found on host — install libunwind8 "
+                 "(or libunwind-dev) so the runtime can load ntdll.so.")
         if not any((prefix).rglob("xgameruntime.dll")):
             warn("xgameruntime.dll absent after install — build/layout off "
                  "(see logs).")
