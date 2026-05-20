@@ -60,11 +60,12 @@ WINEGDK_REG = r"Software\Wine\WineGDK"  # value RefreshToken (REG_SZ)
 # Microsoft login works in-game. Source is cloned/updated here and built;
 # the result is overlaid onto a stock GDK-Proton. See docs/build-xuser-engine.md.
 WINEGDK_REPO = "https://github.com/Wyze3306/WineGDK.git"
-# xbox-live-dev (ChristopherHX, mirrored) does NOT boot — its Wine base is
-# ~1536 commits too old (loader/ntdll.so layout mismatch). master =
-# olivi-r XUser + our fixes: modern base, runs, identifies in-game; only
-# blocked by the title.auth credential wall (Microsoft-side, unfixable here).
-WINEGDK_BRANCH = "master"
+# xuser-olivi (birdayz, mirrored): builds on olivi-r XUser PR #33 and adds
+# the full chain past the title.auth wall — XStore licence, XServiceBroker,
+# XSAPI plumbing + a runtime isSignedIn memory patch + credential-gate
+# bypass. Reported as working: Xbox sign-in + Servers tab. Other branches
+# kept (master = our earlier work; xbox-live-dev = ChristopherHX mirror).
+WINEGDK_BRANCH = "xuser-olivi"
 # OSS replacements for the game's GDK Xbox-Live DLLs (ChristopherHX). These
 # + the xbox-live-dev WineGDK are what got past the title.auth wall.
 GDK_DEPS_URL = "https://github.com/minecraft-linux/mcpelauncher-gdk-dependencies/releases/download/v0.0.0"
@@ -726,6 +727,24 @@ def wine_reg_set_refresh_token(token):
     return False
 
 
+def wine_apply_winegdk_prereqs():
+    """Prereqs for the xuser-olivi WineGDK path (birdayz): set the
+    ConsoleMode registry value the build keys its non-Win32-PC code path
+    on (value 8). Run through the same proton/umu runtime/prefix."""
+    cmd, env = proton_umu_cmd("reg")
+    cmd += ["add",
+            r"HKLM\Software\Microsoft\Windows NT\CurrentVersion\OEM",
+            "/v", "ConsoleMode", "/t", "REG_DWORD", "/d", "8", "/f"]
+    LOGS.mkdir(parents=True, exist_ok=True)
+    log = open(LOGS / "native-login.log", "a")
+    try:
+        subprocess.run(cmd, env=env, stdout=log,
+                       stderr=subprocess.STDOUT, timeout=120)
+        ok("WineGDK prereqs applied (ConsoleMode=8)")
+    except Exception as e:
+        warn(f"Could not apply WineGDK prereqs: {e}")
+
+
 def ensure_umu(force=False):
     binp = UMU_DIR / "umu-run"
     if binp.exists() and not force:
@@ -1132,6 +1151,7 @@ def launch(_pp=None):
         msa_save({"refresh_token": fresh["refresh_token"],
                   "obtained": int(time.time())})
         tok = fresh["refresh_token"]
+    wine_apply_winegdk_prereqs()
     wine_reg_set_refresh_token(tok)
     kill_wine()
     exe = str(CONTENT / "Minecraft.Windows.exe")
@@ -1142,6 +1162,12 @@ def launch(_pp=None):
     # behaviour shows up in proton.log for diagnosis (force unless the user
     # set WINEDEBUG in the real environment).
     env["WINEDEBUG"] = os.environ.get("WINEDEBUG") or "+gdkc,fixme+all"
+    # xuser-olivi prereq: GameInputRedist.dll indirectly hits ntdll's
+    # unimplemented NtQueryWnfStateData. 'b' = built-in only -> Wine has
+    # no builtin, the load fails cleanly and the game continues without it.
+    override = "GameInputRedist=b"
+    cur = os.environ.get("WINEDLLOVERRIDES", "")
+    env["WINEDLLOVERRIDES"] = cur + ";" + override if cur else override
     # Tune the PlayFab XSTS relying party WITHOUT rebuilding WineGDK
     # (resolver honours WINEGDK_XSTS_RP_<HOST>). Iterate via
     # `config --xsts-rp <value>`.
