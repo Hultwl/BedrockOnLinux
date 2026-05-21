@@ -1240,6 +1240,12 @@ def launch(_pp=None):
     override = "GameInputRedist=b"
     cur = os.environ.get("WINEDLLOVERRIDES", "")
     env["WINEDLLOVERRIDES"] = cur + ";" + override if cur else override
+    # Suppress Microsoft.WindowsAppRuntime.dll's "Required components are
+    # missing — Install?" dialog when DeploymentManager.Initialize fails.
+    # On Linux/Wine the framework MSIX can't actually be installed (no
+    # MSIX deployment), so the dialog dead-ends into msiexec; muting it
+    # lets the game keep its degraded WinAppRuntime path going.
+    env["MICROSOFT_WINDOWSAPPRUNTIME_DEPLOYMENT_INITIALIZE_ONERRORSHOWUI"] = "0"
     # Tune the PlayFab XSTS relying party WITHOUT rebuilding WineGDK
     # (resolver honours WINEGDK_XSTS_RP_<HOST>). Iterate via
     # `config --xsts-rp <value>`.
