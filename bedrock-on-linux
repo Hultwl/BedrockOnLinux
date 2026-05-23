@@ -50,7 +50,7 @@ CACERT_URL = "https://curl.se/ca/cacert.pem"
 # device-code flow (pure urllib, no crypto) and seed that token. The
 # client_id MUST equal WineGDK's hardcoded msaAppId or its refresh is
 # rejected. See docs/native-login.md.
-MSA_CLIENT_ID = "0000000040159362"     # Bedrock Win32 (== gophertunnel Win32Config)
+MSA_CLIENT_ID = "0000000048183522"     # Bedrock Android (== ProxyPass / gophertunnel default; matches WineGDK xuser-olivi XUser.c)
 MSA_SCOPE = "service::user.auth.xboxlive.com::MBI_SSL"
 MSA_CONNECT = "https://login.live.com/oauth20_connect.srf"
 MSA_TOKEN = "https://login.live.com/oauth20_token.srf"
