@@ -16,6 +16,7 @@ import tarfile
 import threading
 import time
 import urllib.parse
+import urllib.parse
 import urllib.request
 import urllib.error
 import zipfile
@@ -72,6 +73,19 @@ GDK_DEPS_URL = "https://github.com/minecraft-linux/mcpelauncher-gdk-dependencies
 GDK_DEPS_DLLS = ("libHttpClient.GDK.dll", "XCurl.dll")
 WINEGDK_SRC = DATA / "winegdk-src"
 WINEGDK_OUT = PROTON_DIR / "GDK-Proton-xuser"
+# Bump when the build/packaging method changes → forces a clean rebuild.
+WINEGDK_BUILD_REV = "wow64-archs"
+
+# Direct package list for a 64-bit WineGDK build that can display/run the
+# game — avoids `apt build-dep wine` (needs deb-src, absent on Mint/LMDE).
+WINE_BUILD_PKGS = (
+    "flex bison gcc-mingw-w64-x86-64 gcc-mingw-w64-i686 pkg-config "
+    "libx11-dev libxext-dev libxrandr-dev libxrender-dev libxi-dev "
+    "libxcursor-dev libxcomposite-dev libxinerama-dev libxfixes-dev "
+    "libxxf86vm-dev libfreetype-dev libfontconfig1-dev libgl1-mesa-dev "
+    "libvulkan-dev libgnutls28-dev libpulse-dev libasound2-dev "
+    "libudev-dev libsdl2-dev libusb-1.0-0-dev libpcap-dev "
+    "libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev")
 # Bump when the build/packaging method changes → forces a clean rebuild.
 WINEGDK_BUILD_REV = "wow64-archs"
 
@@ -160,6 +174,24 @@ def http_json(url):
         url, headers={"User-Agent": APP, "Accept": "application/vnd.github+json"})
     with urllib.request.urlopen(req, timeout=30) as r:
         return json.loads(r.read().decode())
+
+
+def http_post_form(url, fields):
+    """POST application/x-www-form-urlencoded → parsed JSON. OAuth endpoints
+    return their error payload with a 4xx, so decode the body either way."""
+    data = urllib.parse.urlencode(fields).encode()
+    req = urllib.request.Request(
+        url, data=data, method="POST",
+        headers={"User-Agent": APP, "Accept": "application/json",
+                 "Content-Type": "application/x-www-form-urlencoded"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        try:
+            return json.loads(e.read().decode())
+        except Exception:
+            raise
 
 
 def http_post_form(url, fields):
@@ -310,6 +342,13 @@ def apply_patch(path: Path, off, expect, new, what, strict=True):
 def proton_path():
     p = load_settings().get("proton")
     return Path(p) if p else None
+
+
+def custom_proton():
+    """A user-supplied GDK-Proton (e.g. a fork built with WineGDK XUser).
+    When set, our combase/ntdll offsets may not match — patch non-strict."""
+    s = load_settings()
+    return bool(s.get("proton_dir") or s.get("proton_url"))
 
 
 def custom_proton():
@@ -728,10 +767,13 @@ def wine_reg_set_refresh_token(token):
 
 
 def wine_apply_winegdk_prereqs():
-    """Prereqs for the xuser-olivi WineGDK path (birdayz): set the
-    ConsoleMode registry value the build keys its non-Win32-PC code path
-    on (value 8), and inject the WindowsAppRuntime UI-mute env vars into
-    HKCU\\Environment so Wine inherits them in every process inside the
+    """Prereqs for the xuser-olivi WineGDK path: set the ConsoleMode
+    registry value (1 = Win32 PC; on Wine that takes the PlayFab-only
+    sign-in path that doesn't need XSAPI's social manager to fully
+    init — value 8 routes through XSAPI which page-faults on Wine and
+    leaves the Servers tab gated on \"need Microsoft account\" even
+    though sign-in succeeded) and inject the WindowsAppRuntime UI-mute
+    env vars into HKCU\\Environment so Wine inherits them inside the
     prefix (pressure-vessel filters MICROSOFT_* out of the host env)."""
     LOGS.mkdir(parents=True, exist_ok=True)
     log = open(LOGS / "native-login.log", "a")
@@ -744,12 +786,7 @@ def wine_apply_winegdk_prereqs():
         except Exception as e:
             warn(f"reg add {args[0]} failed: {e}")
     _regadd(r"HKLM\Software\Microsoft\Windows NT\CurrentVersion\OEM",
-            "/v", "ConsoleMode", "/t", "REG_DWORD", "/d", "8")
-    # Mute the "Required components of the Windows App Runtime are
-    # missing" dialog: pressure-vessel drops MICROSOFT_* from the host
-    # env, so write the same knobs into HKCU\Environment where Wine's
-    # process creation picks them up. Both gates set to 0; FAILFAST
-    # cleared so Bootstrap returns the error instead of aborting.
+            "/v", "ConsoleMode", "/t", "REG_DWORD", "/d", "1")
     for name, val in (
         ("MICROSOFT_WINDOWSAPPRUNTIME_BOOTSTRAP_INITIALIZE_SHOWUI", "0"),
         ("MICROSOFT_WINDOWSAPPRUNTIME_BOOTSTRAP_INITIALIZE_FAILFAST", "0"),
@@ -757,7 +794,7 @@ def wine_apply_winegdk_prereqs():
          "0"),
     ):
         _regadd(r"HKCU\Environment", "/v", name, "/t", "REG_SZ", "/d", val)
-    ok("WineGDK prereqs applied (ConsoleMode=8, WinAppRuntime UI muted)")
+    ok("WineGDK prereqs applied (ConsoleMode=1, WinAppRuntime UI muted)")
 
 
 def ensure_umu(force=False):
@@ -859,6 +896,25 @@ def fix_curl_ssl(game_dir: Path):
     for nm in ("XCurl.dll", "Xcurl.dll"):
         shutil.copy2(libcurl, game_dir / nm)
     ok("libcurl ready")
+
+
+def install_gdk_xbox_dlls(game_dir: Path):
+    """Drop ChristopherHX's OSS GDK Xbox-Live DLLs into the game folder
+    (libHttpClient.GDK.dll, XCurl.dll), backing up originals. The XCurl
+    backup also makes fix_curl_ssl skip its libcurl swap so this one
+    stays. Idempotent."""
+    for nm in GDK_DEPS_DLLS:
+        dst = game_dir / nm
+        bak = Path(str(dst) + ".bol-orig")
+        if bak.exists():
+            continue
+        cached = CACHE / ("gdkdeps-" + nm)
+        if not cached.exists():
+            download(f"{GDK_DEPS_URL}/{nm}", cached, nm)
+        if dst.exists():
+            shutil.copy2(dst, bak)
+        shutil.copy2(cached, dst)
+    ok("Xbox-Live OSS DLLs installed")
 
 
 def install_gdk_xbox_dlls(game_dir: Path):
@@ -1180,6 +1236,9 @@ _DIAG_RULES = [
     (r"wineserver.*version mismatch|wineserver binary was not upgraded",
      "Broken WineGDK packaging (wine vs wineserver mismatch) — rebuild: "
      "'bedrock-on-linux setup --winegdk --force'."),
+    (r"wineserver.*version mismatch|wineserver binary was not upgraded",
+     "Broken WineGDK packaging (wine vs wineserver mismatch) — rebuild: "
+     "'bedrock-on-linux setup --winegdk --force'."),
     (r"Authentication failed|invalid_grant|login.*failed",
      "Microsoft sign-in failed in-game — sign in again "
      "(open the link, enter the code)."),
@@ -1239,12 +1298,44 @@ def launch(_pp=None):
                   "obtained": int(time.time())})
         tok = fresh["refresh_token"]
     wine_apply_winegdk_prereqs()
+    wine_apply_winegdk_prereqs()
     wine_reg_set_refresh_token(tok)
     kill_wine()
     exe = str(CONTENT / "Minecraft.Windows.exe")
     cmd, env = proton_umu_cmd(exe)
     env["PROTON_LOG"] = "1"
     env["PROTON_LOG_DIR"] = str(LOGS)
+    # Trace the WineGDK XUser channel (gdkc) so sign-in / token / signature
+    # behaviour shows up in proton.log for diagnosis (force unless the user
+    # set WINEDEBUG in the real environment).
+    env["WINEDEBUG"] = os.environ.get("WINEDEBUG") or "+gdkc,fixme+all"
+    # GameInputRedist.dll: the previous "GameInputRedist=b" override
+    # (forcing built-in only) was meant to dodge the NtQueryWnfStateData
+    # abort, but Wine has no builtin and the load fails → Minecraft pops
+    # the localised "gameinput_load.error.message" dialog ("Il manque un
+    # composant nécessaire au jeu… Installer") which dead-ends in
+    # msiexec.  patch_proton already neutralises the ntdll unimplemented-
+    # stub funnel (NtQueryWnfStateData now returns STATUS_NOT_IMPL
+    # cleanly), and the prefix has the native GameInputRedist.dll in
+    # both Program Files\\Microsoft GameInput and system32 from the
+    # bundled MSI — let Wine load that one.  Keep an extra
+    # WINEDLLOVERRIDES from the host env if the user explicitly set it.
+    cur = os.environ.get("WINEDLLOVERRIDES", "")
+    if cur:
+        env["WINEDLLOVERRIDES"] = cur
+    # Suppress the WindowsAppRuntime "Required components of the Windows
+    # App Runtime are missing — Install?" dialog.  The text lives in BOTH
+    # Microsoft.WindowsAppRuntime.Bootstrap.dll (MddBootstrapInitialize)
+    # and Microsoft.WindowsAppRuntime.dll (DeploymentManager.Initialize)
+    # — each path has its own env-var gate (also visible in `strings`):
+    #   BOOTSTRAP_INITIALIZE_SHOWUI / _FAILFAST and
+    #   DEPLOYMENT_INITIALIZE_ONERRORSHOWUI.
+    # On Wine the framework MSIX is never installable (no MSIX deploy),
+    # so both paths will always fail.  Mute the UI AND the failfast on
+    # Bootstrap so the process keeps running instead of aborting.
+    env["MICROSOFT_WINDOWSAPPRUNTIME_BOOTSTRAP_INITIALIZE_SHOWUI"] = "0"
+    env["MICROSOFT_WINDOWSAPPRUNTIME_BOOTSTRAP_INITIALIZE_FAILFAST"] = "0"
+    env["MICROSOFT_WINDOWSAPPRUNTIME_DEPLOYMENT_INITIALIZE_ONERRORSHOWUI"] = "0"
     # Trace the WineGDK XUser channel (gdkc) so sign-in / token / signature
     # behaviour shows up in proton.log for diagnosis (force unless the user
     # set WINEDEBUG in the real environment).
