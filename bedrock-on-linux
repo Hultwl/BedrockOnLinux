@@ -199,24 +199,6 @@ def http_post_form(url, fields):
             raise
 
 
-def http_post_form(url, fields):
-    """POST application/x-www-form-urlencoded → parsed JSON. OAuth endpoints
-    return their error payload with a 4xx, so decode the body either way."""
-    data = urllib.parse.urlencode(fields).encode()
-    req = urllib.request.Request(
-        url, data=data, method="POST",
-        headers={"User-Agent": APP, "Accept": "application/json",
-                 "Content-Type": "application/x-www-form-urlencoded"})
-    try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            return json.loads(r.read().decode())
-    except urllib.error.HTTPError as e:
-        try:
-            return json.loads(e.read().decode())
-        except Exception:
-            raise
-
-
 def download(url, dest: Path, label=None, progress=None):
     label = label or dest.name
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -354,20 +336,6 @@ def custom_proton():
     When set, our combase/ntdll offsets may not match — patch non-strict."""
     s = load_settings()
     return bool(s.get("proton_dir") or s.get("proton_url"))
-
-
-def custom_proton():
-    """A user-supplied GDK-Proton (e.g. a fork built with WineGDK XUser).
-    When set, our combase/ntdll offsets may not match — patch non-strict."""
-    s = load_settings()
-    return bool(s.get("proton_dir") or s.get("proton_url"))
-
-
-def list_proton_tags():
-    try:
-        return [r["tag_name"] for r in gh_releases(GDK_PROTON_REPO, 20)]
-    except Exception:
-        return []
 
 
 def ensure_proton(tag=None, force=False, progress=None):
@@ -661,10 +629,6 @@ def msa_refresh(refresh_token):
         "client_id": MSA_CLIENT_ID, "scope": MSA_SCOPE,
         "grant_type": "refresh_token", "refresh_token": refresh_token})
     return t if t.get("refresh_token") else None
-
-
-def account_signed_in(*_):
-    return msa_signed_in()
 
 
 class NativeAuth:
@@ -1983,7 +1947,7 @@ def gui():
             pass
     tk.Label(hw, text="Minecraft Bedrock", bg=BG, fg=FG,
              font=("", 23, "bold")).pack(pady=(12, 2))
-    tk.Label(hw, text="Native Microsoft login · no ProxyPass",
+    tk.Label(hw, text="Bedrock Edition for Linux",
              bg=BG, fg=SUB, font=("", 11)).pack()
 
     # ---- bottom bar: version selector (left), gear/details/PLAY (right) ----
@@ -2014,8 +1978,9 @@ def gui():
     status = tk.Frame(root, bg=BG)
     status.pack(fill="x", side="bottom", padx=24, pady=(0, 8))
     status_txt = tk.StringVar(value="Ready to play.")
-    tk.Label(status, textvariable=status_txt, bg=BG, fg=SUB,
-             anchor="w").pack(fill="x")
+    status_lbl = tk.Label(status, textvariable=status_txt, bg=BG, fg=SUB,
+                          anchor="w")
+    status_lbl.pack(fill="x")
     prog = ttk.Progressbar(status, style="Bar.Horizontal.TProgressbar",
                            mode="determinate")
 
@@ -2026,12 +1991,6 @@ def gui():
                      padx=10, pady=8)
     logbox.pack(fill="both", expand=True, padx=24, pady=(0, 4))
 
-    def glog(line):
-        logbox.insert("end", line + "\n")
-        logbox.see("end")
-    global _LOG_SINK
-    _LOG_SINK = lambda m: root.after(0, glog, m)
-
     def toggle_details():
         ui["details"] = not ui["details"]
         if ui["details"]:
@@ -2041,18 +2000,75 @@ def gui():
             detwrap.pack_forget()
             det_btn.configure(fg=SUB)
 
-    def set_status(t):
-        root.after(0, lambda: status_txt.set(t))
+    # ---- friendly status line + progress bar ----
+    def set_status(t, color=SUB):
+        root.after(0, lambda: (status_txt.set(t),
+                               status_lbl.configure(fg=color)))
 
-    def set_progress(g, t):
+    def _show_bar():
+        if not prog.winfo_ismapped():
+            prog.pack(fill="x", pady=(6, 0))
+
+    def bar_busy():           # animated bar for steps with no measurable %
         def ap():
-            if not prog.winfo_ismapped():
-                prog.pack(fill="x", pady=(5, 0))
-            prog.configure(maximum=max(1, t), value=g)
+            _show_bar()
+            prog.configure(mode="indeterminate")
+            prog.start(14)
+        root.after(0, ap)
+
+    def set_progress(g, t):   # measurable download progress
+        def ap():
+            _show_bar()
+            prog.stop()
+            prog.configure(mode="determinate", maximum=max(1, t), value=g)
+            status_txt.set(f"Downloading Minecraft…  "
+                           f"{int(100 * g / max(1, t))}%")
+            status_lbl.configure(fg=FG)
         root.after(0, ap)
 
     def end_progress():
-        root.after(0, lambda: prog.pack_forget())
+        def ap():
+            prog.stop()
+            prog.pack_forget()
+        root.after(0, ap)
+
+    def _friendly(line):
+        m = line
+        for tag in ("::", "OK", "!!", "xx"):
+            if m.startswith(tag):
+                m = m[len(tag):].strip()
+                break
+        low = m.lower()
+        if "downloading minecraft" in low:
+            return None        # handled by the % progress bar
+        if ("building winegdk" in low or "cloning winegdk" in low
+                or "updating winegdk" in low):
+            return ("Setting up the game engine — first run, "
+                    "this can take a while…")
+        if "installing minecraft" in low or "reinstalling minecraft" in low:
+            return "Installing Minecraft…"
+        if "preparing gdk-proton" in low or "extracting" in low:
+            return "Preparing the engine…"
+        if "pre-auth" in low or "signing in" in low:
+            return "Signing in to Xbox Live…"
+        if "launching minecraft" in low:
+            return "Launching Minecraft…"
+        return None
+
+    def glog(line):
+        logbox.insert("end", line + "\n")
+        logbox.see("end")
+        if not ui["busy"]:
+            return
+        if line.startswith("xx"):
+            set_status(line[2:].strip(), "#e06c5b")
+            return
+        txt = _friendly(line)
+        if txt:
+            set_status(txt, FG)
+            bar_busy()         # animate while this (non-download) step runs
+    global _LOG_SINK
+    _LOG_SINK = lambda m: root.after(0, glog, m)
 
     # ---- account (device-code Microsoft sign-in) ----
     def acct_state(ph):
@@ -2143,30 +2159,31 @@ def gui():
             return None
 
     # ---- PLAY: auto-install (version + engine) then launch ----
-    def busy(on, msg=""):
+    def busy(on):
         ui["busy"] = on
         play_btn.enable(not on)
-        if msg:
-            set_status(msg)
 
     def do_play():
         if ui["busy"]:
             return
-        busy(True, "Preparing…")
+        busy(True)
+        set_status("Preparing…", FG)
+        bar_busy()
 
         def work():
             try:
                 ver = selected_version()
+                # do_setup logs each step; glog() turns them into a friendly
+                # status line + animated/measured progress bar.
                 do_setup(mc_ver=ver, progress=set_progress)
-                set_status("Launching Minecraft…")
+                set_status("Launching Minecraft…", FG)
                 launch()
-                set_status("Minecraft closed.")
+                set_status("Minecraft closed.", SUB)
             except Exception as e:
                 _LOG_SINK(f"xx {e}")
-                set_status(f"Error: {e}")
             finally:
                 end_progress()
-                root.after(0, lambda: busy(False, ""))
+                root.after(0, lambda: busy(False))
         threading.Thread(target=work, daemon=True).start()
 
     # ---- settings popup (the few advanced bits, out of the way) ----
