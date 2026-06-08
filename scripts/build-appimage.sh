@@ -38,7 +38,12 @@ if [[ ! -x "$TOOL" ]]; then
   chmod +x "$TOOL"
 fi
 
+# One clean, version-stamped artifact. Drop any stale AppImages first so
+# dist/ never accumulates an unversioned copy next to the versioned one.
+APPIMG="$OUT/BedrockOnLinux-${VER}-x86_64.AppImage"
+rm -f "$OUT"/BedrockOnLinux-*-x86_64.AppImage "$OUT"/BedrockOnLinux-x86_64.AppImage \
+      "$OUT"/BedrockOnLinux-*.AppImage.old
+
 # run appimagetool without FUSE (sandbox/CI friendly)
-ARCH=x86_64 "$TOOL" --appimage-extract-and-run "$APPDIR" \
-  "$OUT/BedrockOnLinux-x86_64.AppImage"
-echo "OK -> $OUT/BedrockOnLinux-x86_64.AppImage"
+ARCH=x86_64 "$TOOL" --appimage-extract-and-run "$APPDIR" "$APPIMG"
+echo "OK -> $APPIMG"

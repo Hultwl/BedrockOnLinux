@@ -2,8 +2,8 @@
 
 # 🟩 BedrockOnLinux
 
-**Minecraft Bedrock (Windows / GDK edition) on Linux — multiplayer included.
-Install it, pick your version, play.**
+**Minecraft Bedrock (Windows / GDK edition) on Linux, with native in-game
+Microsoft sign-in and multiplayer. Install it, pick a version, play.**
 
 `Ubuntu` · `Debian` · `Linux Mint / LMDE` · `Fedora` · `Arch` · `openSUSE`
 
@@ -17,14 +17,16 @@ Install it, pick your version, play.**
 
 One app, everything automatic:
 
-- downloads **GDK-Proton** and applies the **2 binary patches** without which
-  the game won't start (`combase.RoOriginateErrorW` + `ntdll` stub funnels);
-- runs GDK-Proton **directly** (no Steam runtime / pressure-vessel — same as
-  Heroic), with a bundled **Java 25** and the right **ProxyPass** build;
-- runs **ProxyPass** in the background for multiplayer (WineGDK has no in-game
-  Microsoft login — ProxyPass authenticates outside Wine and bridges to your
-  server, shown in Minecraft as a LAN world);
+- downloads the Minecraft version you pick;
+- builds and runs **GDK-Proton** from a **WineGDK** fork that implements
+  `XUser` + request signing, so you sign in to **Microsoft inside the game**
+  — no relay, no proxy;
+- applies the binary patches the game needs to start and to join online
+  Bedrock servers;
 - fixes curl/SSL and `options.txt`, then launches the game.
+
+You then play like on any platform: sign in, open **Play ▸ Servers**, and
+join native Bedrock servers (Hive, CubeCraft, …) or crossplay/Geyser servers.
 
 ## Install
 
@@ -53,67 +55,48 @@ tar xzf bedrock-on-linux-*-portable.tar.gz && cd bedrock-on-linux
 ## Play
 
 1. Open **BedrockOnLinux**.
-2. **① Minecraft version** — pick one (downloaded for you).
-3. **④ Microsoft account** → *Sign in*: open the shown link, enter the
-   code, sign in with the account that owns Minecraft.
-4. **③ Multiplayer server** — set the destination IP.
-5. **Install / Update**, then **▶ PLAY**.
-6. In game: **Play ▸ Worlds tab ▸ "ProxyPass"**.
+2. Top-right **Sign in** — open the shown link, enter the code, and sign in
+   with the account that owns Minecraft.
+3. Pick a **version** (bottom-left), then hit **▶ PLAY**.
+4. In game: **Play ▸ Servers** (or *Discover*) and join.
 
-## Experimental: in-game login (no ProxyPass)
+The first **PLAY** downloads the version and builds the engine (once); after
+that it just starts. Everything else is handled for you.
 
-This branch can sign in **inside** Minecraft instead of relaying through
-ProxyPass — the game then joins servers itself (real online play). It needs
-a GDK-Proton whose WineGDK implements `XUser` + request signing. The
-launcher can **build that for you** from the WineGDK fork:
+## The engine build (first run)
 
-```bash
-bedrock-on-linux setup --winegdk     # clone + build the fork, package, wire in
-bedrock-on-linux login               # link your Microsoft account
-bedrock-on-linux play                # join your server in-game (Play ▸ Servers)
-```
-
-`setup --winegdk` (or GUI card ② → *"⚙ build from WineGDK (login)"*, then
-**Install / Update**) clones the fork, builds Wine, overlays it onto a
-stock GDK-Proton, and turns on in-game login. The Wine build is **long**
-and needs build tools — the launcher checks and tells you what to install
-(`sudo apt build-dep wine` + `flex bison gcc-mingw-w64-x86-64 …`). Builds
-are cached by source commit. Revert anytime: `config --proton-auto`
-(back to ProxyPass).
-
-Default behaviour is unchanged (ProxyPass). Other engine options:
-`config --proton-dir <dir>` / `--proton-url <url>` for a build you supply.
-
-> The signing path is the standard proof-bound user-token scheme; if Xbox
-> rejects it a device/SISU token may be needed (iterate from the build/run
-> loop). Design: [`docs/native-login.md`](docs/native-login.md); the engine
-> build: [`docs/build-xuser-engine.md`](docs/build-xuser-engine.md).
-
-## If something fails
-
-On exit the app prints a likely cause. Use **🗎 Open logs**
-(`~/.local/share/bedrock-on-linux/logs/`) or **🔌 ProxyPass logs** for the
-live relay log. **🛠 Repair** rebuilds a broken Wine prefix.
+The first launch builds the WineGDK-based GDK-Proton. This is a full Wine
+build — it is **long** and needs build tools; the launcher checks for them
+and prints exactly what to install (e.g. `sudo apt build-dep wine` +
+`flex bison gcc-mingw-w64-x86-64 …`). Builds are cached by source commit, so
+it only happens once per engine update.
 
 ## Command line
 
 ```bash
-bedrock-on-linux versions
-bedrock-on-linux setup --mc 1.26.21.1
-bedrock-on-linux config --server play.linesia.net:19132
-bedrock-on-linux setup --winegdk             # in-game login, see above
-bedrock-on-linux play
-bedrock-on-linux doctor
+bedrock-on-linux              # open the launcher (same as 'gui')
+bedrock-on-linux versions     # list available Minecraft versions
+bedrock-on-linux setup --mc 1.26.21.1   # download + prepare a version
+bedrock-on-linux login        # sign in to a Microsoft account
+bedrock-on-linux play         # launch
+bedrock-on-linux repair       # reset a broken Wine prefix
+bedrock-on-linux doctor       # check host requirements
 ```
+
+## If something fails
+
+Use **⚙ Settings ▸ Open logs folder**
+(`~/.local/share/bedrock-on-linux/logs/`), or **⚙ Settings ▸ Repair** to
+rebuild a broken Wine prefix. The live step-by-step log is also under
+**Details** in the launcher.
 
 ## Legal
 
 BedrockOnLinux ships **no Minecraft files** — it is a compatibility launcher.
 Game files come from a source you choose (default: the community archive
 [`bubbles-wow/mcbe-gdk-unpack-archive`](https://github.com/bubbles-wow/mcbe-gdk-unpack-archive))
-or your own folder; you must own Minecraft. GDK-Proton, ProxyPass and Temurin
-are free software under their own licenses. Realms and the in-game native
-Microsoft login are not supported (WineGDK limitation).
+or your own folder; **you must own Minecraft**. GDK-Proton and WineGDK are
+free software under their own licenses. Realms is not supported.
 
 ## Build
 

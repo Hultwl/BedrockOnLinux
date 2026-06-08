@@ -33,10 +33,8 @@ rm -rf "$OUT/portable"
 echo "  ✓ dist/bedrock-on-linux-${VER}-portable.tar.gz"
 
 # 3) AppImage (best effort: needs network for appimagetool) ----------------
+# build-appimage.sh already produces the version-stamped artifact.
 if bash "$SRC/scripts/build-appimage.sh" >/dev/null 2>&1; then
-  [ -f "$OUT/BedrockOnLinux-x86_64.AppImage" ] && \
-    mv "$OUT/BedrockOnLinux-x86_64.AppImage" \
-       "$OUT/BedrockOnLinux-${VER}-x86_64.AppImage"
   echo "  ✓ dist/BedrockOnLinux-${VER}-x86_64.AppImage"
 else
   echo "  – AppImage skipped (no network/FUSE) — build later with scripts/build-appimage.sh"
