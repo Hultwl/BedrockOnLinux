@@ -66,7 +66,7 @@ WINEGDK_REPO = "https://github.com/Wyze3306/WineGDK.git"
 # XSAPI plumbing + a runtime isSignedIn memory patch + credential-gate
 # bypass. Reported as working: Xbox sign-in + Servers tab. Other branches
 # kept (master = our earlier work; xbox-live-dev = ChristopherHX mirror).
-WINEGDK_BRANCH = "xuser-olivi"
+WINEGDK_BRANCH = "master"
 # OSS replacements for the game's GDK Xbox-Live DLLs (ChristopherHX). These
 # + the xbox-live-dev WineGDK are what got past the title.auth wall.
 GDK_DEPS_URL = "https://github.com/minecraft-linux/mcpelauncher-gdk-dependencies/releases/download/v0.0.0"
@@ -1876,18 +1876,21 @@ def doctor():
 def gui():
     try:
         import tkinter as tk
-        from tkinter import ttk, filedialog
+        from tkinter import ttk
     except Exception:
         warn("Tkinter missing (install python3-tk).")
         return
 
-    BG, CARD, CARD2 = "#0f1115", "#171a21", "#1d212b"
-    FG, SUB, ACC, ACC2, FIELD = "#e8eaed", "#9aa0aa", "#43a047", "#4caf50", "#21262f"
+    # Minecraft-launcher inspired palette: dark slate + signature green.
+    BG, PANEL, PANEL2 = "#181a20", "#23262e", "#2c303a"
+    FG, SUB, GOLD = "#f2f3f5", "#969ca6", "#e0b341"
+    GREEN, GREEN_H = "#4c9f4f", "#58b85b"
+    FIELD = "#2c303a"
 
-    s = load_settings()
     root = tk.Tk()
-    root.title(f"{PRETTY} {VERSION}")
-    root.minsize(720, 660)
+    root.title(PRETTY)
+    root.geometry("880x560")
+    root.minsize(800, 520)
     root.configure(bg=BG)
 
     icon_img = None
@@ -1910,193 +1913,118 @@ def gui():
     except Exception:
         pass
     stl.configure(".", background=BG, foreground=FG, fieldbackground=FIELD,
-                   bordercolor=CARD2, lightcolor=CARD2, darkcolor=CARD2)
-    stl.configure("TButton", background=CARD2, foreground=FG, borderwidth=0,
-                  focuscolor=BG, padding=8)
-    stl.map("TButton", background=[("active", "#2c323d")])
-    stl.configure("Accent.TButton", background=ACC, foreground="white",
-                  font=("", 12, "bold"), padding=12)
-    stl.map("Accent.TButton",
-            background=[("active", ACC2), ("disabled", "#2f3a2c")])
-    stl.configure("TCombobox", fieldbackground=FIELD, background=FIELD,
-                  foreground=FG, arrowcolor=FG, borderwidth=0, padding=4)
-    stl.map("TCombobox", fieldbackground=[("readonly", FIELD)])
-    stl.configure("TCheckbutton", background=CARD, foreground=SUB)
-    stl.configure("Bar.Horizontal.TProgressbar", background=ACC2,
-                  troughcolor=CARD2, borderwidth=0)
+                  bordercolor=PANEL2, lightcolor=PANEL2, darkcolor=PANEL2)
+    stl.configure("Mc.TCombobox", fieldbackground=FIELD, background=FIELD,
+                  foreground=FG, arrowcolor=FG, borderwidth=0, padding=8)
+    stl.map("Mc.TCombobox", fieldbackground=[("readonly", FIELD)],
+            foreground=[("readonly", FG)])
+    stl.configure("Bar.Horizontal.TProgressbar", background=GREEN,
+                  troughcolor=PANEL2, borderwidth=0, thickness=6)
     root.option_add("*TCombobox*Listbox.background", FIELD)
     root.option_add("*TCombobox*Listbox.foreground", FG)
-    root.option_add("*TCombobox*Listbox.selectBackground", ACC)
+    root.option_add("*TCombobox*Listbox.selectBackground", GREEN)
 
     na = NativeAuth()
-    versions = {"mc": []}
+    ui = {"versions": [], "busy": False, "details": False}
 
-    head = tk.Frame(root, bg=BG)
-    head.pack(fill="x", padx=20, pady=(18, 8))
+    def button(parent, text, cmd, bg, fg, hbg, font, padx, pady):
+        b = tk.Label(parent, text=text, bg=bg, fg=fg, font=font,
+                     padx=padx, pady=pady, cursor="hand2")
+        b._bg, b._fg, b._hbg, b._on = bg, fg, hbg, True
+        b.bind("<Enter>", lambda e: b._on and b.configure(bg=b._hbg))
+        b.bind("<Leave>", lambda e: b._on and b.configure(bg=b._bg))
+        b.bind("<Button-1>", lambda e: b._on and cmd())
+
+        def enable(v):
+            b._on = v
+            b.configure(bg=b._bg if v else PANEL2, fg=b._fg if v else SUB,
+                        cursor="hand2" if v else "arrow")
+        b.enable = enable
+        return b
+
+    # ---- top bar: logo + title, account on the right ----
+    top = tk.Frame(root, bg=BG)
+    top.pack(fill="x", padx=24, pady=(16, 4))
     if icon_img is not None:
         try:
-            sm = icon_img.subsample(max(1, icon_img.width() // 56))
-            li = tk.Label(head, image=sm, bg=BG)
-            li.image = sm
-            li.pack(side="left", padx=(0, 14))
+            sm = icon_img.subsample(max(1, icon_img.width() // 38))
+            il = tk.Label(top, image=sm, bg=BG)
+            il.image = sm
+            il.pack(side="left", padx=(0, 12))
         except Exception:
             pass
-    ht = tk.Frame(head, bg=BG)
-    ht.pack(side="left", anchor="w")
-    tk.Label(ht, text="BedrockOnLinux", bg=BG, fg=FG,
-             font=("", 19, "bold")).pack(anchor="w")
-    tk.Label(ht, text="Minecraft Bedrock — WineGDK in-game login.",
-             bg=BG, fg=SUB).pack(anchor="w")
+    tk.Label(top, text="BedrockOnLinux", bg=BG, fg=FG,
+             font=("", 16, "bold")).pack(side="left")
 
-    def card(title):
-        outer = tk.Frame(root, bg=BG)
-        outer.pack(fill="x", padx=20, pady=7)
-        c = tk.Frame(outer, bg=CARD)
-        c.pack(fill="x")
-        inn = tk.Frame(c, bg=CARD)
-        inn.pack(fill="x", padx=16, pady=13)
-        tk.Label(inn, text=title, bg=CARD, fg=ACC2,
-                 font=("", 10, "bold")).pack(anchor="w", pady=(0, 9))
-        body = tk.Frame(inn, bg=CARD)
-        body.pack(fill="x")
-        return body
+    acct = tk.Frame(top, bg=PANEL)
+    acct.pack(side="right")
+    acct_dot = tk.Label(acct, text="●", bg=PANEL, fg=SUB)
+    acct_dot.pack(side="left", padx=(12, 6), pady=9)
+    acct_txt = tk.StringVar(value="Not signed in")
+    tk.Label(acct, textvariable=acct_txt, bg=PANEL, fg=FG).pack(side="left",
+                                                                pady=9)
+    acct_btn = button(acct, "Sign in", lambda: acct_click(), PANEL2, FG,
+                      "#363b46", ("", 10, "bold"), 12, 6)
+    acct_btn.pack(side="left", padx=(10, 8), pady=6)
 
-    cv = card("\u2460  Minecraft version")
-    beta_var = tk.BooleanVar(value=False)
+    # ---- hero: centred logo + title ----
+    hero = tk.Frame(root, bg=BG)
+    hero.pack(fill="both", expand=True)
+    hw = tk.Frame(hero, bg=BG)
+    hw.place(relx=0.5, rely=0.42, anchor="center")
+    if icon_img is not None:
+        try:
+            f = max(1, icon_img.width() // 130)
+            hi = icon_img.subsample(f)
+            hl = tk.Label(hw, image=hi, bg=BG)
+            hl.image = hi
+            hl.pack()
+        except Exception:
+            pass
+    tk.Label(hw, text="Minecraft Bedrock", bg=BG, fg=FG,
+             font=("", 23, "bold")).pack(pady=(12, 2))
+    tk.Label(hw, text="Native Microsoft login · no ProxyPass",
+             bg=BG, fg=SUB, font=("", 11)).pack()
+
+    # ---- bottom bar: version selector (left), gear/details/PLAY (right) ----
+    bar = tk.Frame(root, bg=PANEL)
+    bar.pack(fill="x", side="bottom")
+    barin = tk.Frame(bar, bg=PANEL)
+    barin.pack(fill="x", padx=24, pady=15)
+
+    vbox = tk.Frame(barin, bg=PANEL)
+    vbox.pack(side="left")
+    tk.Label(vbox, text="VERSION", bg=PANEL, fg=SUB,
+             font=("", 8, "bold")).pack(anchor="w")
     mc_var = tk.StringVar()
-    mc_cb = ttk.Combobox(cv, textvariable=mc_var, width=28, state="readonly")
-    mc_cb.grid(row=0, column=0, sticky="w")
-    ttk.Checkbutton(cv, text="include betas", variable=beta_var,
-                    command=lambda: threading.Thread(
-                        target=refresh_mc, daemon=True).start()
-                    ).grid(row=0, column=1, padx=12)
-    _saved_gd = s.get("game_dir", "")
-    try:
-        _is_custom = bool(_saved_gd) and Path(_saved_gd).exists() and \
-            GAMES.resolve() not in Path(_saved_gd).resolve().parents
-    except Exception:
-        _is_custom = bool(_saved_gd) and Path(_saved_gd).exists()
-    own = tk.StringVar(value=_saved_gd if _is_custom else "")
-    ttk.Button(cv, text="\u2026 custom folder",
-               command=lambda: own.set(
-                   filedialog.askdirectory() or own.get())
-               ).grid(row=0, column=2, padx=4)
-    mc_cb.bind("<<ComboboxSelected>>", lambda e: own.set(""))
+    mc_cb = ttk.Combobox(vbox, textvariable=mc_var, width=24, state="readonly",
+                         style="Mc.TCombobox", font=("", 11))
+    mc_cb.pack(anchor="w", pady=(3, 0))
 
-    ce = card("\u2461  Engine \u2014 GDK-Proton built from your WineGDK fork")
-    eng_lbl = tk.StringVar(
-        value=("custom dir: " + Path(s["proton_dir"]).name)
-        if s.get("proton_dir") else
-        ("custom URL set" if s.get("proton_url") else
-         "build from WineGDK (Wyze3306/WineGDK)"))
+    play_btn = button(barin, "▶   PLAY", lambda: do_play(), GREEN, "white",
+                      GREEN_H, ("", 15, "bold"), 46, 14)
+    play_btn.pack(side="right")
+    button(barin, "⚙", lambda: open_settings(), PANEL, SUB, PANEL2,
+           ("", 15), 12, 10).pack(side="right", padx=(0, 12))
+    det_btn = button(barin, "Details", lambda: toggle_details(), PANEL, SUB,
+                     PANEL2, ("", 10), 12, 12)
+    det_btn.pack(side="right", padx=(0, 4))
 
-    def use_winegdk():
-        st = load_settings()
-        st["proton_source"] = "winegdk"
-        st.setdefault("winegdk_repo", WINEGDK_REPO)
-        st.setdefault("winegdk_branch", WINEGDK_BRANCH)
-        for k in ("proton_dir", "proton_url", "proton", "proton_tag",
-                  "winegdk_built"):
-            st.pop(k, None)
-        save_settings(st)
-        eng_lbl.set("build from WineGDK (Wyze3306/WineGDK)")
-        _LOG_SINK("OK Engine = WineGDK fork. Click 'Install / Update' "
-                  "(first build is long).")
-
-    def pick_custom_proton():
-        d = filedialog.askdirectory()
-        if not d:
-            return
-        st = load_settings()
-        if (Path(d) / "proton").exists():
-            st["proton_dir"] = d
-            for k in ("proton_url", "proton", "proton_tag", "proton_source"):
-                st.pop(k, None)
-            save_settings(st)
-            eng_lbl.set("custom dir: " + Path(d).name)
-            _LOG_SINK(f"OK Custom GDK-Proton: {d}")
-        else:
-            _LOG_SINK("xx No 'proton' executable in that folder")
-
-    ttk.Button(ce, text="\u2699 build from WineGDK",
-               command=use_winegdk).grid(row=0, column=0, sticky="w")
-    ttk.Button(ce, text="\u2026 custom dir",
-               command=pick_custom_proton).grid(row=0, column=1, padx=8)
-    tk.Label(ce, textvariable=eng_lbl, bg=CARD, fg="#e0b341"
-             ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(8, 0))
-
-    cm = card("\u2462  Microsoft account (sign in happens in-game too)")
-    ms_state = tk.StringVar()
-    msl = tk.Label(cm, textvariable=ms_state, bg=CARD, font=("", 10, "bold"))
-    msl.grid(row=0, column=0, sticky="w")
-    ms_code = tk.StringVar(value="")
-    tk.Label(cm, textvariable=ms_code, bg=CARD, fg="#e0b341"
-             ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
-
-    def set_phase(ph):
-        if ph == "in":
-            ms_state.set("Connected \u2713")
-            msl.configure(fg=ACC2)
-            ms_code.set("")
-            b_login.grid_remove(); b_link.grid_remove()
-            b_code.grid_remove(); b_logout.grid()
-        elif ph == "auth":
-            ms_state.set("Sign-in required \u2014 open the link, enter the code")
-            msl.configure(fg="#e0b341")
-            b_login.grid_remove(); b_logout.grid_remove()
-            b_link.grid(); b_code.grid()
-        else:
-            ms_state.set("Not connected")
-            msl.configure(fg=SUB)
-            ms_code.set("")
-            b_link.grid_remove(); b_code.grid_remove()
-            b_logout.grid_remove(); b_login.grid()
-
-    def on_auth(u, code):
-        root.after(0, lambda: (ms_code.set(f"\u2794  {u}     code : {code}"),
-                               set_phase("auth")))
-
-    def on_online():
-        root.after(0, lambda: set_phase("in"))
-
-    def open_link():
-        if na.auth:
-            subprocess.Popen(["xdg-open", na.auth[0]],
-                             stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL)
-
-    def copy_code():
-        if na.auth and na.auth[1]:
-            root.clipboard_clear()
-            root.clipboard_append(na.auth[1])
-
-    def do_logout():
-        msa_logout()
-        na.stop()
-        set_phase("out")
-
-    b_login = ttk.Button(cm, text="Sign in",
-                         command=lambda: threading.Thread(
-                             target=lambda: na.start(on_auth, on_online),
-                             daemon=True).start())
-    b_login.grid(row=0, column=1, padx=6)
-    b_link = ttk.Button(cm, text="Open link", command=open_link)
-    b_link.grid(row=0, column=2, padx=6)
-    b_code = ttk.Button(cm, text="Copy code", command=copy_code)
-    b_code.grid(row=0, column=3, padx=6)
-    b_logout = ttk.Button(cm, text="Sign out", command=do_logout)
-    b_logout.grid(row=0, column=1, padx=6)
-    set_phase("in" if msa_signed_in() else "out")
-
-    prog = ttk.Progressbar(root, style="Bar.Horizontal.TProgressbar",
+    # ---- status line + progress (above the bar) ----
+    status = tk.Frame(root, bg=BG)
+    status.pack(fill="x", side="bottom", padx=24, pady=(0, 8))
+    status_txt = tk.StringVar(value="Ready to play.")
+    tk.Label(status, textvariable=status_txt, bg=BG, fg=SUB,
+             anchor="w").pack(fill="x")
+    prog = ttk.Progressbar(status, style="Bar.Horizontal.TProgressbar",
                            mode="determinate")
-    prog.pack(fill="x", padx=20, pady=(10, 4))
-    lw = tk.Frame(root, bg=BG)
-    lw.pack(fill="both", expand=True, padx=20, pady=4)
-    logbox = tk.Text(lw, height=9, bg="#0b0d11", fg="#79d279", bd=0,
-                     relief="flat", insertbackground="#79d279",
-                     font=("monospace", 9), highlightthickness=0)
-    logbox.pack(fill="both", expand=True)
+
+    # ---- collapsible details log ----
+    detwrap = tk.Frame(root, bg=BG)
+    logbox = tk.Text(detwrap, height=8, bg="#0d0f13", fg="#7fd97f", bd=0,
+                     font=("monospace", 9), highlightthickness=0,
+                     padx=10, pady=8)
+    logbox.pack(fill="both", expand=True, padx=24, pady=(0, 4))
 
     def glog(line):
         logbox.insert("end", line + "\n")
@@ -2104,75 +2032,179 @@ def gui():
     global _LOG_SINK
     _LOG_SINK = lambda m: root.after(0, glog, m)
 
+    def toggle_details():
+        ui["details"] = not ui["details"]
+        if ui["details"]:
+            detwrap.pack(fill="both", side="bottom")
+            det_btn.configure(fg=FG)
+        else:
+            detwrap.pack_forget()
+            det_btn.configure(fg=SUB)
+
+    def set_status(t):
+        root.after(0, lambda: status_txt.set(t))
+
     def set_progress(g, t):
-        root.after(0, lambda: prog.configure(maximum=t, value=g))
+        def ap():
+            if not prog.winfo_ismapped():
+                prog.pack(fill="x", pady=(5, 0))
+            prog.configure(maximum=max(1, t), value=g)
+        root.after(0, ap)
 
-    foot = tk.Frame(root, bg=BG)
-    foot.pack(fill="x", padx=20, pady=(8, 18))
-    btn_setup = ttk.Button(foot, text="\u27f3  Install / Update",
-                           command=lambda: act("setup"))
-    btn_setup.pack(side="left")
-    ttk.Button(foot, text="\U0001f5ce  Open logs",
-               command=lambda: subprocess.Popen(
-                   ["xdg-open", str(LOGS)], stdout=subprocess.DEVNULL,
-                   stderr=subprocess.DEVNULL)).pack(side="left", padx=10)
-    ttk.Button(foot, text="\U0001f6e0  Repair",
-               command=lambda: threading.Thread(
-                   target=reset_prefix, daemon=True).start()
-               ).pack(side="left")
-    btn_play = ttk.Button(foot, text="\u25b6    PLAY", style="Accent.TButton",
-                          command=lambda: act("play"))
-    btn_play.pack(side="right")
+    def end_progress():
+        root.after(0, lambda: prog.pack_forget())
 
-    def refresh_mc():
+    # ---- account (device-code Microsoft sign-in) ----
+    def acct_state(ph):
+        if ph == "in":
+            acct_dot.configure(fg=GREEN)
+            acct_txt.set("Signed in")
+            acct_btn.configure(text="Sign out")
+            acct_btn._mode = "out"
+        elif ph == "auth":
+            acct_dot.configure(fg=GOLD)
+            acct_txt.set("Sign-in pending…")
+            acct_btn._mode = "out"
+        else:
+            acct_dot.configure(fg=SUB)
+            acct_txt.set("Not signed in")
+            acct_btn.configure(text="Sign in")
+            acct_btn._mode = "in"
+
+    def acct_click():
+        if getattr(acct_btn, "_mode", "in") == "out":
+            msa_logout()
+            na.stop()
+            acct_state("out")
+        else:
+            threading.Thread(target=lambda: na.start(on_auth, on_online),
+                             daemon=True).start()
+
+    def on_auth(url, code):
+        root.after(0, lambda: (acct_state("auth"), code_dialog(url, code)))
+
+    def on_online():
+        root.after(0, lambda: acct_state("in"))
+
+    def code_dialog(url, code):
+        d = tk.Toplevel(root, bg=PANEL)
+        d.title("Sign in to Microsoft")
+        d.configure(padx=26, pady=22)
+        d.transient(root)
+        d.resizable(False, False)
+        tk.Label(d, text="Sign in to your Microsoft account", bg=PANEL, fg=FG,
+                 font=("", 13, "bold")).pack(anchor="w")
+        tk.Label(d, text="Open the link and enter this code:", bg=PANEL,
+                 fg=SUB).pack(anchor="w", pady=(8, 12))
+        cf = tk.Frame(d, bg=FIELD)
+        cf.pack(fill="x")
+        tk.Label(cf, text=code, bg=FIELD, fg=GOLD,
+                 font=("monospace", 20, "bold")).pack(padx=18, pady=10)
+        row = tk.Frame(d, bg=PANEL)
+        row.pack(fill="x", pady=(14, 0))
+        button(row, "Open link", lambda: subprocess.Popen(
+            ["xdg-open", url], stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL), GREEN, "white", GREEN_H,
+            ("", 11, "bold"), 16, 9).pack(side="left")
+        button(row, "Copy code", lambda: (root.clipboard_clear(),
+               root.clipboard_append(code)), PANEL2, FG, "#363b46",
+               ("", 11), 16, 9).pack(side="left", padx=10)
+
+    # ---- versions ----
+    def refresh_versions():
+        beta = load_settings().get("show_betas", False)
         try:
-            versions["mc"] = list_mc_versions(beta_var.get())
-            vals = [v["tag"] + ("  \u00b7 beta" if v["beta"] else "")
-                    for v in versions["mc"]]
-
-            def ap():
-                mc_cb.configure(values=vals)
-                if vals and not mc_var.get():
-                    cur = (load_settings().get("mc_version") or "")
-                    pick = next((v for v in vals if v.split("  ")[0] == cur
-                                 or v.split("  ")[0].startswith(cur + ".")),
-                                vals[0])
-                    mc_var.set(pick)
-            root.after(0, ap)
+            ui["versions"] = list_mc_versions(beta)
         except Exception as e:
-            _LOG_SINK(f"xx versions MC: {e}")
+            _LOG_SINK(f"xx versions: {e}")
+            return
+        labels = [v["tag"] + ("  · beta" if v["beta"] else "")
+                  for v in ui["versions"]]
 
-    threading.Thread(target=refresh_mc, daemon=True).start()
+        def ap():
+            mc_cb.configure(values=labels)
+            cur = (load_settings().get("mc_version") or "")
+            pick = next((x for x in labels
+                         if x.split("  ")[0] == cur
+                         or x.split("  ")[0].startswith(cur + ".")),
+                        labels[0] if labels else "")
+            if labels:
+                mc_var.set(pick)
+        root.after(0, ap)
 
-    def collect():
-        mc = None
-        if not own.get() and mc_var.get() and versions["mc"]:
-            labels = [v["tag"] + ("  \u00b7 beta" if v["beta"] else "")
-                      for v in versions["mc"]]
-            mc = versions["mc"][labels.index(mc_var.get())]
-        return mc
+    def selected_version():
+        if not ui["versions"] or not mc_var.get():
+            return None
+        labels = [v["tag"] + ("  · beta" if v["beta"] else "")
+                  for v in ui["versions"]]
+        try:
+            return ui["versions"][labels.index(mc_var.get())]
+        except ValueError:
+            return None
 
-    def busy(on):
-        for b in (btn_setup, btn_play):
-            b.configure(state="disabled" if on else "normal")
+    # ---- PLAY: auto-install (version + engine) then launch ----
+    def busy(on, msg=""):
+        ui["busy"] = on
+        play_btn.enable(not on)
+        if msg:
+            set_status(msg)
 
-    def act(kind):
-        busy(True)
+    def do_play():
+        if ui["busy"]:
+            return
+        busy(True, "Preparing…")
 
         def work():
             try:
-                mc = collect()
-                do_setup(game_dir=own.get() or None, mc_ver=mc,
-                         force=(kind == "setup"), progress=set_progress)
-                if kind == "play":
-                    launch()
-                else:
-                    _LOG_SINK("OK Ready \u2014 click PLAY")
+                ver = selected_version()
+                do_setup(mc_ver=ver, progress=set_progress)
+                set_status("Launching Minecraft…")
+                launch()
+                set_status("Minecraft closed.")
             except Exception as e:
                 _LOG_SINK(f"xx {e}")
+                set_status(f"Error: {e}")
             finally:
-                root.after(0, lambda: busy(False))
+                end_progress()
+                root.after(0, lambda: busy(False, ""))
         threading.Thread(target=work, daemon=True).start()
+
+    # ---- settings popup (the few advanced bits, out of the way) ----
+    def open_settings():
+        d = tk.Toplevel(root, bg=PANEL)
+        d.title("Settings")
+        d.configure(padx=26, pady=22)
+        d.transient(root)
+        d.resizable(False, False)
+        tk.Label(d, text="Settings", bg=PANEL, fg=FG,
+                 font=("", 14, "bold")).pack(anchor="w", pady=(0, 12))
+        beta_v = tk.BooleanVar(value=load_settings().get("show_betas", False))
+
+        def save_beta():
+            s2 = load_settings()
+            s2["show_betas"] = beta_v.get()
+            save_settings(s2)
+            threading.Thread(target=refresh_versions, daemon=True).start()
+        tk.Checkbutton(d, text="Show beta / preview versions", variable=beta_v,
+                       command=save_beta, bg=PANEL, fg=FG, selectcolor=FIELD,
+                       activebackground=PANEL, activeforeground=FG, bd=0,
+                       highlightthickness=0, anchor="w").pack(fill="x", pady=2)
+        tk.Frame(d, bg=PANEL2, height=1).pack(fill="x", pady=12)
+        for label, fn in (
+            ("Open logs folder", lambda: subprocess.Popen(
+                ["xdg-open", str(LOGS)], stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL)),
+            ("Repair (reset Wine prefix)", lambda: threading.Thread(
+                target=reset_prefix, daemon=True).start()),
+            ("Force stop Minecraft", kill_wine),
+        ):
+            button(d, label, fn, PANEL2, FG, "#363b46", ("", 11), 14, 9
+                   ).pack(fill="x", pady=3)
+        tk.Label(d, text=f"{PRETTY} {VERSION}", bg=PANEL, fg=SUB,
+                 font=("", 9)).pack(anchor="w", pady=(14, 0))
+
+    acct_state("in" if msa_signed_in() else "out")
+    threading.Thread(target=refresh_versions, daemon=True).start()
 
     def on_close():
         na.stop()
@@ -2185,58 +2217,29 @@ def main():
     p = argparse.ArgumentParser(prog=APP, description=f"{PRETTY} {VERSION}")
     sub = p.add_subparsers(dest="cmd")
 
-    sp = sub.add_parser("setup", help="download & prepare everything")
-    sp.add_argument("--game-dir", help="folder with Minecraft.Windows.exe")
-    sp.add_argument("--mc", help="Minecraft version tag from the archive "
-                                 "(e.g. 1.26.21.1)")
+    sub.add_parser("gui", help="open the launcher (default)")
+    sub.add_parser("play", help="launch Minecraft")
+    sp = sub.add_parser("setup", help="download & prepare Minecraft")
+    sp.add_argument("--mc", metavar="VERSION",
+                    help="Minecraft version tag (e.g. 1.26.21.1)")
     sp.add_argument("--beta", action="store_true", help="allow beta versions")
-    sp.add_argument("--proton", help="(advanced) Weather-OS GDK-Proton tag")
-    sp.add_argument("--winegdk", action="store_true",
-                    help="(default) build & use the WineGDK fork")
-    sp.add_argument("--force", action="store_true")
-
-    sub.add_parser("play", help="launch the game (in-game Microsoft login)")
+    sp.add_argument("--force", action="store_true", help="re-download / rebuild")
     lv = sub.add_parser("versions", help="list available Minecraft versions")
     lv.add_argument("--beta", action="store_true")
-    cf = sub.add_parser("config", help="show/set settings")
-    cf.add_argument("--xsts-rp", metavar="RP",
-                    help="override the PlayFab XSTS relying party "
-                         "(no rebuild; '' clears)")
-    cf.add_argument("--xsts-rp-host", metavar="HOST",
-                    help="host the --xsts-rp override applies to "
-                         "(default: the MC PlayFab host)")
-    cf.add_argument("--proton-dir", metavar="PATH",
-                    help="use a local GDK-Proton build (a fork with "
-                         "WineGDK XUser)")
-    cf.add_argument("--proton-url", metavar="URL",
-                    help="download a custom GDK-Proton .tar.gz")
-    cf.add_argument("--proton-winegdk", nargs="?", const="", metavar="REPO#BRANCH",
-                    help="build GDK-Proton from a WineGDK fork (in-game "
-                         "login); default: " + WINEGDK_REPO + "#" + WINEGDK_BRANCH)
-    cf.add_argument("--proton-auto", action="store_true",
-                    help="revert to Weather-OS/GDK-Proton releases")
-    sub.add_parser("login", help="link a Microsoft account (in-game login mode)")
+    sub.add_parser("login", help="sign in to a Microsoft account")
+    sub.add_parser("repair", help="reset the Wine prefix")
     sub.add_parser("doctor", help="check host requirements")
-    sub.add_parser("repair", help="reset a broken Wine prefix")
-    sub.add_parser("gui", help="graphical launcher")
 
     a = p.parse_args()
     try:
         if a.cmd == "setup":
             mc = None
             if a.mc:
-                vs = list_mc_versions(True)
-                mc = next((v for v in vs if v["tag"] == a.mc), None)
+                mc = next((v for v in list_mc_versions(True)
+                           if v["tag"] == a.mc), None)
                 if not mc:
                     die(f"Minecraft version '{a.mc}' not found.")
-            if a.winegdk:
-                st = load_settings()
-                st["proton_source"] = "winegdk"
-                st.setdefault("winegdk_repo", WINEGDK_REPO)
-                st.setdefault("winegdk_branch", WINEGDK_BRANCH)
-                st["native_login"] = True
-                save_settings(st)
-            do_setup(a.game_dir, mc, a.proton, None, a.force)
+            do_setup(mc_ver=mc, force=a.force)
             ok(f"Done. Run:  {APP} play")
         elif a.cmd == "play":
             launch()
@@ -2244,67 +2247,6 @@ def main():
             for v in list_mc_versions(a.beta):
                 print(f"  {v['tag']:<14}{'beta' if v['beta'] else 'stable':>7}"
                       f"   {v['size']>>20} MiB")
-        elif a.cmd == "config":
-            st = load_settings()
-            touched = False
-            if a.xsts_rp_host is not None:
-                st["xsts_rp_host"] = a.xsts_rp_host
-                save_settings(st)
-                ok(f"XSTS RP host = {a.xsts_rp_host or '(default)'}")
-                touched = True
-            if a.xsts_rp is not None:
-                if a.xsts_rp:
-                    st["xsts_rp"] = a.xsts_rp
-                    ok(f"XSTS relying party = {a.xsts_rp} "
-                       "(takes effect next PLAY, no rebuild)")
-                else:
-                    st.pop("xsts_rp", None)
-                    ok("XSTS relying party override cleared")
-                save_settings(st)
-                touched = True
-            if a.proton_dir:
-                pth = str(Path(a.proton_dir).expanduser())
-                if not (Path(pth) / "proton").exists():
-                    die(f"No 'proton' executable in {pth}")
-                st["proton_dir"] = pth
-                st.pop("proton_url", None)
-                st.pop("proton", None)
-                st.pop("proton_tag", None)
-                save_settings(st)
-                ok(f"Custom GDK-Proton dir = {pth}")
-                touched = True
-            if a.proton_url:
-                st["proton_url"] = a.proton_url
-                st.pop("proton_dir", None)
-                st.pop("proton", None)
-                st.pop("proton_tag", None)
-                save_settings(st)
-                ok("Custom GDK-Proton URL set — runs on next setup/play.")
-                touched = True
-            if a.proton_winegdk is not None:
-                repo, _, branch = a.proton_winegdk.partition("#")
-                st["proton_source"] = "winegdk"
-                st["winegdk_repo"] = repo or WINEGDK_REPO
-                st["winegdk_branch"] = branch or WINEGDK_BRANCH
-                st["native_login"] = True
-                for k in ("proton_dir", "proton_url", "proton", "proton_tag",
-                          "winegdk_built"):
-                    st.pop(k, None)
-                save_settings(st)
-                ok(f"GDK-Proton = build from {st['winegdk_repo']}"
-                   f"#{st['winegdk_branch']} (native login on). Run "
-                   "'Install / Update'.")
-                touched = True
-            if a.proton_auto:
-                for k in ("proton_dir", "proton_url", "proton", "proton_tag",
-                          "proton_source", "winegdk_repo", "winegdk_branch",
-                          "winegdk_built"):
-                    st.pop(k, None)
-                save_settings(st)
-                ok("GDK-Proton = auto (Weather-OS releases)")
-                touched = True
-            if not touched:
-                print(json.dumps(st, indent=2))
         elif a.cmd == "login":
             na = NativeAuth()
             if na.signed_in():
