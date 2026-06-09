@@ -60,16 +60,31 @@ tar xzf bedrock-on-linux-*-portable.tar.gz && cd bedrock-on-linux
 3. Pick a **version** (bottom-left), then hit **▶ PLAY**.
 4. In game: **Play ▸ Servers** (or *Discover*) and join.
 
-The first **PLAY** downloads the version and builds the engine (once); after
-that it just starts. Everything else is handled for you.
+The first **PLAY** downloads the version and the engine (once); after that it
+just starts. Everything else is handled for you — **no build tools needed**.
 
-## The engine build (first run)
+## The engine (first run)
 
-The first launch builds the WineGDK-based GDK-Proton. This is a full Wine
-build — it is **long** and needs build tools; the launcher checks for them
-and prints exactly what to install (e.g. `sudo apt build-dep wine` +
-`flex bison gcc-mingw-w64-x86-64 …`). Builds are cached by source commit, so
-it only happens once per engine update.
+The game runs on a WineGDK-based GDK-Proton ("the engine"). On first launch
+the launcher **downloads a prebuilt engine** from the releases and unpacks it —
+just like the game itself. You do **not** need a compiler or any `-dev`
+packages.
+
+Only when no prebuilt has been published for the current engine revision does
+the launcher fall back to building Wine from source (a long build that needs
+the mingw toolchain) — a path meant for developers iterating on the fork.
+
+**Maintainers — publishing a prebuilt engine:** build it once
+(`bedrock-on-linux setup --force`), then package and upload:
+
+```bash
+scripts/package-engine.sh            # → dist/GDK-Proton-xuser-<rev>.tar.gz
+gh release upload v1.0.0 dist/GDK-Proton-xuser-*.tar.gz --clobber
+```
+
+The launcher finds the asset by name (`GDK-Proton-xuser-<rev>.tar.gz`) across
+the app's releases, so it can hang off any tag. Bump `WINEGDK_BUILD_REV` in
+`bedrock-on-linux` whenever the engine changes, then publish a fresh asset.
 
 ## Command line
 

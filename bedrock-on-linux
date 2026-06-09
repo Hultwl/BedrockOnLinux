@@ -24,7 +24,7 @@ from pathlib import Path
 
 APP = "bedrock-on-linux"
 PRETTY = "BedrockOnLinux"
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 
 HOME = Path.home()
 DATA = Path(os.environ.get("BOL_HOME", HOME / ".local/share" / APP))
@@ -78,6 +78,12 @@ GDK_DEPS_DLLS = ("libHttpClient.GDK.dll", "XCurl.dll")
 OPENSSL_XCURL_SET = DATA / "xodus-xcurl" / "openssl-set"
 WINEGDK_SRC = DATA / "winegdk-src"
 WINEGDK_OUT = PROTON_DIR / "GDK-Proton-xuser"
+# Prebuilt engine source. End users download a ready-built GDK-Proton-xuser
+# from the app's own GitHub releases instead of compiling a full Wine; the
+# launcher scans for an asset named GDK-Proton-xuser-<build-rev>.tar.gz.
+# Only when none is published does it fall back to a from-source build.
+# Publish a new one with scripts/package-engine.sh (see that script's header).
+WINEGDK_PREBUILT_REPO = "Wyze3306/BedrockOnLinux"
 # Bump when the build/packaging method changes → forces a clean rebuild.
 WINEGDK_BUILD_REV = "wow64-archs"
 
@@ -1518,10 +1524,97 @@ def _winegdk_sync():
     return r.stdout.strip()
 
 
+def _wire_winegdk():
+    """Point the launcher at the WineGDK engine (however it was produced) and
+    apply the runtime patches. Shared by the prebuilt and source-build paths."""
+    s = load_settings()
+    s["proton"] = str(WINEGDK_OUT)
+    s["proton_tag"] = "winegdk"
+    s["proton_dir"] = str(WINEGDK_OUT)   # so launch/patch treat it as custom
+    s["proton_source"] = "winegdk"
+    s["native_login"] = True             # the whole point of this engine
+    save_settings(s)
+    patch_proton(WINEGDK_OUT, strict=False)
+    return WINEGDK_OUT
+
+
+def _install_prebuilt_winegdk(progress=None):
+    """Fetch + unpack a prebuilt GDK-Proton-xuser engine so end users never
+    compile a full Wine. Looks for an asset named for the current build rev on
+    the app's own releases. Returns True on success, False (→ source-build
+    fallback) when no matching asset is published or the archive is unusable.
+    Any network/IO error degrades to False — it never breaks the build path."""
+    asset = f"GDK-Proton-xuser-{WINEGDK_BUILD_REV}.tar.gz"
+    try:
+        rels = gh_releases(WINEGDK_PREBUILT_REPO, 30)
+    except Exception as e:
+        warn(f"Prebuilt engine lookup failed ({e}) — will build from source.")
+        return False
+    url = name = None
+    for rel in rels or []:
+        url, name, _ = asset_url(rel, lambda n: n == asset)
+        if url:
+            break
+    if not url:
+        return False
+    tar = CACHE / name
+    if not tar.exists():
+        info("Downloading the game engine (prebuilt, one-time) …")
+        try:
+            download(url, tar, "Game engine", progress)
+        except BolError:
+            return False
+    info("Unpacking the game engine …")
+    tmp = PROTON_DIR / ".xuser-dl"
+    shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir(parents=True, exist_ok=True)
+    try:
+        with tarfile.open(tar) as t:
+            t.extractall(tmp)
+    except Exception as e:
+        warn(f"Prebuilt engine archive unreadable ({e}) — building instead.")
+        shutil.rmtree(tmp, ignore_errors=True)
+        try:
+            tar.unlink()                 # drop the bad/partial cache copy
+        except OSError:
+            pass
+        return False
+    # Accept a tarball whose top level IS the proton tree, or one that wraps a
+    # single GDK-Proton* directory.
+    root = tmp if (tmp / "proton").exists() else next(
+        (p for p in tmp.iterdir() if (p / "proton").exists()), None)
+    if root is None:
+        warn("Prebuilt engine archive has no proton tree — building instead.")
+        shutil.rmtree(tmp, ignore_errors=True)
+        return False
+    WINEGDK_OUT.parent.mkdir(parents=True, exist_ok=True)
+    shutil.rmtree(WINEGDK_OUT, ignore_errors=True)
+    root.replace(WINEGDK_OUT)            # same filesystem (both under PROTON_DIR)
+    shutil.rmtree(tmp, ignore_errors=True)
+    ok("Game engine ready (prebuilt — no compiler needed).")
+    return True
+
+
 def ensure_winegdk(force=False, progress=None):
     """Build a GDK-Proton from the user's WineGDK fork (XUser + request
     signing) and wire it in for native in-game login. The Wine build is
     long; results are cached by source commit."""
+    # Preferred path: a prebuilt engine — end users download it once instead
+    # of compiling a full Wine. The from-source build below is the fallback,
+    # reached only when no prebuilt asset is published for this engine rev
+    # (developers iterating on the fork). Strictly additive: with no asset
+    # hosted, this behaves exactly like the build-only flow it replaced.
+    s = load_settings()
+    if not force and (WINEGDK_OUT / "proton").exists() \
+            and s.get("winegdk_built", "").endswith(":" + WINEGDK_BUILD_REV):
+        info(f"WineGDK engine ready ({WINEGDK_BUILD_REV}).")
+        return _wire_winegdk()
+    if _install_prebuilt_winegdk(progress):     # re-fetched on --force too
+        s = load_settings()
+        s["winegdk_built"] = "prebuilt:" + WINEGDK_BUILD_REV
+        save_settings(s)
+        return _wire_winegdk()
+    info("No prebuilt engine published — building from source (one-time, long).")
     commit = _winegdk_sync()
     want = commit + ":" + WINEGDK_BUILD_REV
     s = load_settings()
@@ -1533,10 +1626,14 @@ def ensure_winegdk(force=False, progress=None):
                              "x86_64-w64-mingw32-gcc",
                              "i686-w64-mingw32-gcc") if not shutil.which(t)]
         if need:
-            die("Build tools missing: " + " ".join(need) + "\n"
-                "  Install (no deb-src needed):\n  "
+            die("No prebuilt engine was available to download, so it has to "
+                "be built from source — but these tools are missing: "
+                + " ".join(need) + "\n"
+                "  This usually means no prebuilt was published for this "
+                "version yet (please report it). To build locally instead "
+                "(no deb-src needed):\n  "
                 + _pm_hint().format(WINE_BUILD_PKGS)
-                + "\n  then re-run Install / Update.")
+                + "\n  then re-run.")
         base = _stock_proton_root(progress)
         # Build Wine straight into a fresh copy of the stock GDK-Proton's
         # files/ — so wine, wine64, wineserver and libwine all come from the
@@ -1651,15 +1748,7 @@ def ensure_winegdk(force=False, progress=None):
         s["winegdk_built"] = want
         save_settings(s)
         ok(f"WineGDK GDK-Proton ready ({commit[:9]})")
-    s = load_settings()
-    s["proton"] = str(WINEGDK_OUT)
-    s["proton_tag"] = "winegdk"
-    s["proton_dir"] = str(WINEGDK_OUT)   # so launch/patch treat it as custom
-    s["proton_source"] = "winegdk"
-    s["native_login"] = True             # the whole point of this engine
-    save_settings(s)
-    patch_proton(WINEGDK_OUT, strict=False)
-    return WINEGDK_OUT
+    return _wire_winegdk()
 
 
 def do_setup(game_dir=None, mc_ver=None, proton_tag=None, pp_tag=None,
