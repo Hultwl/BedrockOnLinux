@@ -24,7 +24,7 @@ from pathlib import Path
 
 APP = "bedrock-on-linux"
 PRETTY = "BedrockOnLinux"
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 
 HOME = Path.home()
 DATA = Path(os.environ.get("BOL_HOME", HOME / ".local/share" / APP))
@@ -314,17 +314,25 @@ def _backup_once(path: Path):
         shutil.copy2(path, bk)
 
 
-def apply_patch(path: Path, off, expect, new, what, strict=True):
+def apply_patch(path: Path, off, expect, new, what, strict=True, relax=False):
     raw = bytearray(path.read_bytes())
     if bytes(raw[off:off + len(new)]) == new:
         info(f"{what}: already patched")
         return False
     if bytes(raw[off:off + len(expect)]) != expect:
-        msg = f"{what}: unexpected bytes at 0x{off:x} — patch skipped."
-        if strict:
-            die(msg)
-        warn(msg)
-        return False
+        got = bytes(raw[off:off + len(expect)]).hex()
+        if not relax:
+            msg = f"{what}: unexpected bytes at 0x{off:x} — patch skipped."
+            if strict:
+                die(msg)
+            warn(msg)
+            return False
+        # relax: the offset comes from a structural lookup (PE export table),
+        # so it IS the real function entry — only the prologue varies between
+        # Wine/compiler builds. The stub (return 0) is safe to plant over any
+        # prologue, so patch anyway instead of skipping (which left the game
+        # to crash later on the unimplemented stub).
+        warn(f"{what}: prologue {got} at 0x{off:x} differs — stubbing anyway.")
     _backup_once(path)
     raw[off:off + len(new)] = new
     path.write_bytes(raw)
@@ -441,9 +449,12 @@ def patch_proton(root: Path, strict=True):
     off = PE(combase).export_off("RoOriginateErrorW")
     if off is None:
         return fail("RoOriginateErrorW not found in combase.dll")
+    # The prologue varies by Wine build (4883ec28 / 4883ec48 / …), but the
+    # entry offset is resolved from the export table, so stub it regardless:
+    # plant `xor eax,eax; ret` so RoOriginateErrorW always returns S_OK.
     apply_patch(combase, off, bytes.fromhex("4883ec28"),
                 bytes.fromhex("31c0c3") + b"\x90" * 21,
-                "combase.RoOriginateErrorW", strict=strict)
+                "combase.RoOriginateErrorW", strict=strict, relax=True)
 
     # (2) ntdll: neutralise every unimplemented-stub funnel (prologue + call
     #     to RtlRaiseException + EB F6 never-return loop) so unimplemented
