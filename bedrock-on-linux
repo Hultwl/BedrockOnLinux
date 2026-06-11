@@ -24,7 +24,7 @@ from pathlib import Path
 
 APP = "bedrock-on-linux"
 PRETTY = "BedrockOnLinux"
-VERSION = "1.0.7"
+VERSION = "1.0.8"
 
 HOME = Path.home()
 DATA = Path(os.environ.get("BOL_HOME", HOME / ".local/share" / APP))
@@ -2083,11 +2083,20 @@ def launch(_pp=None, _repaired=False):
         xrd = os.environ.get("XDG_RUNTIME_DIR")
         if xrd:
             env["XDG_RUNTIME_DIR"] = xrd
-        if disp:
-            env["DISPLAY"] = disp          # harmless XWayland fallback
+        # winewayland only engages when DISPLAY is UNSET — otherwise the v1.0.6
+        # attempt died with nodrv_CreateWindow (winex11 disabled by Proton, yet
+        # the X path still half-initialised). Drop it so Wine has only Wayland.
+        env.pop("DISPLAY", None)
+        # GE-Proton otherwise probes the primary monitor via xrandr, which fails
+        # with no X server (Niri) → no window. Let the user name the output
+        # (e.g. BOL_WAYLAND_MONITOR=DP-1) to skip that probe.
+        mon = (os.environ.get("BOL_WAYLAND_MONITOR")
+               or os.environ.get("WAYLANDDRV_PRIMARY_MONITOR"))
+        if mon:
+            env["WAYLANDDRV_PRIMARY_MONITOR"] = mon
         warn("BOL_INPUT=wayland → winewayland (opt-in mouse fix). If the game "
-             "doesn't start (black/no window), Proton disabled XWayland and "
-             "winewayland couldn't connect — unset BOL_INPUT to use XWayland.")
+             "doesn't start (black/no window) try BOL_WAYLAND_MONITOR=<output> "
+             "(e.g. eDP-1); otherwise unset BOL_INPUT to use XWayland.")
     else:
         if backend == "wayland":
             warn("BOL_INPUT=wayland but no WAYLAND_DISPLAY found — using X11.")
@@ -2140,6 +2149,7 @@ def launch(_pp=None, _repaired=False):
     broken = any("prefix broken" in h.lower() for h in hits)
     no_display = any("display unavailable" in h.lower() for h in hits)
     rng_abort = any("rng unresolved" in h.lower() for h in hits)
+    wayland_attempt = env.get("PROTON_ENABLE_WAYLAND") == "1"
     # A SystemFunction036 abort makes explorer fail to start, which *looks* like
     # a broken prefix (nodrv_CreateWindow) but isn't — a reset won't help and the
     # cause is neither the prefix nor the GPU. The cryptbase=n,b fallback resolves
@@ -2148,6 +2158,13 @@ def launch(_pp=None, _repaired=False):
         warn("The window failure came from the cryptbase RNG abort, not a broken "
              "prefix or GPU — relaunch (builtin cryptbase now provides "
              "RtlGenRandom).")
+    elif wayland_attempt and broken:
+        # winewayland (BOL_INPUT=wayland) couldn't open a window — that's the
+        # Wayland backend not connecting, NOT a broken prefix. Never reset the
+        # prefix for this; point the user back to the working XWayland path.
+        warn("winewayland couldn't open a window (BOL_INPUT=wayland). This is "
+             "the Wayland backend, not a broken prefix — unset BOL_INPUT (or set "
+             "BOL_INPUT=x11) to use XWayland, or try BOL_WAYLAND_MONITOR=<output>.")
     elif broken and not no_display:
         if not _repaired:
             warn("Broken Wine prefix — repairing and relaunching once…")
