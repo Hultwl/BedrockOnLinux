@@ -24,7 +24,7 @@ from pathlib import Path
 
 APP = "bedrock-on-linux"
 PRETTY = "BedrockOnLinux"
-VERSION = "1.0.6"
+VERSION = "1.0.7"
 
 HOME = Path.home()
 DATA = Path(os.environ.get("BOL_HOME", HOME / ".local/share" / APP))
@@ -2056,23 +2056,26 @@ def launch(_pp=None, _repaired=False):
         san = "".join(c.upper() if c.isalnum() else "_" for c in host)
         env["WINEGDK_XSTS_RP_" + san] = rp
         info(f"XSTS relying party override [{host}] = {rp}")
-    # Display + INPUT backend. Minecraft's GameInput reads the mouse (and the
-    # controller) through raw input; under XWayland (winex11.drv on ANY Wayland
-    # session — Niri, KDE/GNOME Wayland, handhelds like the Legion Go) those raw
-    # events never reach the game window, so the mouse + controller are dead
-    # while the keyboard (Win32 path) still works. On a real X server raw input
-    # works — which is why it runs on the maintainer's Cinnamon/X11 box but not
-    # for Wayland users. Fix: on a Wayland session switch Wine to winewayland.drv
-    # (native Wayland pointer + relative-pointer/constraints). Proton then
-    # disables winex11.drv itself — it just needs PROTON_ENABLE_WAYLAND set and
-    # WAYLAND_DISPLAY passed through. Auto by default; override with
-    # BOL_INPUT=x11|wayland|auto (or the input_backend setting) if winewayland
-    # mis-renders on a given setup.
+    # Display + INPUT backend. Under XWayland (winex11.drv on a Wayland session —
+    # Niri, KDE/GNOME Wayland, the Legion Go) Minecraft's GameInput gets no mouse
+    # or controller: it reads them via raw input, which XWayland doesn't deliver
+    # to the game window. Only the keyboard (Win32 path) works. On a real X
+    # server raw input works — which is why it runs on the maintainer's
+    # Cinnamon/X11 box but not for Wayland users.
+    #
+    # winewayland.drv would fix the input (native Wayland pointer), BUT enabling
+    # it makes Proton DISABLE winex11.drv, and on some compositors winewayland
+    # then fails to connect to the display inside the pressure-vessel container
+    # → nodrv_CreateWindow → the game won't start AT ALL (confirmed on
+    # Niri/CachyOS). A non-starting game is worse than a startable one with a
+    # dead mouse, so the safe default stays XWayland. winewayland is opt-in:
+    #   BOL_INPUT=wayland  (or the input_backend setting)
+    # for the compositors where it does connect; BOL_INPUT=x11 forces XWayland.
     wl = os.environ.get("WAYLAND_DISPLAY")
     backend = (os.environ.get("BOL_INPUT")
                or load_settings().get("input_backend") or "auto").lower()
     if backend == "auto":
-        backend = "wayland" if wl else "x11"
+        backend = "x11"               # never auto-pick wayland (see above)
     disp = os.environ.get("DISPLAY")
     if backend == "wayland" and wl:
         env["PROTON_ENABLE_WAYLAND"] = "1"
@@ -2082,9 +2085,9 @@ def launch(_pp=None, _repaired=False):
             env["XDG_RUNTIME_DIR"] = xrd
         if disp:
             env["DISPLAY"] = disp          # harmless XWayland fallback
-        info("Wayland session → winewayland input (fixes the dead "
-             "mouse/controller under XWayland). Force XWayland with "
-             "BOL_INPUT=x11 if the picture looks wrong.")
+        warn("BOL_INPUT=wayland → winewayland (opt-in mouse fix). If the game "
+             "doesn't start (black/no window), Proton disabled XWayland and "
+             "winewayland couldn't connect — unset BOL_INPUT to use XWayland.")
     else:
         if backend == "wayland":
             warn("BOL_INPUT=wayland but no WAYLAND_DISPLAY found — using X11.")
