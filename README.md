@@ -115,14 +115,15 @@ Use **⚙ Settings ▸ Open logs folder**
 rebuild a broken Wine prefix. The live step-by-step log is also under
 **Details** in the launcher.
 
-**Mouse (and controller) dead in-game, keyboard fine?** Fixed in v1.0.10 —
+**Mouse (and controller) dead in-game, keyboard fine?** Fixed in v1.0.11 —
 older releases never actually installed Microsoft's native GameInput redist
 into the Wine prefix (the check matched a pre-seeded Wine builtin DLL that has
 no mouse backend), on X11 and Wayland alike. Just update and press **Play**:
-the launcher detects the broken prefix and installs the redist automatically
-(~6 s, one time). gamescope is no longer needed for this; wrap the game in it
-only if you want to, with `BOL_GAMESCOPE=1` or
-`BOL_GAMESCOPE="-f -W 2560 -H 1440"`.
+the launcher detects the broken prefix and installs the redist automatically,
+one time. It extracts the redist straight from the game package, so it can't
+stall the way the Windows installer does on some machines. gamescope is no
+longer needed for this; wrap the game in it only if you want to, with
+`BOL_GAMESCOPE=1` or `BOL_GAMESCOPE="-f -W 2560 -H 1440"`.
 
 ## Legal
 
