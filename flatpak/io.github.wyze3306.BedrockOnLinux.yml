@@ -11,7 +11,7 @@
 # working tree). Submission steps + permission rationale: flatpak/README.md.
 app-id: io.github.wyze3306.BedrockOnLinux
 runtime: org.freedesktop.Platform
-runtime-version: '24.08'
+runtime-version: '25.08'
 sdk: org.freedesktop.Sdk
 command: bedrock-on-linux
 
@@ -19,7 +19,7 @@ finish-args:
   # GPU (Vulkan) + game controllers
   - --device=all
   # XWayland is the default display backend; winewayland is opt-in (BOL_INPUT=wayland)
-  - --socket=x11
+  - --socket=fallback-x11
   - --socket=wayland
   - --socket=pulseaudio
   - --share=ipc
@@ -119,8 +119,9 @@ modules:
       - install -Dm644 flatpak/io.github.wyze3306.BedrockOnLinux.desktop /app/share/applications/io.github.wyze3306.BedrockOnLinux.desktop
       - install -Dm644 flatpak/io.github.wyze3306.BedrockOnLinux.metainfo.xml /app/share/metainfo/io.github.wyze3306.BedrockOnLinux.metainfo.xml
     sources:
-      # Pinned release. After tagging, set commit to:
-      #   git rev-parse v1.0.9^{commit}
+      # Pinned release. Bump tag+commit each release:
+      #   git rev-parse vX.Y.Z^{commit}
       - type: git
         url: https://github.com/Wyze3306/BedrockOnLinux.git
-        tag: v1.0.9
+        tag: v1.0.13
+        commit: 68786a053dd14070bac4f399929aca482ebfb23a
