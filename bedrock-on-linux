@@ -25,7 +25,7 @@ from pathlib import Path
 
 APP = "bedrock-on-linux"
 PRETTY = "BedrockOnLinux"
-VERSION = "1.0.12"
+VERSION = "1.0.13"
 
 HOME = Path.home()
 DATA = Path(os.environ.get("BOL_HOME", HOME / ".local/share" / APP))
@@ -2302,14 +2302,28 @@ def launch(_pp=None, _repaired=False, _force_x11=False, _no_gamescope=False):
                 gs_argv += ["-W", wh[0], "-H", wh[1], "-w", wh[0], "-h", wh[1]]
         cmd = gs_argv + ["--"] + cmd
         info("Using gamescope (BOL_GAMESCOPE).")
-    info("Launching Minecraft … sign in with Microsoft in-game, then "
+    info("Starting Minecraft … sign in with Microsoft in-game, then "
          "join your server from the Servers tab.")
     glog = open(LOGS / "minecraft.log", "w")
     rc = None
     hits = []
     try:
-        rc = subprocess.run(cmd, env=env, cwd=str(CONTENT), stdout=glog,
-                            stderr=subprocess.STDOUT).returncode
+        proc = subprocess.Popen(cmd, env=env, cwd=str(CONTENT), stdout=glog,
+                                stderr=subprocess.STDOUT)
+        # Once the game has survived its launch, flip the UI to a steady
+        # "running" state instead of spinning "Starting…" for the whole
+        # session — the launcher has nothing left to do until the game exits.
+        started = time.time()
+        announced = False
+        while True:
+            try:
+                rc = proc.wait(timeout=1)
+                break
+            except subprocess.TimeoutExpired:
+                if not announced and time.time() - started > 8:
+                    announced = True
+                    ok("Minecraft is running — close the game window to come "
+                       "back here.")
     finally:
         glog.close()
         patch_options()
@@ -2619,8 +2633,14 @@ def gui():
             return "Preparing the engine…"
         if "pre-auth" in low or "signing in" in low:
             return "Signing in to Xbox Live…"
-        if "launching minecraft" in low:
-            return "Launching Minecraft…"
+        if "minecraft is running" in low:
+            # the launcher's work is done — steady state, stop the spinner
+            return ("Minecraft is running — close the game to come back here.",
+                    True)
+        if "starting minecraft" in low or "launching minecraft" in low:
+            return "Starting Minecraft…"
+        if "game closed" in low:
+            return ("Minecraft closed.", True)
         return None
 
     def glog(line):
@@ -2640,8 +2660,16 @@ def gui():
             return
         txt = _friendly(line)
         if txt:
-            set_status(txt, FG)
-            bar_busy()         # animate while this (non-download) step runs
+            steady = False
+            if isinstance(txt, tuple):
+                txt, steady = txt
+            if steady:
+                # nothing measurable is running — stop the spinner, calm colour
+                set_status(txt, GREEN if "running" in txt.lower() else SUB)
+                end_progress()
+            else:
+                set_status(txt, FG)
+                bar_busy()         # animate while a real step runs
     global _LOG_SINK
     _LOG_SINK = lambda m: root.after(0, glog, m)
 
@@ -2751,7 +2779,7 @@ def gui():
                 # do_setup logs each step; glog() turns them into a friendly
                 # status line + animated/measured progress bar.
                 do_setup(mc_ver=ver, progress=set_progress)
-                set_status("Launching Minecraft…", FG)
+                set_status("Starting Minecraft…", FG)
                 launch()
                 set_status("Minecraft closed.", SUB)
             except Exception as e:
