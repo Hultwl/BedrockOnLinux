@@ -106,7 +106,14 @@ bedrock-on-linux login        # sign in to a Microsoft account
 bedrock-on-linux play         # launch
 bedrock-on-linux repair       # reset a broken Wine prefix
 bedrock-on-linux doctor       # check host requirements
+bedrock-on-linux update       # check for and install a launcher update
 ```
+
+The launcher also checks for updates on its own: when a newer version is
+released, a banner appears at the top of the window with an **Update now**
+button (one click downloads and installs it, then offers to restart). Git
+checkouts are left alone — `git pull` there — and packaged installs (`.deb`,
+Flatpak) point you at your package manager instead.
 
 ## If something fails
 
