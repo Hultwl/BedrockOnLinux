@@ -1296,50 +1296,35 @@ def install_gdk_xbox_dlls(game_dir: Path):
 
 
 def _patch_hbui_signin_gate(game_dir: Path):
-    """HBUI (oreUI) minified-bundle patches for our out-of-process login:
+    """Bypass HBUI's 'You need a Microsoft account' banner that blocks the
+    Servers tab: its derived facet (wB() in the minified JS bundle) reports
+    not-signed-in because XSAPI never completes init under Wine, even though
+    the SISU/PlayFab auth works. An early `return ""` makes every consumer
+    fall through to `default: return null`. Idempotent; skips silently when
+    a Minecraft update rebundles the JS (pattern must then be re-found).
 
-    (1) Force the `isLoggedInWithMicrosoftAccount` facet TRUE everywhere it's
-        read. The game's facet is false (XSAPI's MSA sign-in never completes
-        under Wine even though the SISU/PlayFab/People Hub auth all work), and
-        that single false flag gates almost everything behind a 'Sign in' wall:
-        the in-game Sign-in button, viewing other players' profiles, the skin
-        dressing room, and Realms. The People Hub / persona data all return
-        HTTP 200 — only the UI gate blocks it. Every read is `<var>.isLogged…`
-        (single var, never chained, no assignment — verified), so replacing it
-        with `!0` is syntax-safe and reversible.
-    (2) The 'You need a Microsoft account' banner facet wB() — early `return ""`
-        so its consumers fall through to null (it's a separate facet).
-
-    Idempotent; skips silently when an update rebundles the JS."""
+    NOTE: forcing the isLoggedInWithMicrosoftAccount facet true (to unlock
+    Profiles / Skins / Realms / the Sign-in button) was tried and reverted —
+    it only removes the UI gate, exposing that those features genuinely need
+    XSAPI social/persona, which does not work under Wine (they then loop or
+    crash). That's an engine-level (WineGDK) problem, not a UI patch."""
     import glob
-    import re as _re
-    wb_needle = 'function wB(){return(0,l.useFacetMap)'
-    wb_done = 'function wB(){return"";return'
-    msa_done = '!0/*MSAforced*/'
-    # a READ: a non-word/non-dot char, then a single identifier, then the prop.
-    msa_rx = _re.compile(
-        r'([^\w$.])([A-Za-z_$][\w$]*)\.isLoggedInWithMicrosoftAccount')
     for js in glob.glob(str(game_dir / "data/gui/dist/hbui/index-*.js")):
         try:
             data = Path(js).read_text()
         except OSError:
             continue
-        orig = data
-        if wb_done not in data and wb_needle in data:
-            data = data.replace(wb_needle, wb_done, 1)
-        if msa_done not in data:
-            data = msa_rx.sub(lambda m: m.group(1) + msa_done, data)
-        if data == orig:
+        needle = 'function wB(){return(0,l.useFacetMap)'
+        already = 'function wB(){return"";return'
+        if already in data:
             continue
-        # never write a bundle whose bracket balance changed (would white-screen)
-        if any(orig.count(c) != data.count(c) for c in "(){}[]"):
-            warn("HBUI patch skipped — bracket balance changed (JS rebundled?)")
+        if needle not in data:
             continue
         bak = js + ".bol-orig"
         if not Path(bak).exists():
             shutil.copy2(js, bak)
-        Path(js).write_text(data)
-        ok(f"HBUI patched (MSA facet forced) in {Path(js).name}")
+        Path(js).write_text(data.replace(needle, 'function wB(){return"";return', 1))
+        ok(f"HBUI sign-in gate bypassed in {Path(js).name}")
         return
 
 
