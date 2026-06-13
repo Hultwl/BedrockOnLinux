@@ -1308,23 +1308,40 @@ def _patch_hbui_signin_gate(game_dir: Path):
     it only removes the UI gate, exposing that those features genuinely need
     XSAPI social/persona, which does not work under Wine (they then loop or
     crash). That's an engine-level (WineGDK) problem, not a UI patch."""
-    import glob
+    import glob, re
     for js in glob.glob(str(game_dir / "data/gui/dist/hbui/index-*.js")):
         try:
             data = Path(js).read_text()
         except OSError:
             continue
+        orig = data
+
+        # (1) Servers-tab "need a Microsoft account" banner: wB() -> "" so every
+        #     consumer hits `default: return null`. Legacy pattern; left as-is.
         needle = 'function wB(){return(0,l.useFacetMap)'
-        already = 'function wB(){return"";return'
-        if already in data:
-            continue
-        if needle not in data:
+        if needle in data and 'function wB(){return"";return' not in data:
+            data = data.replace(needle, 'function wB(){return"";return', 1)
+
+        # (2) Remove the broken in-game "Sign in" button. The PlayScreen
+        #     not-logged-in warning component (kB) renders a noticeTint with a
+        #     sign-in link; under Wine the MSA facet never flips so it shows
+        #     forever and the button does nothing useful. Make that component
+        #     render null — AFTER its hooks (the useCallback whose body holds the
+        #     stable "_NotLoggedInWarning_OreUI" sign-in source), so React's hook
+        #     order is preserved (unlike a naive early return). Version-tolerant:
+        #     anchored on the immutable signInSource string, minified names free.
+        m = re.search(r'(_NotLoggedInWarning_OreUI`\)\}\),\[[^\]]*\]\);)'
+                      r'(return r\.createElement\(sx,)', data)
+        if m and 'return null;return r.createElement(sx,' not in data:
+            data = data[:m.start()] + m.group(1) + 'return null;' + m.group(2) + data[m.end():]
+
+        if data == orig:
             continue
         bak = js + ".bol-orig"
         if not Path(bak).exists():
             shutil.copy2(js, bak)
-        Path(js).write_text(data.replace(needle, 'function wB(){return"";return', 1))
-        ok(f"HBUI sign-in gate bypassed in {Path(js).name}")
+        Path(js).write_text(data)
+        ok(f"HBUI sign-in gate + button patched in {Path(js).name}")
         return
 
 
