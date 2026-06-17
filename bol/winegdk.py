@@ -178,6 +178,10 @@ def ensure_winegdk(force=False, progress=None):
             and s.get("winegdk_built", "").endswith(":" + WINEGDK_BUILD_REV):
         info(f"WineGDK engine ready ({WINEGDK_BUILD_REV}).")
         return _wire_winegdk()
+    # Engine present but built for a different rev → a newer engine was
+    # published; auto-update it (same mechanism as the launcher's self-update).
+    if (WINEGDK_OUT / "proton").exists() and s.get("winegdk_built"):
+        info(f"Updating the game engine → {WINEGDK_BUILD_REV} …")
     if _install_prebuilt_winegdk(progress):     # re-fetched on --force too
         s = load_settings()
         s["winegdk_built"] = "prebuilt:" + WINEGDK_BUILD_REV

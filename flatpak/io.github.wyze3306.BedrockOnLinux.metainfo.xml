@@ -69,6 +69,15 @@
   </content_rating>
 
   <releases>
+    <release version="1.1.2" date="2026-06-17">
+      <description>
+        <p>The bundled game engine now auto-updates: when a newer WineGDK
+           engine is published, the launcher re-downloads it on the next
+           launch — the same way the launcher updates itself — so the in-game
+           sign-in and server-join fixes reach everyone, not just fresh
+           installs.</p>
+      </description>
+    </release>
     <release version="1.1.1" date="2026-06-17">
       <description>
         <p>Fixes after 1.1.0:</p>
