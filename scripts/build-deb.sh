@@ -4,7 +4,7 @@
 set -euo pipefail
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VER="$(grep -m1 '^VERSION = ' "$SRC/bedrock-on-linux" | cut -d'"' -f2)"
+VER="$(grep -m1 '^VERSION = ' "$SRC/bol/config.py" | cut -d'"' -f2)"
 OUT="$SRC/dist"
 PKG="$OUT/deb"
 rm -rf "$PKG"
@@ -19,6 +19,8 @@ mkdir -p "$OUT" \
 [[ -f "$SRC/data/icon.png" ]] || { echo "data/icon.png missing" >&2; exit 1; }
 
 install -m755 "$SRC/bedrock-on-linux" "$PKG/usr/lib/bedrock-on-linux/bedrock-on-linux"
+cp -r "$SRC/bol"                       "$PKG/usr/lib/bedrock-on-linux/bol"
+find "$PKG/usr/lib/bedrock-on-linux/bol" -name __pycache__ -type d -exec rm -rf {} +
 install -m644 "$SRC/data/icon.png"    "$PKG/usr/lib/bedrock-on-linux/data/icon.png"
 ln -s /usr/lib/bedrock-on-linux/bedrock-on-linux "$PKG/usr/bin/bedrock-on-linux"
 install -m644 "$SRC/data/icon.png" \
@@ -33,10 +35,10 @@ Version: ${VER}
 Section: games
 Priority: optional
 Architecture: all
-Depends: python3 (>= 3.9), python3-tk, tar, zstd, xdg-utils, x11-xserver-utils, ca-certificates, curl | wget
+Depends: python3 (>= 3.9), python3-tk, python3-cryptography, tar, zstd, xdg-utils, x11-xserver-utils, ca-certificates, curl | wget
 Recommends: mesa-vulkan-drivers | nvidia-driver
 Maintainer: BedrockOnLinux contributors <noreply@bedrockonlinux.invalid>
-Homepage: https://github.com/BedrockOnLinux/BedrockOnLinux
+Homepage: https://github.com/Wyze3306/BedrockOnLinux
 Description: Run Minecraft Bedrock (Windows GDK) on Linux, multiplayer included
  One graphical launcher that downloads and builds a WineGDK-based GDK-Proton,
  applies the binary patches the game needs, and signs you in to Microsoft

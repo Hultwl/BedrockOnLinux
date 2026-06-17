@@ -10,7 +10,7 @@
 set -euo pipefail
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VER="$(grep -m1 '^VERSION = ' "$SRC/bedrock-on-linux" | cut -d'"' -f2)"
+VER="$(grep -m1 '^VERSION = ' "$SRC/bol/config.py" | cut -d'"' -f2)"
 APPID="io.github.wyze3306.BedrockOnLinux"
 MANIFEST="$SRC/flatpak/$APPID.yml"
 DEV_MANIFEST="$SRC/flatpak/.$APPID.resolved.yml"   # same dir → ../ paths resolve
@@ -60,6 +60,7 @@ app = m["modules"][-1]
 assert app["name"] == "bedrock-on-linux", "app module must be last"
 app["sources"] = [
     {"type": "file", "path": "../bedrock-on-linux"},
+    {"type": "dir", "path": "../bol", "dest": "bol"},
     {"type": "file", "path": "../data/icon.png", "dest": "data"},
     {"type": "file", "path": "io.github.wyze3306.BedrockOnLinux.desktop",
      "dest": "flatpak"},

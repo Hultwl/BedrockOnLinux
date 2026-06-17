@@ -18,8 +18,11 @@ command: bedrock-on-linux
 finish-args:
   # GPU (Vulkan) + game controllers
   - --device=all
-  # XWayland is the default display backend; winewayland is opt-in (BOL_INPUT=wayland)
-  - --socket=fallback-x11
+  # The launcher GUI is Tkinter, an X11-only toolkit, so the X11 socket must be
+  # granted unconditionally: under a pure Wayland session (e.g. KDE) the weaker
+  # fallback-x11 leaves $DISPLAY unset and tk.Tk() crashes (issue #7). The game
+  # itself runs through XWayland; winewayland stays opt-in (BOL_INPUT=wayland).
+  - --socket=x11
   - --socket=wayland
   - --socket=pulseaudio
   - --share=ipc
@@ -98,6 +101,29 @@ modules:
         url: https://www.python.org/ftp/python/3.12.8/Python-3.12.8.tar.xz
         sha256: c909157bb25ec114e5869124cc2a9c4a4d4c1e957ca4ff553f1edc692101154e
 
+  # cryptography (+ its cffi / pycparser deps) for the native Microsoft login:
+  # it signs the Xbox Live device/request tokens, and without it sign-in fails
+  # with a connection reset (0x80072746). The runtime ships none and the
+  # bundled Python has no pip, so the wheels are vendored and unzipped straight
+  # into site-packages. Bump all three (url + sha256) when cryptography moves;
+  # the abi3 cryptography wheel stays valid across Python 3.x.
+  - name: python3-cryptography
+    buildsystem: simple
+    build-commands:
+      - install -d /app/lib/python3.12/site-packages
+      - for w in *.whl; do python3 -m zipfile -e "$w" /app/lib/python3.12/site-packages/; done
+      - /app/bin/python3 -c "import cryptography; print('cryptography', cryptography.__version__)"
+    sources:
+      - type: file
+        url: https://files.pythonhosted.org/packages/2c/99/2d13299eb3dd27b02dcfaafcc91d6b5cb3329f7cbd6d8f51921acd566c1a/cryptography-49.0.0-cp39-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
+        sha256: 35b151772baff2c74cba7fa290ceaff4c3b11c0c881eb93eb5dbc05a7cfbba18
+      - type: file
+        url: https://files.pythonhosted.org/packages/78/2d/7fa73dfa841b5ac06c7b8855cfc18622132e365f5b81d02230333ff26e9e/cffi-2.0.0-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
+        sha256: 3e17ed538242334bf70832644a32a7aae3d83b57567f9fd60a26257e992b79ba
+      - type: file
+        url: https://files.pythonhosted.org/packages/0c/c3/44f3fbbfa403ea2a7c779186dc20772604442dde72947e7d01069cbe98e3/pycparser-3.0-py3-none-any.whl
+        sha256: b727414169a36b7d524c1c3e31839a521725078d7b2ff038656844266160a992
+
   # zstd CLI for the one .pkg.tar.zst (libcurl) the launcher extracts;
   # Python's tarfile can't read zstd and the runtime ships no unzstd.
   - name: zstd
@@ -115,6 +141,9 @@ modules:
     buildsystem: simple
     build-commands:
       - install -Dm755 bedrock-on-linux /app/bin/bedrock-on-linux
+      # the implementation now lives in the bol/ package next to <prefix>/lib
+      - mkdir -p /app/lib/bedrock-on-linux
+      - cp -r bol /app/lib/bedrock-on-linux/bol
       - install -Dm644 data/icon.png /app/share/icons/hicolor/256x256/apps/io.github.wyze3306.BedrockOnLinux.png
       - install -Dm644 flatpak/io.github.wyze3306.BedrockOnLinux.desktop /app/share/applications/io.github.wyze3306.BedrockOnLinux.desktop
       - install -Dm644 flatpak/io.github.wyze3306.BedrockOnLinux.metainfo.xml /app/share/metainfo/io.github.wyze3306.BedrockOnLinux.metainfo.xml
@@ -123,5 +152,5 @@ modules:
       #   git rev-parse vX.Y.Z^{commit}
       - type: git
         url: https://github.com/Wyze3306/BedrockOnLinux.git
-        tag: v1.0.13
-        commit: 68786a053dd14070bac4f399929aca482ebfb23a
+        tag: v1.1.0
+        commit: 0000000000000000000000000000000000000000

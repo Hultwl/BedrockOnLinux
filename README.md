@@ -42,11 +42,10 @@ sudo apt install ./bedrock-on-linux_*_all.deb
 chmod +x BedrockOnLinux-*-x86_64.AppImage && ./BedrockOnLinux-*-x86_64.AppImage
 ```
 
-**Portable** — tarball
+**Portable** — single-file `.pyz` (any distro with Python 3)
 
 ```bash
-tar xzf bedrock-on-linux-*-portable.tar.gz && cd bedrock-on-linux
-./bedrock-on-linux gui
+chmod +x bedrock-on-linux-*.pyz && ./bedrock-on-linux-*.pyz gui
 ```
 
 **Flatpak**
@@ -59,8 +58,11 @@ flatpak run io.github.wyze3306.BedrockOnLinux
 > Build it yourself with `scripts/build-flatpak.sh` (see
 > [`flatpak/README.md`](flatpak/README.md)).
 
-> Needs (`.deb`/AppImage/portable): `python3`, `python3-tk`, `tar`, `zstd`.
-> `bedrock-on-linux doctor` reports anything missing.
+> Needs: `python3`, `python3-tk`, `tar`, `zstd`, and Python `cryptography`
+> (for Microsoft sign-in). The `.deb` and Flatpak pull these in; on the
+> AppImage/`.pyz` the launcher auto-installs `cryptography` on first login (or
+> run `pip install --user cryptography`). `bedrock-on-linux doctor` reports
+> anything missing.
 
 ## Play
 
@@ -94,7 +96,7 @@ gh release upload v1.0.0 dist/GDK-Proton-xuser-*.tar.gz --clobber
 
 The launcher finds the asset by name (`GDK-Proton-xuser-<rev>.tar.gz`) across
 the app's releases, so it can hang off any tag. Bump `WINEGDK_BUILD_REV` in
-`bedrock-on-linux` whenever the engine changes, then publish a fresh asset.
+`bol/config.py` whenever the engine changes, then publish a fresh asset.
 
 ## Command line
 
@@ -133,9 +135,15 @@ free software under their own licenses. Realms is not supported.
 ## Build
 
 ```bash
-scripts/build-release.sh        # .deb + AppImage + portable tarball → dist/
+scripts/build-release.sh        # .deb + AppImage + portable .pyz → dist/
 scripts/build-flatpak.sh        # Flatpak bundle → dist/ (needs flatpak-builder)
 ```
+
+The launcher is a small Python package, [`bol/`](bol/) — one module per
+concern (`config`, `auth`, `prefix`, `fixups`, `launch`, `gui`, …) behind the
+thin `bedrock-on-linux` entry point. The portable artifact is that package
+zipped into a single executable `.pyz`; the `.deb`/Flatpak/AppImage ship the
+package alongside the entry point.
 
 ## License
 

@@ -5,7 +5,7 @@
 set -euo pipefail
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VER="$(grep -m1 '^VERSION = ' "$SRC/bedrock-on-linux" | cut -d'"' -f2)"
+VER="$(grep -m1 '^VERSION = ' "$SRC/bol/config.py" | cut -d'"' -f2)"
 OUT="$SRC/dist"
 APPDIR="$OUT/BedrockOnLinux.AppDir"
 rm -rf "$APPDIR"
@@ -14,6 +14,9 @@ mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/share/applications" \
 
 [[ -f "$SRC/data/icon.png" ]] || { echo "data/icon.png missing" >&2; exit 1; }
 install -m755 "$SRC/bedrock-on-linux" "$APPDIR/usr/bin/bedrock-on-linux"
+# the implementation lives in the bol/ package next to the entry point
+cp -r "$SRC/bol" "$APPDIR/usr/bin/bol"
+find "$APPDIR/usr/bin/bol" -name __pycache__ -type d -exec rm -rf {} +
 mkdir -p "$APPDIR/usr/bin/data"
 cp "$SRC/data/icon.png" "$APPDIR/usr/bin/data/icon.png"
 cp "$SRC/data/icon.png" "$APPDIR/bedrock-on-linux.png"

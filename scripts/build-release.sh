@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Build every Linux artifact for a release: .deb, AppImage, portable tarball.
+# Build every Linux artifact for a release: .deb, AppImage, portable .pyz.
 # Usage: scripts/build-release.sh
 set -uo pipefail
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VER="$(grep -m1 '^VERSION = ' "$SRC/bedrock-on-linux" | cut -d'"' -f2)"
+VER="$(grep -m1 '^VERSION = ' "$SRC/bol/config.py" | cut -d'"' -f2)"
 OUT="$SRC/dist"
 mkdir -p "$OUT"
 
@@ -18,18 +18,27 @@ else
   echo "  – .deb skipped (dpkg-deb absent)"
 fi
 
-# 2) portable tarball (universal, no root) --------------------------------
-TMP="$OUT/portable/bedrock-on-linux"
-rm -rf "$OUT/portable"; mkdir -p "$TMP/data" "$TMP/scripts"
-install -m755 "$SRC/bedrock-on-linux" "$TMP/bedrock-on-linux"
-cp "$SRC/data/icon.png" "$TMP/data/icon.png"
-cp "$SRC/data/bedrock-on-linux.desktop" "$TMP/data/"
-cp "$SRC/scripts/install.sh" "$TMP/scripts/"
-cp "$SRC/README.md" "$SRC/LICENSE" "$TMP/"
-tar -C "$OUT/portable" -czf "$OUT/bedrock-on-linux-${VER}-portable.tar.gz" \
-    bedrock-on-linux
-rm -rf "$OUT/portable"
-echo "  ✓ dist/bedrock-on-linux-${VER}-portable.tar.gz"
+# 2) portable single-file zipapp (.pyz — universal, no root, self-updating) -
+# The bol/ package + a tiny __main__ are zipped into one executable file with a
+# `#!/usr/bin/env python3` shebang. It needs only a host python3 (+ tkinter for
+# the GUI; cryptography is auto-installed at first login — see bol/deps.py).
+STAGE="$OUT/pyz-stage"
+rm -rf "$STAGE"; mkdir -p "$STAGE"
+cp -r "$SRC/bol" "$STAGE/bol"
+find "$STAGE/bol" -name __pycache__ -type d -exec rm -rf {} +
+cat > "$STAGE/__main__.py" <<'PYEOF'
+import sys
+from bol.cli import main
+try:
+    main()
+except KeyboardInterrupt:
+    print(); sys.exit(130)
+PYEOF
+python3 -m zipapp "$STAGE" -p "/usr/bin/env python3" \
+    -o "$OUT/bedrock-on-linux-${VER}.pyz"
+chmod +x "$OUT/bedrock-on-linux-${VER}.pyz"
+rm -rf "$STAGE"
+echo "  ✓ dist/bedrock-on-linux-${VER}.pyz"
 
 # 3) AppImage (best effort: needs network for appimagetool) ----------------
 # build-appimage.sh already produces the version-stamped artifact.
@@ -53,15 +62,16 @@ fi
 
 # keep only the release artifacts
 rm -rf "$OUT/appimagetool" "$OUT/BedrockOnLinux.AppDir" "$OUT/deb" \
-       "$OUT/portable" "$OUT/flatpak-build"
+       "$OUT/portable" "$OUT/pyz-stage" "$OUT/flatpak-build"
 ls "$OUT"/*.deb 2>/dev/null | grep -v "_${VER}_" | xargs -r rm -f
 ls "$OUT"/*.AppImage 2>/dev/null | grep -v "${VER}" | xargs -r rm -f
-ls "$OUT"/*portable.tar.gz 2>/dev/null | grep -v "${VER}" | xargs -r rm -f
+ls "$OUT"/*.pyz 2>/dev/null | grep -v "${VER}" | xargs -r rm -f
+ls "$OUT"/*portable.tar.gz 2>/dev/null | xargs -r rm -f
 ls "$OUT"/*.flatpak 2>/dev/null | grep -v "${VER}" | xargs -r rm -f
 
 echo
 echo "Release artifacts in $OUT :"
-ls -1sh "$OUT" 2>/dev/null | grep -E '\.(deb|AppImage|tar\.gz|flatpak)$' || true
+ls -1sh "$OUT" 2>/dev/null | grep -E '\.(deb|AppImage|pyz|flatpak)$' || true
 echo
 echo "Tag & publish (needs a GitHub remote + gh):"
 echo "  git tag -a v$VER -m 'BedrockOnLinux v$VER' && git push origin v$VER"
