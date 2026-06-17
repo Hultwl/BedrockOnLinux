@@ -153,4 +153,4 @@ modules:
       - type: git
         url: https://github.com/Wyze3306/BedrockOnLinux.git
         tag: v1.1.1
-        commit: 0000000000000000000000000000000000000000
+        commit: b3ac8b82c31e29de656761be8cff5283801cc7e8
