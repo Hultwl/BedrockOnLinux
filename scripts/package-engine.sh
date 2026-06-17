@@ -24,7 +24,7 @@ OUT="$SRC/dist"; mkdir -p "$OUT"
 
 # Pull the build rev straight from the launcher so the asset name always
 # matches what the launcher will look for.
-REV="$(grep -m1 '^WINEGDK_BUILD_REV = ' "$SRC/bedrock-on-linux" | cut -d'"' -f2)"
+REV="$(grep -m1 '^WINEGDK_BUILD_REV = ' "$SRC/bol/config.py" | cut -d'"' -f2)"
 [[ -n "$REV" ]] || { echo "!! could not read WINEGDK_BUILD_REV" >&2; exit 1; }
 
 BOL_HOME="${BOL_HOME:-$HOME/.local/share/bedrock-on-linux}"
