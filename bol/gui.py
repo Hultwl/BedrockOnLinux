@@ -9,7 +9,7 @@ from pathlib import Path
 
 from .auth import NativeAuth, msa_logout, msa_signed_in
 from .config import LOGS, PRETTY, VERSION
-from .content import import_content
+from .content import _mojang_dir, import_content
 from .games import list_mc_versions
 from .gamesetup import do_setup
 from .launch import launch
@@ -470,6 +470,9 @@ def gui():
 
         for label, fn in (
             ("Import content (.mcpack / .mcworld / .mcaddon)…", do_import),
+            ("Open Minecraft folder", lambda: subprocess.Popen(
+                ["xdg-open", str(_mojang_dir())], stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL)),
             ("Open logs folder", lambda: subprocess.Popen(
                 ["xdg-open", str(LOGS)], stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL)),
