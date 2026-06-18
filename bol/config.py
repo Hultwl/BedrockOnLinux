@@ -6,7 +6,7 @@ from pathlib import Path
 
 APP = "bedrock-on-linux"
 PRETTY = "BedrockOnLinux"
-VERSION = "1.1.4"
+VERSION = "1.1.5"
 
 HOME = Path.home()
 DATA = Path(os.environ.get("BOL_HOME", HOME / ".local/share" / APP))

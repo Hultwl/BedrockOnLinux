@@ -69,6 +69,17 @@
   </content_rating>
 
   <releases>
+    <release version="1.1.5" date="2026-06-18">
+      <description>
+        <p>The AppImage is now fully self-contained: it bundles its own Python
+           and the Tk GUI toolkit, so it runs on any Linux out of the box with
+           nothing to install first. This fixes the "tkinter is not installed"
+           error on systems that ship Python without the Tk module. The Flatpak
+           was already self-contained and the Debian package pulls those
+           pieces in automatically; the portable .pyz still uses the system
+           Python.</p>
+      </description>
+    </release>
     <release version="1.1.4" date="2026-06-18">
       <description>
         <p>Fixes the launch crash on recent Minecraft builds (1.26.30+) the
