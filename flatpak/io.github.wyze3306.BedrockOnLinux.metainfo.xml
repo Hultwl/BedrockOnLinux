@@ -69,6 +69,17 @@
   </content_rating>
 
   <releases>
+    <release version="1.1.3" date="2026-06-18">
+      <description>
+        <p>Fixes a crash a few seconds after launch on recent Minecraft builds
+           (1.26.30+): a binary patch was forcing an "is signed in with
+           Microsoft" flag that those builds trust to access an account object
+           that does not exist under Wine, causing a null dereference. The
+           patch is now only applied on builds where it is safe; newer builds
+           run normally (with a greyed Servers tab) instead of crashing. The
+           fixed engine is delivered by the engine auto-update.</p>
+      </description>
+    </release>
     <release version="1.1.2" date="2026-06-17">
       <description>
         <p>The bundled game engine now auto-updates: when a newer WineGDK
