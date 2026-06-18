@@ -69,6 +69,16 @@
   </content_rating>
 
   <releases>
+    <release version="1.1.6" date="2026-06-18">
+      <description>
+        <p>Fixes the AppImage hanging at "Preparing" with an empty version list
+           on some Linux distributions. It now bundles its own certificate
+           store, so it can always reach the download servers over HTTPS no
+           matter where the system keeps its certificates — the version list,
+           the game engine download and Microsoft sign-in all work out of the
+           box. Completes the self-contained AppImage from 1.1.5.</p>
+      </description>
+    </release>
     <release version="1.1.5" date="2026-06-18">
       <description>
         <p>The AppImage is now fully self-contained: it bundles its own Python

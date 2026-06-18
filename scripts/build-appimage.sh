@@ -34,9 +34,12 @@ PYHOME="$APPDIR/usr/python"
 PYBIN="$PYHOME/bin/python3.12"
 [[ -x "$PYBIN" ]] || { echo "!! bundled python missing at $PYBIN" >&2; exit 1; }
 
-# --- 2. bake in the login dependency (cryptography) so it works offline ------
-echo "== installing cryptography into the bundle"
-"$PYBIN" -m pip install --no-cache-dir --no-compile cryptography >/dev/null
+# --- 2. bake in the launcher's deps: cryptography (login) + certifi (a CA
+#       bundle, so HTTPS works on any distro regardless of where it keeps its
+#       certificates — without it the GitHub version list / downloads fail and
+#       the launcher hangs at "Preparing" on hosts whose CA layout differs). --
+echo "== installing cryptography + certifi into the bundle"
+"$PYBIN" -m pip install --no-cache-dir --no-compile cryptography certifi >/dev/null
 
 # --- 3. trim weight that a launcher never needs ------------------------------
 PYLIB="$PYHOME/lib/python3.12"
@@ -70,6 +73,14 @@ PY="$HERE/usr/python/bin/python3.12"
 # that has no Tcl/Tk at all.
 for d in "$HERE"/usr/python/lib/tcl8.*; do [[ -d "$d" ]] && export TCL_LIBRARY="$d"; done
 for d in "$HERE"/usr/python/lib/tk8.*;  do [[ -d "$d" ]] && export TK_LIBRARY="$d"; done
+# Bundled CA store: make HTTPS (version list, downloads, login) verify against
+# our own certificates so it works on every distro, not just hosts that keep
+# their CA bundle where this Python's OpenSSL was compiled to look.
+CERT="$HERE/usr/python/lib/python3.12/site-packages/certifi/cacert.pem"
+if [[ -f "$CERT" ]]; then
+  export SSL_CERT_FILE="$CERT"
+  export REQUESTS_CA_BUNDLE="$CERT"
+fi
 # self-contained: don't let a host PYTHON* env leak in
 unset PYTHONHOME PYTHONPATH
 exec "$PY" "$HERE/usr/bin/bedrock-on-linux" "$@"
@@ -77,11 +88,20 @@ EOF
 chmod +x "$APPDIR/AppRun"
 
 # --- 6. prove the bundle is self-sufficient before packaging -----------------
-echo "== verifying the bundle imports tkinter + cryptography (no host deps)"
-env -i "$PYBIN" - <<'PY'
-import tkinter, cryptography, ssl, ctypes
+# Run with an EMPTY env and the host cert dir hidden, so this only passes if
+# tkinter, cryptography and HTTPS all work from the bundle alone.
+echo "== verifying the bundle: tkinter + cryptography + HTTPS with NO host certs"
+CERT_FILE="$PYHOME/lib/python3.12/site-packages/certifi/cacert.pem"
+[[ -f "$CERT_FILE" ]] || { echo "!! certifi CA bundle missing at $CERT_FILE" >&2; exit 1; }
+env -i SSL_CERT_FILE="$CERT_FILE" SSL_CERT_DIR=/nonexistent "$PYBIN" - <<'PY'
+import tkinter, cryptography, ssl, ctypes, urllib.request
 from cryptography.hazmat.primitives.asymmetric import ec   # the login path
-print("  bundle OK: tkinter", tkinter.TkVersion, "| cryptography", cryptography.__version__)
+# host cert dir is hidden (SSL_CERT_DIR=/nonexistent); this verifies ONLY via
+# the bundled certifi store — exactly the field case that was failing.
+urllib.request.urlopen("https://api.github.com", timeout=20).read(16)
+print("  bundle OK: tkinter", tkinter.TkVersion,
+      "| cryptography", cryptography.__version__,
+      "| HTTPS verified via bundled CA store")
 PY
 
 # --- 7. package --------------------------------------------------------------
