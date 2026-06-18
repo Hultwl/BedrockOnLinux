@@ -69,6 +69,23 @@
   </content_rating>
 
   <releases>
+    <release version="1.2.0" date="2026-06-18">
+      <description>
+        <p>A refreshed, modern interface and a fix for launch crashes on some
+           systems:</p>
+        <ul>
+          <li>redesigned launcher with rounded, flat controls and crisp
+              antialiased text — and it is fully self-contained, so it looks
+              the same on every distribution with nothing to install;</li>
+          <li>a new setting to turn off the in-game Servers-tab unlock: on a
+              few systems forcing it makes the game freeze or crash a few
+              seconds after launch, and turning it off lets the game run
+              (Steam Deck, CachyOS and some others);</li>
+          <li>the version list and downloads are more reliable, and downloads
+              now resume instead of failing on a flaky connection.</li>
+        </ul>
+      </description>
+    </release>
     <release version="1.1.6" date="2026-06-18">
       <description>
         <p>Fixes the AppImage hanging at "Preparing" with an empty version list

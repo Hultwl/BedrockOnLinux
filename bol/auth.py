@@ -485,6 +485,15 @@ def wine_apply_winegdk_prereqs():
             warn(f"reg add {args[0]} failed: {e}")
     _regadd(r"HKLM\Software\Microsoft\Windows NT\CurrentVersion\OEM",
             "/v", "ConsoleMode", "/t", "REG_DWORD", "/d", "8")
+    # Force the in-game "signed in with Microsoft" facet (unlocks the Servers
+    # tab). The engine reads this and applies the patch only when 1 (default);
+    # users whose game crashes on launch (the XSAPI account object never
+    # populates under Wine — issue #17/#18) set it 0 to fall back to the
+    # pre-patch behaviour (Servers greyed, but the game runs).
+    from .util import load_settings
+    _regadd(r"HKLM\Software\Wine\WineGDK", "/v", "ForceMsaFacet",
+            "/t", "REG_DWORD", "/d",
+            "1" if load_settings().get("force_msa_facet", True) else "0")
     # Azure rejects Wine GnuTLS' TLS 1.3 handshake (7-byte fatal Alert →
     # 0x80090304); forcing TLS 1.2 via DefaultSecureProtocols lets the
     # SISU/XSTS and PlayFab POSTs through.

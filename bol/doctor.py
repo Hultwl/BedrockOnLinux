@@ -27,6 +27,11 @@ def doctor():
     print(f"  {'tkinter':12} : {'OK (GUI)' if tk_ok else 'MANQUANT (GUI)'}")
     if not tk_ok:
         miss.append("python3-tk")
+    # customtkinter (GUI toolkit) — bundled in the AppImage/Flatpak/.deb and
+    # auto-installed on first GUI launch elsewhere, so a miss here isn't fatal.
+    ctk_ok = deps.have("customtkinter")
+    print(f"  {'customtkinter':12} : "
+          f"{'OK (GUI)' if ctk_ok else 'auto-installed on launch'}")
     # cryptography (native Microsoft login) — see bol.deps
     cr_ok = deps.have("cryptography")
     print(f"  {'cryptography':12} : "

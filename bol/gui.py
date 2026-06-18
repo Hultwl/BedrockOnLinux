@@ -1,4 +1,4 @@
-"""bol.gui — the Tkinter desktop GUI."""
+"""bol.gui — the desktop GUI (customtkinter: modern, rounded, self-contained)."""
 # SPDX-License-Identifier: MIT
 
 import os
@@ -20,33 +20,40 @@ from .update import check_for_update, self_update
 from .util import load_settings, save_settings
 
 def gui():
+    from .deps import ensure_gui_deps
+    ensure_gui_deps()                            # .pyz / bare host: pip customtkinter
     try:
         import tkinter as tk
-        from tkinter import ttk
-    except Exception:
-        warn("Tkinter missing (install python3-tk).")
+        import customtkinter as ctk
+    except Exception as e:                       # missing Tk / customtkinter
+        warn(f"GUI toolkit unavailable ({e}). Install python3-tk + "
+             "customtkinter, or use the command line "
+             "('bedrock-on-linux play | setup | login | doctor').")
         return
 
-    # Minecraft-launcher inspired palette: dark slate + signature green.
-    BG, PANEL, PANEL2 = "#181a20", "#23262e", "#2c303a"
-    FG, SUB, GOLD = "#f2f3f5", "#969ca6", "#e0b341"
+    # Minecraft-launcher palette: deep slate + signature green.
+    BG, CARD, CARD2 = "#15171c", "#1e2129", "#272b35"
+    FG, SUB = "#f1f3f5", "#8b93a7"
     GREEN, GREEN_H = "#4c9f4f", "#58b85b"
-    FIELD = "#2c303a"
+    GOLD, RED, FIELD = "#e0b341", "#e06c5b", "#272b35"
 
+    ctk.set_appearance_mode("dark")
     try:
-        root = tk.Tk()
-    except tk.TclError as e:
-        # No usable X11 display — e.g. a pure Wayland session where the X11
-        # socket wasn't granted (Flatpak issue #7). Don't dump a traceback.
+        root = ctk.CTk()
+    except Exception as e:                       # no usable X11 / XWayland display
         warn(f"No graphical display available ({e}). The launcher GUI needs an "
              "X11 (or XWayland) display. Use the command line instead, e.g. "
              "'bedrock-on-linux play', '… setup', '… login' or '… doctor'.")
         return
     root.title(PRETTY)
-    root.geometry("880x560")
-    root.minsize(800, 520)
-    root.configure(bg=BG)
+    root.geometry("900x600")
+    root.minsize(820, 560)
+    root.configure(fg_color=BG)
 
+    def font(size=13, weight="normal"):
+        return ctk.CTkFont(size=size, weight=weight)
+
+    # app icon (tk.PhotoImage — no Pillow dependency)
     icon_img = None
     here = Path(__file__).resolve().parent
     for p in (here / "data/icon.png",
@@ -61,164 +68,204 @@ def gui():
             except Exception:
                 pass
 
-    stl = ttk.Style()
-    try:
-        stl.theme_use("clam")
-    except Exception:
-        pass
-    stl.configure(".", background=BG, foreground=FG, fieldbackground=FIELD,
-                  bordercolor=PANEL2, lightcolor=PANEL2, darkcolor=PANEL2)
-    stl.configure("Mc.TCombobox", fieldbackground=FIELD, background=FIELD,
-                  foreground=FG, arrowcolor=FG, borderwidth=0, padding=8)
-    stl.map("Mc.TCombobox", fieldbackground=[("readonly", FIELD)],
-            foreground=[("readonly", FG)])
-    stl.configure("Bar.Horizontal.TProgressbar", background=GREEN,
-                  troughcolor=PANEL2, borderwidth=0, thickness=6)
-    root.option_add("*TCombobox*Listbox.background", FIELD)
-    root.option_add("*TCombobox*Listbox.foreground", FG)
-    root.option_add("*TCombobox*Listbox.selectBackground", GREEN)
+    def logo_label(parent, px, bg):
+        """A scaled logo image in a tk.Label (its bg must match the parent)."""
+        if icon_img is None:
+            return None
+        try:
+            im = icon_img.subsample(max(1, icon_img.width() // px))
+            lab = tk.Label(parent, image=im, bg=bg, bd=0)
+            lab.image = im
+            return lab
+        except Exception:
+            return None
 
     na = NativeAuth()
-    ui = {"versions": [], "busy": False, "details": False}
+    ui = {"versions": [], "labels": [], "busy": False, "details": False}
 
-    def button(parent, text, cmd, bg, fg, hbg, font, padx, pady):
-        b = tk.Label(parent, text=text, bg=bg, fg=fg, font=font,
-                     padx=padx, pady=pady, cursor="hand2")
-        b._bg, b._fg, b._hbg, b._on = bg, fg, hbg, True
-        b.bind("<Enter>", lambda e: b._on and b.configure(bg=b._hbg))
-        b.bind("<Leave>", lambda e: b._on and b.configure(bg=b._bg))
-        b.bind("<Button-1>", lambda e: b._on and cmd())
+    def mkbtn(parent, text, cmd, kind="ghost", **kw):
+        base = {
+            "play":    dict(fg_color=GREEN, hover_color=GREEN_H, text_color="white"),
+            "primary": dict(fg_color=GREEN, hover_color=GREEN_H, text_color="white"),
+            "ghost":   dict(fg_color=CARD2, hover_color="#333a47", text_color=FG),
+            "flat":    dict(fg_color="transparent", hover_color=CARD2, text_color=SUB),
+        }[kind]
+        opts = dict(corner_radius=10, font=font(13), command=cmd)
+        opts.update(base)
+        opts.update(kw)
+        return ctk.CTkButton(parent, text=text, **opts)
 
-        def enable(v):
-            b._on = v
-            b.configure(bg=b._bg if v else PANEL2, fg=b._fg if v else SUB,
-                        cursor="hand2" if v else "arrow")
-        b.enable = enable
-        return b
+    # ---- top bar: logo + title (left), account chip (right) ----
+    top = ctk.CTkFrame(root, fg_color="transparent")
+    top.pack(fill="x", padx=22, pady=(16, 6))
+    ll = logo_label(top, 34, BG)
+    if ll:
+        ll.pack(side="left", padx=(2, 12))
+    ctk.CTkLabel(top, text="BedrockOnLinux", font=font(17, "bold"),
+                 text_color=FG).pack(side="left")
 
-    # ---- top bar: logo + title, account on the right ----
-    top = tk.Frame(root, bg=BG)
-    top.pack(fill="x", padx=24, pady=(16, 4))
-    if icon_img is not None:
-        try:
-            sm = icon_img.subsample(max(1, icon_img.width() // 38))
-            il = tk.Label(top, image=sm, bg=BG)
-            il.image = sm
-            il.pack(side="left", padx=(0, 12))
-        except Exception:
-            pass
-    tk.Label(top, text="BedrockOnLinux", bg=BG, fg=FG,
-             font=("", 16, "bold")).pack(side="left")
-
-    acct = tk.Frame(top, bg=PANEL)
+    acct = ctk.CTkFrame(top, fg_color=CARD, corner_radius=12)
     acct.pack(side="right")
-    acct_dot = tk.Label(acct, text="●", bg=PANEL, fg=SUB)
-    acct_dot.pack(side="left", padx=(12, 6), pady=9)
+    acct_dot = ctk.CTkLabel(acct, text="●", text_color=SUB, font=font(13), width=12)
+    acct_dot.pack(side="left", padx=(12, 2), pady=6)
     acct_txt = tk.StringVar(value="Not signed in")
-    tk.Label(acct, textvariable=acct_txt, bg=PANEL, fg=FG).pack(side="left",
-                                                                pady=9)
-    acct_btn = button(acct, "Sign in", lambda: acct_click(), PANEL2, FG,
-                      "#363b46", ("", 10, "bold"), 12, 6)
-    acct_btn.pack(side="left", padx=(10, 8), pady=6)
+    ctk.CTkLabel(acct, textvariable=acct_txt, text_color=FG,
+                 font=font(13)).pack(side="left", padx=(2, 8))
+    acct_btn = mkbtn(acct, "Sign in", lambda: acct_click(), kind="ghost",
+                     width=86, height=30, font=font(12, "bold"))
+    acct_btn.pack(side="left", padx=(0, 8), pady=8)
 
-    # ---- hero: centred logo + title ----
-    hero = tk.Frame(root, bg=BG)
-    hero.pack(fill="both", expand=True)
-    hw = tk.Frame(hero, bg=BG)
-    hw.place(relx=0.5, rely=0.42, anchor="center")
-    if icon_img is not None:
-        try:
-            f = max(1, icon_img.width() // 130)
-            hi = icon_img.subsample(f)
-            hl = tk.Label(hw, image=hi, bg=BG)
-            hl.image = hi
-            hl.pack()
-        except Exception:
-            pass
-    tk.Label(hw, text="Minecraft Bedrock", bg=BG, fg=FG,
-             font=("", 23, "bold")).pack(pady=(12, 2))
-    tk.Label(hw, text="Bedrock Edition for Linux",
-             bg=BG, fg=SUB, font=("", 11)).pack()
+    # ---- hero card: centred logo + title ----
+    hero = ctk.CTkFrame(root, fg_color=CARD, corner_radius=18)
+    hero.pack(fill="both", expand=True, padx=22, pady=6)
+    hw = ctk.CTkFrame(hero, fg_color="transparent")
+    hw.place(relx=0.5, rely=0.46, anchor="center")
+    hl = logo_label(hw, 120, CARD)
+    if hl:
+        hl.pack()
+    ctk.CTkLabel(hw, text="Minecraft Bedrock", font=font(27, "bold"),
+                 text_color=FG).pack(pady=(14, 2))
+    ctk.CTkLabel(hw, text="Bedrock Edition for Linux", font=font(13),
+                 text_color=SUB).pack()
 
-    # ---- bottom bar: version selector (left), gear/details/PLAY (right) ----
-    bar = tk.Frame(root, bg=PANEL)
-    bar.pack(fill="x", side="bottom")
-    barin = tk.Frame(bar, bg=PANEL)
-    barin.pack(fill="x", padx=24, pady=15)
-
-    vbox = tk.Frame(barin, bg=PANEL)
-    vbox.pack(side="left")
-    tk.Label(vbox, text="VERSION", bg=PANEL, fg=SUB,
-             font=("", 8, "bold")).pack(anchor="w")
-    mc_var = tk.StringVar()
-    mc_cb = ttk.Combobox(vbox, textvariable=mc_var, width=24, state="readonly",
-                         style="Mc.TCombobox", font=("", 11))
-    mc_cb.pack(anchor="w", pady=(3, 0))
-
-    play_btn = button(barin, "▶   PLAY", lambda: do_play(), GREEN, "white",
-                      GREEN_H, ("", 15, "bold"), 46, 14)
-    play_btn.pack(side="right")
-    button(barin, "⚙", lambda: open_settings(), PANEL, SUB, PANEL2,
-           ("", 15), 12, 10).pack(side="right", padx=(0, 12))
-    det_btn = button(barin, "Details", lambda: toggle_details(), PANEL, SUB,
-                     PANEL2, ("", 10), 12, 12)
-    det_btn.pack(side="right", padx=(0, 4))
-
-    # ---- status line + progress (above the bar) ----
-    status = tk.Frame(root, bg=BG)
-    status.pack(fill="x", side="bottom", padx=24, pady=(0, 8))
+    # ---- status line + progress (under the hero) ----
+    status = ctk.CTkFrame(root, fg_color="transparent")
+    status.pack(fill="x", padx=26, pady=(4, 0))
     status_txt = tk.StringVar(value="Ready to play.")
-    status_lbl = tk.Label(status, textvariable=status_txt, bg=BG, fg=SUB,
-                          anchor="w")
+    status_lbl = ctk.CTkLabel(status, textvariable=status_txt, text_color=SUB,
+                              font=font(12), anchor="w")
     status_lbl.pack(fill="x")
-    prog = ttk.Progressbar(status, style="Bar.Horizontal.TProgressbar",
-                           mode="determinate")
+    prog = ctk.CTkProgressBar(status, height=8, corner_radius=4,
+                              progress_color=GREEN, fg_color=CARD2)
+    prog.set(0)
+
+    # ---- bottom bar: version (left) · Details / gear / PLAY (right) ----
+    bar = ctk.CTkFrame(root, fg_color="transparent")
+    bar.pack(fill="x", padx=22, pady=(8, 16))
+
+    vbox = ctk.CTkFrame(bar, fg_color="transparent")
+    vbox.pack(side="left")
+    ctk.CTkLabel(vbox, text="VERSION", text_color=SUB, font=font(11, "bold"),
+                 anchor="w").pack(anchor="w", pady=(0, 3))
+    mc_var = tk.StringVar(value="")
+
+    # Custom scrollable version picker, themed to match the rounded widgets (a
+    # ttk Combobox looked out of place). A field shows the choice; clicking it
+    # opens a rounded, scrollable list of the ~60 versions.
+    _pick = {"win": None}
+
+    def close_picker():
+        w = _pick["win"]
+        _pick["win"] = None
+        if w is not None:
+            try:
+                w.destroy()
+            except Exception:
+                pass
+
+    def set_version(label):
+        mc_var.set(label or "")
+        close_picker()
+
+    def open_picker():
+        if _pick["win"] is not None:
+            close_picker()
+            return
+        labels = ui.get("labels") or []
+        if not labels:
+            return
+        win = ctk.CTkToplevel(root)
+        _pick["win"] = win
+        win.overrideredirect(True)
+        win.configure(fg_color=CARD2)
+        win.attributes("-topmost", True)
+        x, y = ver_field.winfo_rootx(), ver_field.winfo_rooty()
+        win.geometry(f"{ver_field.winfo_width()}x{min(340, 34 * len(labels) + 16)}"
+                     f"+{x}+{y + ver_field.winfo_height() + 4}")
+        sf = ctk.CTkScrollableFrame(win, fg_color=CARD2, corner_radius=8)
+        sf.pack(fill="both", expand=True, padx=2, pady=2)
+        cur = mc_var.get()
+        for lab in labels:
+            ctk.CTkButton(sf, text=lab, anchor="w", height=30, corner_radius=6,
+                          fg_color=GREEN if lab == cur else "transparent",
+                          hover_color="#333a47",
+                          text_color="white" if lab == cur else FG, font=font(12),
+                          command=lambda l=lab: set_version(l)).pack(fill="x", pady=1)
+        win.after(10, win.focus_force)
+        win.bind("<FocusOut>", lambda e: close_picker())
+        win.bind("<Escape>", lambda e: close_picker())
+
+    ver_field = ctk.CTkFrame(vbox, fg_color=FIELD, corner_radius=10,
+                             width=210, height=36)
+    ver_field.pack(anchor="w")
+    ver_field.pack_propagate(False)
+    ver_lbl = ctk.CTkLabel(ver_field, textvariable=mc_var, text_color=FG,
+                           font=font(13), anchor="w")
+    ver_lbl.pack(side="left", fill="x", expand=True, padx=(12, 0))
+    ver_arrow = ctk.CTkLabel(ver_field, text="▾", text_color=SUB, font=font(14))
+    ver_arrow.pack(side="right", padx=(0, 12))
+
+    def _ver_hover(on):
+        ver_field.configure(fg_color="#30353f" if on else FIELD)
+    for _w in (ver_field, ver_lbl, ver_arrow):
+        _w.bind("<Enter>", lambda e: _ver_hover(True))
+        _w.bind("<Leave>", lambda e: _ver_hover(False))
+        _w.bind("<Button-1>", lambda e: open_picker())
+
+    play_btn = mkbtn(bar, "▶   PLAY", lambda: do_play(), kind="play",
+                     width=158, height=48, corner_radius=12, font=font(15, "bold"))
+    play_btn.pack(side="right")
+    mkbtn(bar, "⚙", lambda: open_settings(), kind="ghost", width=48, height=48,
+          corner_radius=12, font=font(18)).pack(side="right", padx=(0, 10))
+    det_btn = mkbtn(bar, "Details", lambda: toggle_details(), kind="flat",
+                    width=82, height=48)
+    det_btn.pack(side="right", padx=(0, 6))
 
     # ---- collapsible details log ----
-    detwrap = tk.Frame(root, bg=BG)
-    logbox = tk.Text(detwrap, height=8, bg="#0d0f13", fg="#7fd97f", bd=0,
-                     font=("monospace", 9), highlightthickness=0,
-                     padx=10, pady=8)
-    logbox.pack(fill="both", expand=True, padx=24, pady=(0, 4))
+    detwrap = ctk.CTkFrame(root, fg_color=CARD, corner_radius=12)
+    logbox = tk.Text(detwrap, height=9, bg="#0d0f13", fg="#7fd97f", bd=0,
+                     font=("monospace", 10), highlightthickness=0,
+                     padx=12, pady=10, insertbackground=FG)
+    logbox.pack(fill="both", expand=True, padx=5, pady=5)
     for _tg, (_lbl, _a1, _a2, _lc, _mc) in _LEVELS.items():
         _nm = _lbl.strip()
         logbox.tag_configure("L_" + _nm, foreground=_lc,
-                             font=("monospace", 9, "bold"))
+                             font=("monospace", 10, "bold"))
         logbox.tag_configure("M_" + _nm, foreground=_mc)
 
     def toggle_details():
         ui["details"] = not ui["details"]
         if ui["details"]:
-            detwrap.pack(fill="both", side="bottom")
-            det_btn.configure(fg=FG)
+            detwrap.pack(fill="both", padx=22, pady=(0, 16))
+            det_btn.configure(text_color=FG)
         else:
             detwrap.pack_forget()
-            det_btn.configure(fg=SUB)
+            det_btn.configure(text_color=SUB)
 
     # ---- friendly status line + progress bar ----
     def set_status(t, color=SUB):
         root.after(0, lambda: (status_txt.set(t),
-                               status_lbl.configure(fg=color)))
+                               status_lbl.configure(text_color=color)))
 
     def _show_bar():
         if not prog.winfo_ismapped():
-            prog.pack(fill="x", pady=(6, 0))
+            prog.pack(fill="x", pady=(8, 2))
 
     def bar_busy():           # animated bar for steps with no measurable %
         def ap():
             _show_bar()
             prog.configure(mode="indeterminate")
-            prog.start(14)
+            prog.start()
         root.after(0, ap)
 
     def set_progress(g, t):   # measurable download progress
         def ap():
             _show_bar()
             prog.stop()
-            prog.configure(mode="determinate", maximum=max(1, t), value=g)
-            status_txt.set(f"Downloading Minecraft…  "
-                           f"{int(100 * g / max(1, t))}%")
-            status_lbl.configure(fg=FG)
+            prog.configure(mode="determinate")
+            prog.set(g / max(1, t))
+            status_txt.set(f"Downloading Minecraft…  {int(100 * g / max(1, t))}%")
+            status_lbl.configure(text_color=FG)
         root.after(0, ap)
 
     def end_progress():
@@ -247,7 +294,6 @@ def gui():
         if "pre-auth" in low or "signing in" in low:
             return "Signing in to Xbox Live…"
         if "minecraft is running" in low:
-            # the launcher's work is done — steady state, stop the spinner
             return ("Minecraft is running — close the game to come back here.",
                     True)
         if "starting minecraft" in low or "launching minecraft" in low:
@@ -259,9 +305,8 @@ def gui():
     def glog(line):
         lvl = _LEVELS.get(line[:2])
         if lvl:
-            label = lvl[0]
-            nm = label.strip()
-            logbox.insert("end", label + "  ", "L_" + nm)
+            nm = lvl[0].strip()
+            logbox.insert("end", lvl[0] + "  ", "L_" + nm)
             logbox.insert("end", line[2:].strip() + "\n", "M_" + nm)
         else:
             logbox.insert("end", line + "\n")
@@ -269,7 +314,7 @@ def gui():
         if not ui["busy"]:
             return
         if line.startswith("xx"):
-            set_status(line[2:].strip(), "#e06c5b")
+            set_status(line[2:].strip(), RED)
             return
         txt = _friendly(line)
         if txt:
@@ -277,27 +322,26 @@ def gui():
             if isinstance(txt, tuple):
                 txt, steady = txt
             if steady:
-                # nothing measurable is running — stop the spinner, calm colour
                 set_status(txt, GREEN if "running" in txt.lower() else SUB)
                 end_progress()
             else:
                 set_status(txt, FG)
-                bar_busy()         # animate while a real step runs
+                bar_busy()
     log._LOG_SINK = lambda m: root.after(0, glog, m)
 
     # ---- account (device-code Microsoft sign-in) ----
     def acct_state(ph):
         if ph == "in":
-            acct_dot.configure(fg=GREEN)
+            acct_dot.configure(text_color=GREEN)
             acct_txt.set("Signed in")
             acct_btn.configure(text="Sign out")
             acct_btn._mode = "out"
         elif ph == "auth":
-            acct_dot.configure(fg=GOLD)
+            acct_dot.configure(text_color=GOLD)
             acct_txt.set("Sign-in pending…")
             acct_btn._mode = "out"
         else:
-            acct_dot.configure(fg=SUB)
+            acct_dot.configure(text_color=SUB)
             acct_txt.set("Not signed in")
             acct_btn.configure(text="Sign in")
             acct_btn._mode = "in"
@@ -318,28 +362,31 @@ def gui():
         root.after(0, lambda: acct_state("in"))
 
     def code_dialog(url, code):
-        d = tk.Toplevel(root, bg=PANEL)
+        d = ctk.CTkToplevel(root)
         d.title("Sign in to Microsoft")
-        d.configure(padx=26, pady=22)
+        d.configure(fg_color=CARD)
         d.transient(root)
         d.resizable(False, False)
-        tk.Label(d, text="Sign in to your Microsoft account", bg=PANEL, fg=FG,
-                 font=("", 13, "bold")).pack(anchor="w")
-        tk.Label(d, text="Open the link and enter this code:", bg=PANEL,
-                 fg=SUB).pack(anchor="w", pady=(8, 12))
-        cf = tk.Frame(d, bg=FIELD)
-        cf.pack(fill="x")
-        tk.Label(cf, text=code, bg=FIELD, fg=GOLD,
-                 font=("monospace", 20, "bold")).pack(padx=18, pady=10)
-        row = tk.Frame(d, bg=PANEL)
-        row.pack(fill="x", pady=(14, 0))
-        button(row, "Open link", lambda: subprocess.Popen(
+        d.after(120, d.lift)
+        ctk.CTkLabel(d, text="Sign in to your Microsoft account",
+                     font=font(15, "bold"), text_color=FG).pack(
+                         anchor="w", padx=26, pady=(24, 0))
+        ctk.CTkLabel(d, text="Open the link and enter this code:",
+                     text_color=SUB).pack(anchor="w", padx=26, pady=(6, 12))
+        cf = ctk.CTkFrame(d, fg_color=FIELD, corner_radius=10)
+        cf.pack(fill="x", padx=26)
+        ctk.CTkLabel(cf, text=code, text_color=GOLD,
+                     font=ctk.CTkFont(family="monospace", size=22,
+                                      weight="bold")).pack(padx=18, pady=12)
+        row = ctk.CTkFrame(d, fg_color="transparent")
+        row.pack(fill="x", padx=26, pady=(14, 24))
+        mkbtn(row, "Open link", lambda: subprocess.Popen(
             ["xdg-open", url], stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL), GREEN, "white", GREEN_H,
-            ("", 11, "bold"), 16, 9).pack(side="left")
-        button(row, "Copy code", lambda: (root.clipboard_clear(),
-               root.clipboard_append(code)), PANEL2, FG, "#363b46",
-               ("", 11), 16, 9).pack(side="left", padx=10)
+            stderr=subprocess.DEVNULL), kind="primary", width=120,
+            height=38).pack(side="left")
+        mkbtn(row, "Copy code", lambda: (root.clipboard_clear(),
+              root.clipboard_append(code)), kind="ghost", width=120,
+              height=38).pack(side="left", padx=10)
 
     # ---- versions ----
     def refresh_versions():
@@ -353,7 +400,7 @@ def gui():
                   for v in ui["versions"]]
 
         def ap():
-            mc_cb.configure(values=labels)
+            ui["labels"] = labels
             cur = (load_settings().get("mc_version") or "")
             pick = next((x for x in labels
                          if x.split("  ")[0] == cur
@@ -376,7 +423,7 @@ def gui():
     # ---- PLAY: auto-install (version + engine) then launch ----
     def busy(on):
         ui["busy"] = on
-        play_btn.enable(not on)
+        play_btn.configure(state="disabled" if on else "normal")
 
     def do_play():
         if ui["busy"]:
@@ -388,8 +435,6 @@ def gui():
         def work():
             try:
                 ver = selected_version()
-                # do_setup logs each step; glog() turns them into a friendly
-                # status line + animated/measured progress bar.
                 do_setup(mc_ver=ver, progress=set_progress)
                 set_status("Starting Minecraft…", FG)
                 launch()
@@ -401,15 +446,19 @@ def gui():
                 root.after(0, lambda: busy(False))
         threading.Thread(target=work, daemon=True).start()
 
-    # ---- settings popup (the few advanced bits, out of the way) ----
+    # ---- settings popup ----
     def open_settings():
-        d = tk.Toplevel(root, bg=PANEL)
+        d = ctk.CTkToplevel(root)
         d.title("Settings")
-        d.configure(padx=26, pady=22)
+        d.configure(fg_color=CARD)
         d.transient(root)
         d.resizable(False, False)
-        tk.Label(d, text="Settings", bg=PANEL, fg=FG,
-                 font=("", 14, "bold")).pack(anchor="w", pady=(0, 12))
+        d.after(120, d.lift)
+        wrap = ctk.CTkFrame(d, fg_color="transparent")
+        wrap.pack(fill="both", expand=True, padx=24, pady=22)
+        ctk.CTkLabel(wrap, text="Settings", font=font(16, "bold"),
+                     text_color=FG).pack(anchor="w", pady=(0, 14))
+
         beta_v = tk.BooleanVar(value=load_settings().get("show_betas", False))
 
         def save_beta():
@@ -417,10 +466,9 @@ def gui():
             s2["show_betas"] = beta_v.get()
             save_settings(s2)
             threading.Thread(target=refresh_versions, daemon=True).start()
-        tk.Checkbutton(d, text="Show beta / preview versions", variable=beta_v,
-                       command=save_beta, bg=PANEL, fg=FG, selectcolor=FIELD,
-                       activebackground=PANEL, activeforeground=FG, bd=0,
-                       highlightthickness=0, anchor="w").pack(fill="x", pady=2)
+        ctk.CTkSwitch(wrap, text="Show beta / preview versions", variable=beta_v,
+                      command=save_beta, progress_color=GREEN,
+                      font=font(13)).pack(anchor="w", pady=7)
 
         diag_v = tk.BooleanVar(value=load_settings().get("diagnostics", False))
 
@@ -428,12 +476,21 @@ def gui():
             s2 = load_settings()
             s2["diagnostics"] = diag_v.get()
             save_settings(s2)
-        tk.Checkbutton(d, text="Advanced diagnostics (verbose logs — for bug "
-                       "reports)", variable=diag_v, command=save_diag, bg=PANEL,
-                       fg=FG, selectcolor=FIELD, activebackground=PANEL,
-                       activeforeground=FG, bd=0, highlightthickness=0,
-                       anchor="w").pack(fill="x", pady=2)
-        tk.Frame(d, bg=PANEL2, height=1).pack(fill="x", pady=12)
+        ctk.CTkSwitch(wrap, text="Advanced diagnostics (verbose logs — for bug "
+                      "reports)", variable=diag_v, command=save_diag,
+                      progress_color=GREEN, font=font(13)).pack(anchor="w", pady=7)
+
+        msa_v = tk.BooleanVar(value=load_settings().get("force_msa_facet", True))
+
+        def save_msa():
+            s2 = load_settings()
+            s2["force_msa_facet"] = msa_v.get()
+            save_settings(s2)
+        ctk.CTkSwitch(wrap, text="Unlock the in-game Servers tab (turn OFF if the "
+                      "game freezes / crashes on launch)", variable=msa_v,
+                      command=save_msa, progress_color=GREEN,
+                      font=font(13)).pack(anchor="w", pady=7)
+        ctk.CTkFrame(wrap, fg_color=CARD2, height=1).pack(fill="x", pady=14)
 
         imp_status = tk.StringVar(value="")
 
@@ -480,12 +537,12 @@ def gui():
                 target=reset_prefix, daemon=True).start()),
             ("Force stop Minecraft", kill_wine),
         ):
-            button(d, label, fn, PANEL2, FG, "#363b46", ("", 11), 14, 9
-                   ).pack(fill="x", pady=3)
-        tk.Label(d, textvariable=imp_status, bg=PANEL, fg=GOLD,
-                 font=("", 9)).pack(anchor="w")
-        tk.Label(d, text=f"{PRETTY} {VERSION}", bg=PANEL, fg=SUB,
-                 font=("", 9)).pack(anchor="w", pady=(14, 0))
+            mkbtn(wrap, label, fn, kind="ghost", anchor="w",
+                  height=38).pack(fill="x", pady=3)
+        ctk.CTkLabel(wrap, textvariable=imp_status, text_color=GOLD,
+                     font=font(11)).pack(anchor="w", pady=(2, 0))
+        ctk.CTkLabel(wrap, text=f"{PRETTY} {VERSION}", text_color=SUB,
+                     font=font(11)).pack(anchor="w", pady=(12, 0))
 
     # ---- self-update notification (background check → banner) ----
     def relaunch_app():
@@ -502,27 +559,29 @@ def gui():
         def ap():
             _show_bar()
             prog.stop()
-            prog.configure(mode="determinate", maximum=max(1, total), value=got)
+            prog.configure(mode="determinate")
+            prog.set(got / max(1, total))
             status_txt.set(f"Downloading update…  {int(100 * got / max(1, total))}%")
-            status_lbl.configure(fg=FG)
+            status_lbl.configure(text_color=FG)
         root.after(0, ap)
 
     def restart_prompt():
-        d = tk.Toplevel(root, bg=PANEL)
+        d = ctk.CTkToplevel(root)
         d.title("Update installed")
-        d.configure(padx=24, pady=20)
+        d.configure(fg_color=CARD)
         d.transient(root)
         d.resizable(False, False)
-        tk.Label(d, text="Update installed", bg=PANEL, fg=FG,
-                 font=("", 13, "bold")).pack(anchor="w")
-        tk.Label(d, text="Restart now to run the new version?", bg=PANEL,
-                 fg=SUB).pack(anchor="w", pady=(4, 14))
-        row = tk.Frame(d, bg=PANEL)
-        row.pack(fill="x")
-        button(row, "Restart now", relaunch_app, GREEN, "white", GREEN_H,
-               ("", 11, "bold"), 16, 7).pack(side="right")
-        button(row, "Later", d.destroy, PANEL2, FG, "#363b46",
-               ("", 11), 14, 7).pack(side="right", padx=(0, 8))
+        d.after(120, d.lift)
+        ctk.CTkLabel(d, text="Update installed", font=font(14, "bold"),
+                     text_color=FG).pack(anchor="w", padx=24, pady=(22, 0))
+        ctk.CTkLabel(d, text="Restart now to run the new version?",
+                     text_color=SUB).pack(anchor="w", padx=24, pady=(4, 16))
+        row = ctk.CTkFrame(d, fg_color="transparent")
+        row.pack(fill="x", padx=24, pady=(0, 22))
+        mkbtn(row, "Restart now", relaunch_app, kind="primary", width=130,
+              height=38, font=font(13, "bold")).pack(side="right")
+        mkbtn(row, "Later", d.destroy, kind="ghost", width=90,
+              height=38).pack(side="right", padx=(0, 8))
 
     def run_update(rel, banner):
         banner.destroy()
@@ -532,7 +591,7 @@ def gui():
         def done(state, msg):
             end_progress()
             set_status(msg, GREEN if state == "ok"
-                       else ("#e06c5b" if state == "error" else SUB))
+                       else (RED if state == "error" else SUB))
             if state == "ok":
                 restart_prompt()
 
@@ -542,16 +601,17 @@ def gui():
         threading.Thread(target=work, daemon=True).start()
 
     def show_update_banner(rel):
-        bn = tk.Frame(root, bg="#26331f")
-        tk.Label(bn, text=f"  ⟳  Update available — v{rel['version']}   "
-                          f"(you have {VERSION})", bg="#26331f", fg="#cfe8c2",
-                 font=("", 10, "bold")).pack(side="left", padx=(20, 0), pady=8)
-        button(bn, "Later", bn.destroy, "#26331f", "#9fb89a", "#33421f",
-               ("", 10), 12, 5).pack(side="right", padx=(0, 16), pady=6)
-        button(bn, "Update now", lambda: run_update(rel, bn), GREEN, "white",
-               GREEN_H, ("", 10, "bold"), 14, 5).pack(side="right",
-                                                      padx=(0, 8), pady=6)
-        bn.pack(fill="x", after=top)
+        bn = ctk.CTkFrame(root, fg_color="#26331f", corner_radius=10)
+        ctk.CTkLabel(bn, text=f"⟳   Update available — v{rel['version']}   "
+                     f"(you have {VERSION})", text_color="#cfe8c2",
+                     font=font(12, "bold")).pack(side="left", padx=18, pady=8)
+        mkbtn(bn, "Later", bn.destroy, kind="flat", width=64, height=30,
+              text_color="#9fb89a", hover_color="#33421f").pack(
+                  side="right", padx=(0, 14), pady=7)
+        mkbtn(bn, "Update now", lambda: run_update(rel, bn), kind="primary",
+              width=112, height=30, font=font(12, "bold")).pack(
+                  side="right", padx=(0, 6), pady=7)
+        bn.pack(fill="x", padx=22, pady=(0, 4), after=top)
 
     def update_check():
         rel = check_for_update()

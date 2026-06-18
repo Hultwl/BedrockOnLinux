@@ -20,7 +20,14 @@ mkdir -p "$OUT" \
 
 install -m755 "$SRC/bedrock-on-linux" "$PKG/usr/lib/bedrock-on-linux/bedrock-on-linux"
 cp -r "$SRC/bol"                       "$PKG/usr/lib/bedrock-on-linux/bol"
-find "$PKG/usr/lib/bedrock-on-linux/bol" -name __pycache__ -type d -exec rm -rf {} +
+# Bundle the GUI toolkit (customtkinter + darkdetect + packaging — pure Python,
+# not packaged by Debian) next to bol/ so it's on sys.path; a real dir means
+# customtkinter's theme/font assets load fine. cryptography/tk stay apt deps.
+python3 -m pip install --quiet --no-compile --target \
+  "$PKG/usr/lib/bedrock-on-linux" customtkinter
+rm -rf "$PKG/usr/lib/bedrock-on-linux"/bin \
+       "$PKG/usr/lib/bedrock-on-linux"/*.dist-info 2>/dev/null || true
+find "$PKG/usr/lib/bedrock-on-linux" -name __pycache__ -type d -exec rm -rf {} +
 install -m644 "$SRC/data/icon.png"    "$PKG/usr/lib/bedrock-on-linux/data/icon.png"
 ln -s /usr/lib/bedrock-on-linux/bedrock-on-linux "$PKG/usr/bin/bedrock-on-linux"
 install -m644 "$SRC/data/icon.png" \

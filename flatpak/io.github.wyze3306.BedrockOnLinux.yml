@@ -124,6 +124,25 @@ modules:
         url: https://files.pythonhosted.org/packages/0c/c3/44f3fbbfa403ea2a7c779186dc20772604442dde72947e7d01069cbe98e3/pycparser-3.0-py3-none-any.whl
         sha256: b727414169a36b7d524c1c3e31839a521725078d7b2ff038656844266160a992
 
+  # customtkinter (the modern GUI toolkit, on top of Tk) + its pure-Python deps
+  # darkdetect & packaging. Vendored like cryptography (the runtime has no pip);
+  # the wheels are py3-none-any, so they drop straight into site-packages.
+  - name: python3-customtkinter
+    buildsystem: simple
+    build-commands:
+      - for w in *.whl; do python3 -m zipfile -e "$w" /app/lib/python3.12/site-packages/; done
+      - /app/bin/python3 -c "import customtkinter; print('customtkinter', customtkinter.__version__)"
+    sources:
+      - type: file
+        url: https://files.pythonhosted.org/packages/3b/b1/b43b33001a77256b335511e75f257d001082350b8506c8807f30c98db052/customtkinter-5.2.2-py3-none-any.whl
+        sha256: 14ad3e7cd3cb3b9eb642b9d4e8711ae80d3f79fb82545ad11258eeffb2e6b37c
+      - type: file
+        url: https://files.pythonhosted.org/packages/f2/f2/728f041460f1b9739b85ee23b45fa5a505962ea11fd85bdbe2a02b021373/darkdetect-0.8.0-py3-none-any.whl
+        sha256: a7509ccf517eaad92b31c214f593dbcf138ea8a43b2935406bbd565e15527a85
+      - type: file
+        url: https://files.pythonhosted.org/packages/df/b2/87e62e8c3e2f4b32e5fe99e0b86d576da1312593b39f47d8ceef365e95ed/packaging-26.2-py3-none-any.whl
+        sha256: 5fc45236b9446107ff2415ce77c807cee2862cb6fac22b8a73826d0693b0980e
+
   # zstd CLI for the one .pkg.tar.zst (libcurl) the launcher extracts;
   # Python's tarfile can't read zstd and the runtime ships no unzstd.
   - name: zstd
@@ -152,5 +171,5 @@ modules:
       #   git rev-parse vX.Y.Z^{commit}
       - type: git
         url: https://github.com/Wyze3306/BedrockOnLinux.git
-        tag: v1.1.6
-        commit: 36ddbf3e348e63310a8a9dc921fcbeb7f721d535
+        tag: v1.2.0
+        commit: PLACEHOLDER_SET_AFTER_TAG

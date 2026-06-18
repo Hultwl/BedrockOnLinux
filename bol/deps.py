@@ -82,3 +82,31 @@ def ensure_login_deps(install=True):
     else:
         ok("Python login dependencies ready.")
     return missing
+
+
+# The GUI toolkit: customtkinter (modern rounded widgets on top of Tk; pulls
+# darkdetect + packaging). It is BUNDLED in the AppImage / Flatpak / .deb, so
+# this is a no-op there; only the portable .pyz (or a bare host) pip-installs it
+# on first GUI launch.
+GUI_DEPS = {"customtkinter": "customtkinter"}
+
+
+def missing_gui_deps():
+    return [m for m in GUI_DEPS if not have(m)]
+
+
+def ensure_gui_deps(install=True):
+    """Ensure the GUI toolkit is importable; pip-install it when missing and
+    allowed. Returns import-names still missing (empty == ready). Never raises."""
+    missing = missing_gui_deps()
+    if not missing or not install or os.environ.get("BOL_NO_PIP") == "1":
+        return missing
+    info(f"Installing the GUI toolkit: {', '.join(missing)} …")
+    if _pip_install(GUI_DEPS[m] for m in missing):
+        _refresh_path()
+        missing = missing_gui_deps()
+    if missing:
+        warn("Could not install the GUI toolkit "
+             f"('pip install --user {' '.join(GUI_DEPS[m] for m in missing)}'). "
+             "The self-contained AppImage or Flatpak needs nothing installed.")
+    return missing
