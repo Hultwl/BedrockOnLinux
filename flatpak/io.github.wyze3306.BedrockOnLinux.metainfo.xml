@@ -69,6 +69,18 @@
   </content_rating>
 
   <releases>
+    <release version="1.1.4" date="2026-06-18">
+      <description>
+        <p>Fixes the launch crash on recent Minecraft builds (1.26.30+) the
+           proper way, so the in-game Servers tab is unlocked everywhere
+           instead of being greyed out on those builds. The "is signed in with
+           Microsoft" patch now guards against the account object the game has
+           not finished setting up yet: it keeps the flag where the object
+           exists and safely does nothing where it is missing, so the game
+           starts on every system (Steam Deck, CachyOS and others) and still
+           shows the server list. Delivered by the engine auto-update.</p>
+      </description>
+    </release>
     <release version="1.1.3" date="2026-06-18">
       <description>
         <p>Fixes a crash a few seconds after launch on recent Minecraft builds
