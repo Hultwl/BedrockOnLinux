@@ -238,7 +238,21 @@ def _install_cryptbase_in_prefix(pfx=None):
     without it. Backs up any existing cryptbase once; idempotent."""
     src = OPENSSL_XCURL_SET / "cryptbase.dll"
     if not src.exists():
-        return
+        # OpenSSL XCurl set unavailable (download failed, or the rev's asset
+        # isn't published yet). Without ANY cryptbase, GDK-Proton's advapi32
+        # forward of SystemFunction036 (RtlGenRandom) stays unresolved and the
+        # game aborts on its first RNG call before opening a window — a dead
+        # prefix / ghost window that masquerades as a GPU/display fault. The
+        # cryptbase=n,b override only falls back to a real cryptbase.dll FILE in
+        # the prefix, so seed one from GDK-Proton's own builtin (it exports
+        # SystemFunction036 — verified). Enough to boot a window; the OpenSSL TLS
+        # shim lives in a separate XCurl.dll and is unaffected.
+        from .proton import proton_path
+        pp = proton_path()
+        builtin = (pp / "files/lib/wine/x86_64-windows/cryptbase.dll") if pp else None
+        if not (builtin and builtin.exists()):
+            return
+        src = builtin
     pfx = pfx or active_prefix()
     sys32 = pfx / "drive_c/windows/system32"
     if not sys32.is_dir():

@@ -9,7 +9,7 @@ import tarfile
 import time
 from pathlib import Path
 
-from .config import CACHE, COMPAT, HOME, LOGS, PFX, UMU_DIR, UMU_REPO
+from .config import CACHE, COMPAT, DATA, HOME, LOGS, PFX, UMU_DIR, UMU_REPO
 from .log import die, info, ok, warn
 from .proton import proton_path
 from .util import _pkill, asset_url, download, gh_latest
@@ -65,6 +65,31 @@ def active_prefix():
     return _existing_gdk_pfx() or PFX
 
 
+def steam_compat_dir():
+    """A directory for STEAM_COMPAT_CLIENT_INSTALL_PATH — umu/Proton require one.
+
+    We prefer the host's ~/.steam/steam: on a machine with Steam it's a symlink
+    to the real client install, which umu happily reuses. That preference is
+    also the trap — on a Steam Deck ~/.steam/steam points at ~/.local/share/Steam,
+    which our Flatpak sandbox can't see (we only grant ~/.steam, not the target),
+    leaving a *dangling* symlink: the name exists yet isn't a directory, so even
+    mkdir(exist_ok=True) raises FileExistsError on it and the launch aborts
+    (issue #19). So only create it when nothing is in the way; if anything is
+    (a dangling/foreign symlink, an unwritable ~/.steam), fall back to a dir we
+    own. Proton needs no real Steam files here — a writable empty dir is enough,
+    which is exactly what a fresh, Steam-less machine already runs with."""
+    steam = HOME / ".steam/steam"
+    if steam.is_dir():                     # real Steam, or one we made earlier
+        return steam
+    try:
+        steam.mkdir(parents=True, exist_ok=True)
+        return steam
+    except OSError:
+        fallback = DATA / "steamcompat"
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback
+
+
 def proton_umu_cmd(exe, prefix=None):
     """Launch GDK-Proton through umu-launcher (Steam Linux Runtime). The GDK
     networking the LAN/server join needs only works inside that runtime, not
@@ -80,11 +105,11 @@ def proton_umu_cmd(exe, prefix=None):
                 (COMPAT / junk).unlink(missing_ok=True)
     else:
         info(f"Using existing GDK prefix: {prefix}")
-    (HOME / ".steam/steam").mkdir(parents=True, exist_ok=True)
+    steam_compat = steam_compat_dir()
     env = dict(os.environ)
     env.update({"GAMEID": "0", "PROTONPATH": str(proton_path()),
                 "PROTON_VERB": "run", "WINEPREFIX": str(prefix),
-                "STEAM_COMPAT_CLIENT_INSTALL_PATH": str(HOME / ".steam/steam"),
+                "STEAM_COMPAT_CLIENT_INSTALL_PATH": str(steam_compat),
                 "UMU_RUNTIME_UPDATE": "0"})
     return [sys.executable, str(ensure_umu()), exe], env
 
