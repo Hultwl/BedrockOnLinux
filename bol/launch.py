@@ -31,7 +31,9 @@ from .prefix import (
     reset_prefix,
 )
 from .proton import custom_proton, patch_proton, proton_path
+from .config import WINEGDK_BUILD_REV
 from .util import _screen_wh, load_settings
+from .winegdk import ensure_winegdk
 
 def launch(_pp=None, _repaired=False, _force_x11=False, _no_gamescope=False):
     s = load_settings()
@@ -40,6 +42,25 @@ def launch(_pp=None, _repaired=False, _force_x11=False, _no_gamescope=False):
         die("No game — choose a Minecraft version first.")
     if not proton_path():
         die("GDK-Proton missing — run Install / Update.")
+    # Auto-update the engine when a newer rev shipped (e.g. a graphics/vkd3d
+    # fix). Without this, updating the launcher and clicking PLAY keeps the OLD
+    # engine — engine-side fixes only reached people who happened to re-run
+    # Install/Update, so bug fixes silently missed most users. No-op (no
+    # network) when the engine already matches WINEGDK_BUILD_REV; best-effort
+    # otherwise — a failed download keeps the installed engine instead of
+    # blocking the launch.
+    if not custom_proton() and not load_settings().get(
+            "winegdk_built", "").endswith(":" + WINEGDK_BUILD_REV):
+        info(f"A newer game engine ({WINEGDK_BUILD_REV}) is available — "
+             "updating (one-time) …")
+        try:
+            ensure_winegdk()
+        except SystemExit:
+            warn("Engine auto-update couldn't finish — using the installed "
+                 "engine. Run Install / Update to get the latest graphics fix.")
+        except Exception as e:                       # noqa: BLE001
+            warn(f"Engine auto-update skipped ({e}) — using the installed "
+                 "engine.")
     patch_proton(proton_path(), strict=not custom_proton())
 
     tok = msa_load().get("refresh_token")
