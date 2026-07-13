@@ -24,9 +24,8 @@ pressure-vessel-inside-Flatpak step is the one most likely to need iteration.
 To debug: `flatpak run --devel --command=sh io.github.wyze3306.BedrockOnLinux`
 then `bedrock-on-linux play`.
 
-Not supported inside the Flatpak: the from-source engine build (no
-git/gcc/mingw in the runtime). The prebuilt engine download is the only path —
-fine for users, but keep the release asset published.
+The application only installs the reviewed prebuilt engine. Keep its matching
+release asset available; reproducible engine builds remain a maintainer task.
 
 ## Publishing on Flathub
 

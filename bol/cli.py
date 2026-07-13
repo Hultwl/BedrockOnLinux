@@ -36,7 +36,13 @@ def main():
     ip.add_argument("files", nargs="+", metavar="FILE",
                     help="content file(s) to import")
     sub.add_parser("repair", help="reset the Wine prefix")
-    sub.add_parser("doctor", help="check host requirements")
+    dp = sub.add_parser("doctor", help="check host requirements")
+    dp.add_argument(
+        "--acknowledge-gpu-crash",
+        action="store_true",
+        help=("after repairing the graphics driver and rebooting, clear the "
+              "interrupted-launch safety block"),
+    )
     sub.add_parser("update", help="check for and install launcher updates")
 
     a = p.parse_args()
@@ -65,7 +71,7 @@ def main():
                 if not na.signed_in():
                     sys.exit(1)
         elif a.cmd == "doctor":
-            sys.exit(0 if doctor() else 1)
+            sys.exit(0 if doctor(a.acknowledge_gpu_crash) else 1)
         elif a.cmd == "update":
             rel = check_for_update()
             if not rel:

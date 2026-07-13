@@ -1,13 +1,22 @@
 """bol.gui — the desktop GUI (customtkinter: modern, rounded, self-contained)."""
 # SPDX-License-Identifier: MIT
 
+import base64
 import os
+import shutil
 import subprocess
 import sys
 import threading
+import zipfile
 from pathlib import Path
 
-from .auth import NativeAuth, msa_logout, msa_signed_in
+from .auth import (
+    NativeAuth,
+    force_msa_facet_enabled,
+    msa_logout,
+    msa_signed_in,
+    set_force_msa_facet,
+)
 from .config import LOGS, PRETTY, VERSION
 from .content import _mojang_dir, import_content
 from .games import list_mc_versions
@@ -16,20 +25,45 @@ from .inject import run_injector
 from .launch import launch
 from . import log
 from .log import BolError, _LEVELS, warn
-from .prefix import _mc_running, kill_wine, reset_prefix
+from .prefix import (
+    _mc_running,
+    kill_wine,
+    prefix_operation_lock,
+    reset_prefix,
+)
 from .update import check_for_update, self_update
 from .util import load_settings, save_settings
 
+
+def _desktop_error(message):
+    warn(message)
+    notifier = shutil.which("notify-send")
+    if notifier:
+        try:
+            subprocess.run(
+                [notifier, "--app-name", PRETTY, PRETTY, message],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=5, check=False)
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+
 def gui():
+    if os.environ.get("WAYLAND_DISPLAY") and not os.environ.get("DISPLAY"):
+        _desktop_error(
+            "The launcher needs XWayland. Install or enable XWayland, then "
+            "open BedrockOnLinux again; command-line tools remain available.")
+        return
     from .deps import ensure_gui_deps
-    ensure_gui_deps()                            # .pyz / bare host: pip customtkinter
+    ensure_gui_deps()
     try:
         import tkinter as tk
+        from tkinter import messagebox
         import customtkinter as ctk
-    except Exception as e:                       # missing Tk / customtkinter
-        warn(f"GUI toolkit unavailable ({e}). Install python3-tk + "
-             "customtkinter, or use the command line "
-             "('bedrock-on-linux play | setup | login | doctor').")
+    except Exception as e:
+        _desktop_error(
+            f"GUI toolkit unavailable ({e}). Install python3-tk and "
+            "customtkinter, or use the command line.")
         return
 
     # Minecraft-launcher palette: deep slate + signature green.
@@ -40,11 +74,11 @@ def gui():
 
     ctk.set_appearance_mode("dark")
     try:
-        root = ctk.CTk()
-    except Exception as e:                       # no usable X11 / XWayland display
-        warn(f"No graphical display available ({e}). The launcher GUI needs an "
-             "X11 (or XWayland) display. Use the command line instead, e.g. "
-             "'bedrock-on-linux play', '… setup', '… login' or '… doctor'.")
+        root = ctk.CTk(className=PRETTY)
+    except Exception as e:
+        _desktop_error(
+            f"No usable X11/XWayland display ({e}). Enable XWayland or use "
+            "the command line.")
         return
     root.title(PRETTY)
     root.geometry("900x600")
@@ -54,10 +88,12 @@ def gui():
     def font(size=13, weight="normal"):
         return ctk.CTkFont(size=size, weight=weight)
 
-    # app icon (tk.PhotoImage — no Pillow dependency)
     icon_img = None
     here = Path(__file__).resolve().parent
-    for p in (here / "data/icon.png",
+    for p in (here.parent / "data/icon.png",
+              here / "data/icon.png",
+              Path("/app/share/icons/hicolor/256x256/apps/") /
+              "io.github.wyze3306.BedrockOnLinux.png",
               Path("/usr/lib/bedrock-on-linux/data/icon.png"),
               Path("/usr/share/icons/hicolor/256x256/apps/bedrock-on-linux.png")):
         if p.exists():
@@ -68,6 +104,15 @@ def gui():
                 break
             except Exception:
                 pass
+    if icon_img is None:
+        try:
+            with zipfile.ZipFile(Path(sys.argv[0])) as archive:
+                encoded = base64.b64encode(archive.read("data/icon.png"))
+            icon_img = tk.PhotoImage(data=encoded)
+            root.iconphoto(True, icon_img)
+            root._icon = icon_img
+        except (OSError, KeyError, zipfile.BadZipFile, tk.TclError):
+            pass
 
     def logo_label(parent, px, bg):
         """A scaled logo image in a tk.Label (its bg must match the parent)."""
@@ -96,7 +141,6 @@ def gui():
         opts.update(kw)
         return ctk.CTkButton(parent, text=text, **opts)
 
-    # ---- top bar: logo + title (left), account chip (right) ----
     top = ctk.CTkFrame(root, fg_color="transparent")
     top.pack(fill="x", padx=22, pady=(16, 6))
     ll = logo_label(top, 34, BG)
@@ -116,7 +160,6 @@ def gui():
                      width=86, height=30, font=font(12, "bold"))
     acct_btn.pack(side="left", padx=(0, 8), pady=8)
 
-    # ---- hero card: centred logo + title ----
     hero = ctk.CTkFrame(root, fg_color=CARD, corner_radius=18)
     hero.pack(fill="both", expand=True, padx=22, pady=6)
     hw = ctk.CTkFrame(hero, fg_color="transparent")
@@ -129,7 +172,6 @@ def gui():
     ctk.CTkLabel(hw, text="Bedrock Edition for Linux", font=font(13),
                  text_color=SUB).pack()
 
-    # ---- status line + progress (under the hero) ----
     status = ctk.CTkFrame(root, fg_color="transparent")
     status.pack(fill="x", padx=26, pady=(4, 0))
     status_txt = tk.StringVar(value="Ready to play.")
@@ -140,7 +182,6 @@ def gui():
                               progress_color=GREEN, fg_color=CARD2)
     prog.set(0)
 
-    # ---- bottom bar: version (left) · Details / gear / PLAY (right) ----
     bar = ctk.CTkFrame(root, fg_color="transparent")
     bar.pack(fill="x", padx=22, pady=(8, 16))
 
@@ -150,9 +191,6 @@ def gui():
                  anchor="w").pack(anchor="w", pady=(0, 3))
     mc_var = tk.StringVar(value="")
 
-    # Custom scrollable version picker, themed to match the rounded widgets (a
-    # ttk Combobox looked out of place). A field shows the choice; clicking it
-    # opens a rounded, scrollable list of the ~60 versions.
     _pick = {"win": None}
 
     def close_picker():
@@ -222,7 +260,6 @@ def gui():
                     width=82, height=48)
     det_btn.pack(side="right", padx=(0, 6))
 
-    # ---- collapsible details log ----
     detwrap = ctk.CTkFrame(root, fg_color=CARD, corner_radius=12)
     logbox = tk.Text(detwrap, height=9, bg="#0d0f13", fg="#7fd97f", bd=0,
                      font=("monospace", 10), highlightthickness=0,
@@ -243,7 +280,6 @@ def gui():
             detwrap.pack_forget()
             det_btn.configure(text_color=SUB)
 
-    # ---- friendly status line + progress bar ----
     def set_status(t, color=SUB):
         root.after(0, lambda: (status_txt.set(t),
                                status_lbl.configure(text_color=color)))
@@ -252,14 +288,14 @@ def gui():
         if not prog.winfo_ismapped():
             prog.pack(fill="x", pady=(8, 2))
 
-    def bar_busy():           # animated bar for steps with no measurable %
+    def bar_busy():
         def ap():
             _show_bar()
             prog.configure(mode="indeterminate")
             prog.start()
         root.after(0, ap)
 
-    def set_progress(g, t):   # measurable download progress
+    def set_progress(g, t):
         def ap():
             _show_bar()
             prog.stop()
@@ -330,7 +366,6 @@ def gui():
                 bar_busy()
     log._LOG_SINK = lambda m: root.after(0, glog, m)
 
-    # ---- account (device-code Microsoft sign-in) ----
     def acct_state(ph):
         if ph == "in":
             acct_dot.configure(text_color=GREEN)
@@ -349,8 +384,17 @@ def gui():
 
     def acct_click():
         if getattr(acct_btn, "_mode", "in") == "out":
-            msa_logout()
             na.stop()
+            try:
+                # PLAY holds this same non-blocking lock through the complete
+                # game session, so Sign out can never invalidate credentials
+                # halfway through launch or while Minecraft is using them.
+                with prefix_operation_lock("sign out of Microsoft"):
+                    msa_logout()
+            except BolError as exc:
+                warn(str(exc))
+                acct_state("in" if msa_signed_in() else "out")
+                return
             acct_state("out")
         else:
             threading.Thread(target=lambda: na.start(on_auth, on_online),
@@ -389,7 +433,6 @@ def gui():
               root.clipboard_append(code)), kind="ghost", width=120,
               height=38).pack(side="left", padx=10)
 
-    # ---- versions ----
     def refresh_versions():
         beta = load_settings().get("show_betas", False)
         try:
@@ -421,7 +464,6 @@ def gui():
         except ValueError:
             return None
 
-    # ---- PLAY: auto-install (version + engine) then launch ----
     def busy(on):
         ui["busy"] = on
         play_btn.configure(state="disabled" if on else "normal")
@@ -441,13 +483,16 @@ def gui():
                 launch()
                 set_status("Minecraft closed.", SUB)
             except Exception as e:
-                log._LOG_SINK(f"xx {e}")
+                message = str(e) or type(e).__name__
+                log._LOG_SINK(f"xx {message}")
+                set_status("Minecraft could not start.", RED)
+                root.after(0, lambda text=message: messagebox.showerror(
+                    "Minecraft could not start", text[:2000], parent=root))
             finally:
                 end_progress()
                 root.after(0, lambda: busy(False))
         threading.Thread(target=work, daemon=True).start()
 
-    # ---- settings popup ----
     def open_settings():
         d = ctk.CTkToplevel(root)
         d.title("Settings")
@@ -481,14 +526,12 @@ def gui():
                       "reports)", variable=diag_v, command=save_diag,
                       progress_color=GREEN, font=font(13)).pack(anchor="w", pady=7)
 
-        msa_v = tk.BooleanVar(value=load_settings().get("force_msa_facet", True))
+        msa_v = tk.BooleanVar(value=force_msa_facet_enabled())
 
         def save_msa():
-            s2 = load_settings()
-            s2["force_msa_facet"] = msa_v.get()
-            save_settings(s2)
-        ctk.CTkSwitch(wrap, text="Unlock the in-game Servers tab (turn OFF if the "
-                      "game freezes / crashes on launch)", variable=msa_v,
+            set_force_msa_facet(msa_v.get())
+        ctk.CTkSwitch(wrap, text="Microsoft/Xbox server access (recommended; "
+                      "disable only for launch troubleshooting)", variable=msa_v,
                       command=save_msa, progress_color=GREEN,
                       font=font(13)).pack(anchor="w", pady=7)
 
@@ -592,7 +635,6 @@ def gui():
         ctk.CTkLabel(wrap, text=f"{PRETTY} {VERSION}", text_color=SUB,
                      font=font(11)).pack(anchor="w", pady=(12, 0))
 
-    # ---- self-update notification (background check → banner) ----
     def relaunch_app():
         na.stop()
         try:

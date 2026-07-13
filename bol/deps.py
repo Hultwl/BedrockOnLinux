@@ -14,7 +14,12 @@ from .log import info, ok, warn
 # in-game login fails with a connection-reset (0x80072746). `requests` was
 # dropped in favour of urllib, so cryptography is the only hard dependency.
 #   import-name -> pip distribution name
-LOGIN_DEPS = {"cryptography": "cryptography"}
+# 43.0.3 is the newest upstream wheel line built on manylinux_2_28.  Starting
+# with 44, x86-64 wheels require glibc 2.34, so installing the floating latest
+# breaks the portable .pyz on Debian 11/12 and Ubuntu 22.04. Distribution-
+# packaged cryptography remains accepted at any version; this pin applies only
+# to the best-effort pip bootstrap when the module is absent.
+LOGIN_DEPS = {"cryptography": "cryptography==43.0.3"}
 
 
 def have(mod):
@@ -88,7 +93,12 @@ def ensure_login_deps(install=True):
 # darkdetect + packaging). It is BUNDLED in the AppImage / Flatpak / .deb, so
 # this is a no-op there; only the portable .pyz (or a bare host) pip-installs it
 # on first GUI launch.
-GUI_DEPS = {"customtkinter": "customtkinter"}
+GUI_DEPS = {
+    "customtkinter": "customtkinter==5.2.2",
+    "darkdetect": "darkdetect==0.8.0",
+    "packaging": "packaging==26.2",
+}
+GUI_INSTALL_REQUIREMENTS = tuple(GUI_DEPS.values())
 
 
 def missing_gui_deps():
@@ -102,11 +112,11 @@ def ensure_gui_deps(install=True):
     if not missing or not install or os.environ.get("BOL_NO_PIP") == "1":
         return missing
     info(f"Installing the GUI toolkit: {', '.join(missing)} …")
-    if _pip_install(GUI_DEPS[m] for m in missing):
+    if _pip_install(GUI_INSTALL_REQUIREMENTS):
         _refresh_path()
         missing = missing_gui_deps()
     if missing:
         warn("Could not install the GUI toolkit "
-             f"('pip install --user {' '.join(GUI_DEPS[m] for m in missing)}'). "
-             "The self-contained AppImage or Flatpak needs nothing installed.")
+             f"('pip install --user {' '.join(GUI_INSTALL_REQUIREMENTS)}'). "
+             "The AppImage and Flatpak already bundle this Python toolkit.")
     return missing

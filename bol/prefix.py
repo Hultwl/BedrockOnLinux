@@ -1,68 +1,143 @@
 """bol.prefix — Wine prefix and umu lifecycle: boot, kill, reset, options."""
 # SPDX-License-Identifier: MIT
 
+import hashlib
+import fcntl
 import os
 import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
-from .config import CACHE, COMPAT, DATA, HOME, LOGS, PFX, UMU_DIR, UMU_REPO
-from .log import die, info, ok, warn
+from .archive import safe_extract_tar
+from .config import (
+    CACHE,
+    COMPAT,
+    DATA,
+    HOME,
+    LOGS,
+    PFX,
+    UMU_ARCHIVE_SHA256,
+    UMU_ASSET,
+    UMU_DIR,
+    UMU_REPO,
+    UMU_RUN_SHA256,
+    UMU_VERSION,
+)
+from .log import BolError, die, info, ok, warn
 from .proton import proton_path
-from .util import _pkill, asset_url, download, gh_latest
+from .util import download
 
 def ensure_umu(force=False):
     binp = UMU_DIR / "umu-run"
-    if binp.exists() and not force:
-        return binp
-    rel = gh_latest(UMU_REPO)
-    url, fname, _ = asset_url(
-        rel, lambda n: n.endswith("zipapp.tar") or n == "umu-run")
-    if not url:
-        url, fname, _ = asset_url(rel, lambda n: n.endswith((".tar", ".tar.gz")))
-    if not url:
-        die("umu-launcher asset not found.")
-    pkg = CACHE / fname
-    info("Downloading umu-launcher …")
-    download(url, pkg, "umu-launcher")
-    if fname == "umu-run":
-        shutil.copy2(pkg, binp)
-    else:
-        with tarfile.open(pkg) as t:
-            t.extractall(UMU_DIR)
-        found = next((p for p in UMU_DIR.rglob("umu-run")), None)
-        if not found:
+    if binp.is_file() and not force:
+        try:
+            if hashlib.sha256(binp.read_bytes()).hexdigest() == UMU_RUN_SHA256:
+                return binp
+        except OSError:
+            pass
+        warn("Installed umu-launcher is stale or modified; repairing it.")
+    url = (f"https://github.com/{UMU_REPO}/releases/download/"
+           f"{UMU_VERSION}/{UMU_ASSET}")
+    pkg = CACHE / UMU_ASSET
+    expected_archive_hash = UMU_ARCHIVE_SHA256.lower()
+    actual_archive_hash = None
+    if pkg.is_file():
+        try:
+            actual_archive_hash = hashlib.sha256(pkg.read_bytes()).hexdigest()
+        except OSError:
+            pass
+    if actual_archive_hash != expected_archive_hash:
+        pkg.unlink(missing_ok=True)
+        info("Downloading umu-launcher …")
+        download(url, pkg, "umu-launcher")
+        actual_archive_hash = hashlib.sha256(pkg.read_bytes()).hexdigest()
+    if actual_archive_hash != expected_archive_hash:
+        pkg.unlink(missing_ok=True)
+        raise ValueError(
+            "umu-launcher archive SHA-256 mismatch (expected %s, got %s)" %
+            (expected_archive_hash, actual_archive_hash))
+    UMU_DIR.mkdir(parents=True, exist_ok=True)
+    staging = None
+    tmp_fd, tmp_name = tempfile.mkstemp(prefix=".umu-run-", dir=UMU_DIR)
+    os.close(tmp_fd)
+    tmp_bin = Path(tmp_name)
+    try:
+        staging = Path(tempfile.mkdtemp(
+            prefix=".umu-extract-", dir=UMU_DIR.parent))
+        with tarfile.open(pkg) as archive:
+            safe_extract_tar(archive, staging)
+        source = next((p for p in staging.rglob("umu-run")
+                       if p.is_file()), None)
+        if not source:
             die("umu-run missing from the package.")
-        if found != binp:
-            shutil.copy2(found, binp)
-    os.chmod(binp, 0o755)
+        source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+        if source_hash != UMU_RUN_SHA256:
+            raise ValueError(
+                "umu-run SHA-256 mismatch (expected %s, got %s)" %
+                (UMU_RUN_SHA256, source_hash))
+        shutil.copy2(source, tmp_bin)
+        os.chmod(tmp_bin, 0o755)
+        tmp_bin.replace(binp)
+    finally:
+        tmp_bin.unlink(missing_ok=True)
+        if staging is not None:
+            shutil.rmtree(staging, ignore_errors=True)
     ok("umu-launcher ready")
     return binp
 
 
-def _existing_gdk_pfx():
-    """Reuse an already-working GDK Wine prefix if the host happens to have one
-    (some users set one up via another GDK launcher). It already carries
-    Microsoft GameInput and the GDK runtime, so reusing it verbatim is a touch
-    more reliable than our own. Returns None when there's none — we then build
-    and populate our own prefix, so a fresh machine works with no extra setup."""
-    base = HOME / "Games/Heroic/Prefixes"
-    if not base.is_dir():
-        return None
-    for d in sorted(base.iterdir()):
-        p = d / "pfx" if (d / "pfx").is_dir() else d
-        if (p / "drive_c/Program Files/Microsoft GameInput").is_dir():
-            return p
-    return None
-
-
 def active_prefix():
-    """The Wine prefix the game runs in: an existing GDK prefix when present,
-    otherwise our own self-contained one (populated by do_setup)."""
-    return _existing_gdk_pfx() or PFX
+    """Return the app-owned prefix, unless the user explicitly opts out.
+
+    Older builds silently reused the first Heroic GDK prefix they found.  That
+    made PLAY/Repair/Force-stop modify or kill another application's Wine
+    session.  Isolation is the safe default on every distribution; advanced
+    users can still opt in deliberately with ``BOL_WINEPREFIX``.
+    """
+    override = os.environ.get("BOL_WINEPREFIX", "").strip()
+    return Path(override).expanduser() if override else PFX
+
+
+@contextmanager
+def prefix_operation_lock(operation="modify the Wine prefix"):
+    """Serialize every prefix-mutating operation.
+
+    The lock is intentionally held for the complete game session. Repair and
+    setup therefore cannot delete or rewrite the prefix behind a running game,
+    while the explicit Force-stop action remains lock-free so it can end that
+    session.
+    """
+    DATA.mkdir(parents=True, exist_ok=True)
+    path = DATA / ".launch.lock"
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        os.chmod(path, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise BolError(
+                f"Cannot {operation}: another BedrockOnLinux setup, repair, "
+                "or game session is already in progress. Close Minecraft or "
+                "use 'Force stop Minecraft' before trying again."
+            ) from exc
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+@contextmanager
+def launch_lock():
+    """Serialize PLAY with setup/repair and without stale crash locks."""
+    with prefix_operation_lock("start Minecraft"):
+        yield
 
 
 def steam_compat_dir():
@@ -125,9 +200,14 @@ def boot_prefix(prefix=None):
     sys32 = pfx / "drive_c/windows/system32"
     if sys32.is_dir():
         return True
+    # This is the only setup helper which may execute Wine.  Refuse a known
+    # broken display/driver before UMU or Wine can open a device.
+    from .gpu_safety import require_safe_graphics_session
+    require_safe_graphics_session()
     info("Initialising the Wine prefix (first run) …")
     cmd, env = proton_umu_cmd("wineboot", prefix=pfx)
     cmd.append("-u")
+    env = headless_setup_env(env)
     env.setdefault("WINEDEBUG", "-all")
     LOGS.mkdir(parents=True, exist_ok=True)
     try:
@@ -136,6 +216,10 @@ def boot_prefix(prefix=None):
                            stderr=subprocess.STDOUT, timeout=300)
     except Exception as e:
         warn(f"wineboot failed ({e}).")
+    finally:
+        # wineboot sometimes leaves services behind.  Registry updates which
+        # follow are offline, so finish the setup session gracefully first.
+        stop_prefix_procs(pfx, grace=5)
     end = time.time() + 30
     while time.time() < end and not sys32.is_dir():
         time.sleep(1)
@@ -146,33 +230,121 @@ def boot_prefix(prefix=None):
     return True
 
 
-def kill_prefix_procs(prefix: Path):
-    """Kill every process running in a specific Wine prefix, matched by its
-    WINEPREFIX env var via /proc — so tearing down one prefix's install never
-    touches a game running in another prefix."""
+def prefix_processes(prefix: Path):
+    """Return live PIDs carrying this exact ``WINEPREFIX`` environment."""
     target = ("WINEPREFIX=" + str(prefix)).encode() + b"\0"
+    found = []
     for pdir in Path("/proc").glob("[0-9]*"):
         try:
             if target in pdir.joinpath("environ").read_bytes():
-                os.kill(int(pdir.name), 9)
+                pid = int(pdir.name)
+                if pid != os.getpid():
+                    found.append(pid)
         except Exception:
             continue
+    return sorted(set(found))
+
+
+def require_prefix_idle(prefix: Path, action="modify the Wine prefix"):
+    """Fail before an offline mutation while wineserver still owns the hive."""
+    live = prefix_processes(Path(prefix))
+    if live:
+        raise BolError(
+            f"Cannot {action}: {len(live)} Wine/Proton process(es) still use "
+            "this prefix. Close Minecraft or use 'Force stop Minecraft' first."
+        )
+    return True
+
+
+def stop_prefix_procs(prefix: Path, grace=5, kill_grace=2):
+    """Stop a prefix, including children spawned during shutdown.
+
+    A one-shot PID snapshot misses services which wineserver/explorer creates
+    while their parents are exiting. Keep rescanning through both TERM and KILL
+    phases, and do not let an offline registry writer proceed until the prefix
+    is demonstrably idle.
+    """
+    prefix = Path(prefix)
+    seen = set()
+    term_sent = set()
+    deadline = time.monotonic() + max(0, grace)
+
+    while True:
+        live = set(prefix_processes(prefix))
+        if not live:
+            return len(seen), 0
+        seen.update(live)
+        for pid in live - term_sent:
+            try:
+                os.kill(pid, 15)
+            except (ProcessLookupError, PermissionError):
+                pass
+            term_sent.add(pid)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(0.1, remaining))
+
+    forced = set()
+    kill_deadline = time.monotonic() + max(0, kill_grace)
+    while True:
+        live = set(prefix_processes(prefix))
+        if not live:
+            return len(seen), len(forced)
+        seen.update(live)
+        for pid in live:
+            try:
+                os.kill(pid, 9)
+            except (ProcessLookupError, PermissionError):
+                pass
+            else:
+                forced.add(pid)
+        remaining = kill_deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(0.1, remaining))
+
+    live = prefix_processes(prefix)
+    if live:
+        raise BolError(
+            f"Could not stop {len(live)} Wine/Proton process(es) for this "
+            "prefix; refusing unsafe offline changes."
+        )
+    return len(seen), len(forced)
+
+
+def headless_setup_env(env):
+    """Prevent non-graphical Wine setup helpers from initialising a GPU."""
+    result = dict(env)
+    result.pop("DISPLAY", None)
+    result.pop("WAYLAND_DISPLAY", None)
+    result.pop("XAUTHORITY", None)
+    result.pop("PROTON_ENABLE_WAYLAND", None)
+    result["SDL_VIDEODRIVER"] = "dummy"
+    disabled = "winevulkan=;dxgi=;d3d11=;d3d12="
+    current = result.get("WINEDLLOVERRIDES", "")
+    result["WINEDLLOVERRIDES"] = disabled + (";" + current if current else "")
+    return result
 
 
 def kill_wine():
-    """Kill leftover wine/Proton (a hung run locks the prefix)."""
-    for pat in ("wineserver", "winedevice.exe", "GDK-Proton",
-                "Minecraft.Windows.exe", "umu_run.py", "umu-shim",
-                "pv-adverb", "pressure-vessel"):
-        _pkill(pat)
+    """Explicit GUI action: stop only this application's Wine prefix."""
+    stopped, forced = stop_prefix_procs(active_prefix())
+    if stopped:
+        ok(f"Stopped {stopped} BedrockOnLinux process(es)"
+           + (f" ({forced} forced)." if forced else "."))
+    else:
+        info("No BedrockOnLinux Wine process is running.")
 
 
 def reset_prefix():
-    kill_wine()
-    time.sleep(1)
-    if COMPAT.exists():
-        shutil.rmtree(COMPAT, ignore_errors=True)
-    ok("Wine prefix reset — rebuilt on next launch.")
+    # Repair never deletes an explicitly supplied third-party prefix.
+    with prefix_operation_lock("repair the Wine prefix"):
+        stop_prefix_procs(PFX)
+        require_prefix_idle(PFX, "repair the Wine prefix")
+        if COMPAT.exists():
+            shutil.rmtree(COMPAT, ignore_errors=True)
+        ok("Wine prefix reset — rebuilt on next launch.")
 
 
 OPTIONS_REL = ("drive_c/users/steamuser/AppData/Roaming/Minecraft Bedrock/"
@@ -201,8 +373,11 @@ def patch_options():
 
 
 def _mc_running():
-    try:
-        return subprocess.run(["pgrep", "-f", "Minecraft.Windows.exe"],
-                              capture_output=True).returncode == 0
-    except Exception:
-        return False
+    for pid in prefix_processes(active_prefix()):
+        try:
+            cmdline = Path(f"/proc/{pid}/cmdline").read_bytes()
+            if b"Minecraft.Windows.exe" in cmdline:
+                return True
+        except OSError:
+            continue
+    return False

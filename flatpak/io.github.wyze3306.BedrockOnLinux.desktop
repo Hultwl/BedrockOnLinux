@@ -9,4 +9,4 @@ Terminal=false
 Categories=Game;ActionGame;
 Keywords=minecraft;bedrock;gdk;wine;proton;mcbe;
 StartupNotify=true
-StartupWMClass=Tk
+StartupWMClass=BedrockOnLinux

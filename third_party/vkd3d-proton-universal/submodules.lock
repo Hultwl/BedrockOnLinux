@@ -1,0 +1,8 @@
+f88a2d766840fc825af1fc065977953ba1fa4a91 khronos/SPIRV-Headers
+ad9ce1235e88dc09287e19171dfac384db8ec32c khronos/Vulkan-Headers
+62dbb07f771534c8ce924479efdc6c8fa510361d subprojects/dxil-spirv
+29c93aeecd55533a357fdd7c95be5587d1c1f506 subprojects/dxil-spirv/subprojects/dxbc-spirv
+c8ad050fcb29e42a2f57d9f59e97488f465c436d subprojects/dxil-spirv/subprojects/dxbc-spirv/submodules/spirv_headers
+4b7bcb7e5cf71015b3299088d22004bfe4e13a5e subprojects/dxil-spirv/third_party/SPIRV-Cross
+64f5770f59db933d46b9cad6edc42b4186409ef4 subprojects/dxil-spirv/third_party/SPIRV-Tools
+f88a2d766840fc825af1fc065977953ba1fa4a91 subprojects/dxil-spirv/third_party/spirv-headers

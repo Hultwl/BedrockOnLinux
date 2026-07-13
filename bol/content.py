@@ -11,14 +11,11 @@ from pathlib import Path
 from .log import die, ok, warn
 from .prefix import _mc_running, active_prefix
 
-# ---- content import (.mcpack / .mcaddon / .mcworld / .mctemplate) ----------
 # Minecraft Bedrock normally imports these by "opening" the file, which has no
 # handler under Wine — so worlds/packs can't be imported in-game. We unpack
 # them straight into the game's com.mojang folders instead.
 COM_MOJANG_REL = ("drive_c/users/steamuser/AppData/Roaming/Minecraft Bedrock/"
                   "Users/Shared/games/com.mojang")
-IMPORT_EXTS = (".mcpack", ".mcaddon", ".mcworld", ".mctemplate", ".mcskin",
-               ".zip")
 
 
 def _mojang_dir(prefix=None):

@@ -2,12 +2,14 @@
 # SPDX-License-Identifier: MIT
 
 import http.client
+import fcntl
 import json
 import os
 import re
 import shutil
 import socket
 import subprocess
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -23,8 +25,6 @@ from .config import (
     PROTON_DIR,
     SETTINGS,
     UMU_DIR,
-    WINEGDK_BRANCH,
-    WINEGDK_REPO,
 )
 from .log import IS_TTY, die, warn
 
@@ -36,6 +36,10 @@ def run(cmd, **kw):
 def mkdirs():
     for d in (DATA, PROTON_DIR, UMU_DIR, CACHE, LOGS, GAMES):
         d.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(DATA, 0o700)
+    except OSError:
+        pass
 
 
 def load_settings():
@@ -45,24 +49,41 @@ def load_settings():
             s = json.loads(SETTINGS.read_text())
         except Exception:
             s = {}
-    # Always use the WineGDK engine unless the user pointed at a custom build.
-    s.setdefault("native_login", True)
     if not s.get("proton_dir") and not s.get("proton_url"):
         s.setdefault("proton_source", "winegdk")
-        s.setdefault("winegdk_repo", WINEGDK_REPO)
-        s.setdefault("winegdk_branch", WINEGDK_BRANCH)
-        # A stale persisted repo/branch is repointed and forces a clean rebuild.
-        if s.get("winegdk_repo") != WINEGDK_REPO \
-                or s.get("winegdk_branch") != WINEGDK_BRANCH:
-            s["winegdk_repo"] = WINEGDK_REPO
-            s["winegdk_branch"] = WINEGDK_BRANCH
-            s.pop("winegdk_built", None)
     return s
 
 
 def save_settings(s):
     DATA.mkdir(parents=True, exist_ok=True)
-    SETTINGS.write_text(json.dumps(s, indent=2))
+    try:
+        os.chmod(DATA, 0o700)
+    except OSError:
+        pass
+    lock_path = DATA / ".settings.lock"
+    lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    staged = None
+    try:
+        os.chmod(lock_path, 0o600)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        fd, name = tempfile.mkstemp(prefix=".settings-", suffix=".tmp",
+                                    dir=DATA)
+        staged = Path(name)
+        with os.fdopen(fd, "w") as stream:
+            json.dump(s, stream, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(staged, 0o600)
+        os.replace(staged, SETTINGS)
+        staged = None
+    finally:
+        if staged is not None:
+            staged.unlink(missing_ok=True)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
 
 
 def http_json(url):
@@ -185,20 +206,3 @@ def _screen_wh():
         return None
     m = re.search(r"current\s+(\d+)\s+x\s+(\d+)", out)
     return (m.group(1), m.group(2)) if m else None
-
-
-def _pkill(pattern):
-    """Best-effort kill of processes whose cmdline matches `pattern`."""
-    if shutil.which("pkill"):
-        subprocess.run(["pkill", "-9", "-f", pattern],
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return
-    for pid in os.listdir("/proc"):
-        if not pid.isdigit():
-            continue
-        try:
-            cl = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ")
-            if pattern.encode() in cl:
-                os.kill(int(pid), 9)
-        except Exception:
-            pass

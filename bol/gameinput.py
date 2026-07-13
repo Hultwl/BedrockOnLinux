@@ -2,14 +2,12 @@
 # SPDX-License-Identifier: MIT
 
 import struct
-import subprocess
-import time
 import zlib
 from pathlib import Path
 
-from .config import CACHE, LOGS
 from .log import info, ok, warn
-from .prefix import kill_prefix_procs, proton_umu_cmd
+from .prefix import require_prefix_idle
+from .wine_registry import reg_dword, reg_sz, update_prefix_registry
 
 def gameinput_redist_ok(prefix: Path):
     """True when the NATIVE Microsoft GameInput redist is fully installed.
@@ -153,10 +151,10 @@ def _extract_gameinput_redist(msi_path: Path, prefix: Path):
     (GameInputBridge reports itself as GameInputRedist). Returns True on
     success, False to let the caller fall back to running the MSI."""
     cab = _msi_embedded_cab(msi_path.read_bytes())
-    pes = [(len(d), k, d) for sz, d in _cab_payload(cab)
+    pes = [(len(d), k, d) for _, d in _cab_payload(cab)
            for k in [_pe_kind(d)] if k]
-    dlls = sorted([d for sz, k, d in pes if k == "dll"], key=len, reverse=True)
-    exes = sorted([d for sz, k, d in pes if k == "exe"], key=len, reverse=True)
+    dlls = sorted([d for _, k, d in pes if k == "dll"], key=len, reverse=True)
+    exes = sorted([d for _, k, d in pes if k == "exe"], key=len, reverse=True)
     if not dlls or not exes:            # unrecognised payload → MSI fallback
         return False
     x64 = prefix / "drive_c/Program Files/Microsoft GameInput/x64"
@@ -183,32 +181,30 @@ def _extract_gameinput_redist(msi_path: Path, prefix: Path):
 def _set_gameinput_registry(prefix: Path):
     """Point the game's GameInput loader at the extracted redist: RedistDir
     (both registry views) + the demand-start service entry, matching what the
-    MSI writes. Imported in one umu/reg pass."""
-    reg = (
-        "Windows Registry Editor Version 5.00\r\n\r\n"
-        r"[HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\GameInput]" "\r\n"
-        r'"RedistDir"="C:\\Program Files\\Microsoft GameInput\\x64"' "\r\n\r\n"
-        r"[HKEY_LOCAL_MACHINE\SOFTWARE\Wow6432Node\Microsoft\GameInput]" "\r\n"
-        r'"RedistDir"="C:\\Program Files\\Microsoft GameInput\\x64"' "\r\n\r\n"
-        r"[HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\GameInputRedistService]" "\r\n"
-        r'"DisplayName"="GameInput Redist Service"' "\r\n"
-        r'"Description"="GameInput Redist Service"' "\r\n"
-        r'"ImagePath"="C:\\Program Files\\Microsoft GameInput\\x64\\GameInputRedistService.exe"' "\r\n"
-        r'"ObjectName"="LocalSystem"' "\r\n"
-        r'"ErrorControl"=dword:00000000' "\r\n"
-        r'"Start"=dword:00000003' "\r\n"
-        r'"Type"=dword:00000010' "\r\n"
-    )
-    rf = CACHE / "gameinput.reg"
-    CACHE.mkdir(parents=True, exist_ok=True)
-    rf.write_text(reg, encoding="utf-16")        # UTF-16 + BOM (Wine needs it)
-    cmd, env = proton_umu_cmd("reg", prefix=prefix)
-    cmd += ["import", "Z:" + str(rf).replace("/", "\\")]
+    MSI writes.  Write the stopped prefix directly: starting ``reg.exe`` here
+    also starts Wine Explorer and may initialise the GPU before Minecraft."""
+    redist = r"C:\Program Files\Microsoft GameInput\x64"
+    service = r"System\CurrentControlSet\Services\GameInputRedistService"
+    changes = [
+        reg_sz(r"Software\Microsoft\GameInput", "RedistDir", redist),
+        reg_sz(r"Software\Wow6432Node\Microsoft\GameInput", "RedistDir",
+               redist),
+        reg_sz(service, "DisplayName", "GameInput Redist Service"),
+        reg_sz(service, "Description", "GameInput Redist Service"),
+        reg_sz(service, "ImagePath",
+               redist + r"\GameInputRedistService.exe"),
+        reg_sz(service, "ObjectName", "LocalSystem"),
+        reg_dword(service, "ErrorControl", 0),
+        reg_dword(service, "Start", 3),
+        reg_dword(service, "Type", 0x10),
+    ]
     try:
-        subprocess.run(cmd, env=env, stdout=subprocess.DEVNULL,
-                       stderr=subprocess.DEVNULL, timeout=120)
+        update_prefix_registry(prefix, machine=changes)
+        return True
     except Exception as e:
-        warn(f"GameInput RedistDir registry import failed ({e}).")
+        warn("GameInput RedistDir offline registry update failed "
+             f"({type(e).__name__}).")
+        return False
 
 
 def install_gameinput(prefix: Path, game_dir: Path):
@@ -216,13 +212,15 @@ def install_gameinput(prefix: Path, game_dir: Path):
     prefixes from older releases (≤ 1.0.9) that fell back to Wine's builtin
     GameInput (no mouse) because the redist never actually installed.
 
-    Primary path EXTRACTS the redist straight from the game's
+    The installer EXTRACTS the redist straight from the game's
     Installers/GameInputRedist.msi (pure-Python OLE+CAB) and writes the
     registry — this avoids running Windows Installer entirely, whose post-copy
-    RtlGenRandom custom action hangs msiexec for minutes on some hosts. Only if
-    extraction can't recognise the payload do we fall back to running the MSI
-    (poll for the artifacts, then kill — never wait for the hang)."""
+    RtlGenRandom custom action hangs msiexec for minutes on some hosts. An
+    unrecognised payload fails closed with a warning; PLAY never starts an MSI,
+    Wine Explorer, or a second graphics session as a fallback."""
+    require_prefix_idle(prefix, "install Microsoft GameInput offline")
     if gameinput_redist_ok(prefix):
+        _set_gameinput_registry(prefix)
         return
     msi = game_dir / "Installers" / "GameInputRedist.msi"
     if not msi.exists():
@@ -232,53 +230,15 @@ def install_gameinput(prefix: Path, game_dir: Path):
         return
     info("Installing Microsoft GameInput (native redist — in-game mouse) …")
     try:
-        if _extract_gameinput_redist(msi, prefix):
-            _set_gameinput_registry(prefix)
+        if _extract_gameinput_redist(msi, prefix) \
+                and _set_gameinput_registry(prefix):
             ok("Microsoft GameInput installed (native redist)")
             return
     except Exception as e:
-        warn(f"GameInput direct extraction failed ({e}) — trying the MSI.")
-    _install_gameinput_via_msi(prefix, msi)
-    if gameinput_redist_ok(prefix):
-        _set_gameinput_registry(prefix)
-        ok("Microsoft GameInput installed (native redist)")
-    else:
-        warn("GameInput install incomplete — the in-game mouse may not work; "
-             "re-run Play or 'Install / Update' to retry.")
-
-
-def _install_gameinput_via_msi(prefix: Path, msi: Path):
-    """Fallback: run GameInputRedist.msi under umu, but never wait for it to
-    finish — its final RtlGenRandom action hangs msiexec indefinitely on some
-    hosts. Poll for the redist artifacts (they are written early) and kill the
-    install the moment they appear, scoped to this prefix."""
-    LOGS.mkdir(parents=True, exist_ok=True)
-    log = open(LOGS / "native-login.log", "a")
-    cmd, env = proton_umu_cmd("msiexec", prefix=prefix)
-    env["WINEDEBUG"] = "-all"
-    overrides = ["cryptbase=n,b"]
-    if env.get("WINEDLLOVERRIDES"):
-        overrides.append(env["WINEDLLOVERRIDES"])
-    env["WINEDLLOVERRIDES"] = ";".join(overrides)
-    cmd += ["/i", "Z:" + str(msi).replace("/", "\\"), "/qn"]
-    proc = subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT,
-                            start_new_session=True)
-    end = time.time() + 120
-    try:
-        while time.time() < end:
-            if proc.poll() is not None:
-                break
-            if gameinput_redist_ok(prefix):
-                time.sleep(2)          # let the last writes flush
-                break
-            time.sleep(2)
-    finally:
-        log.close()
-        if proc.poll() is None:
-            kill_prefix_procs(prefix)
-            try:
-                proc.wait(10)
-            except Exception:
-                proc.kill()
-        else:
-            kill_prefix_procs(prefix)
+        warn(f"GameInput direct extraction failed ({e}).")
+    # Do not automatically run msiexec as a fallback.  A setup-only failure is
+    # preferable to silently starting another Wine/Explorer/GPU session in the
+    # PLAY path; the current Bedrock MSI is supported by the pure-Python CAB
+    # extractor above.
+    warn("GameInput install incomplete — no Windows MSI helper was started. "
+         "Re-run 'Install / Update' after checking the game package.")

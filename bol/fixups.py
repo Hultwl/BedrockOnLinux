@@ -1,18 +1,24 @@
 """bol.fixups — in-prefix / in-game fixups (curl SSL, DLLs, OpenSSL XCurl, cryptbase, UI)."""
 # SPDX-License-Identifier: MIT
 
+import hashlib
+import os
 import re
 import shutil
 import struct
+import sys
 import tarfile
+import tempfile
 from pathlib import Path
 
+from .archive import safe_extract_tar
 from .config import (
     CACERT_URL,
     CACHE,
     GDK_DEPS_DLLS,
     GDK_DEPS_URL,
     MINGW_CURL,
+    OPENSSL_XCURL_ARCHIVE_SHA256,
     OPENSSL_XCURL_REV,
     OPENSSL_XCURL_SET,
     WINEGDK_PREBUILT_REPO,
@@ -98,8 +104,6 @@ def _patch_hbui_signin_gate(game_dir: Path):
             continue
         orig = data
 
-        # (1) Servers-tab "need a Microsoft account" banner: wB() -> "" so every
-        #     consumer hits `default: return null`. Legacy pattern; left as-is.
         needle = 'function wB(){return(0,l.useFacetMap)'
         if needle in data and 'function wB(){return"";return' not in data:
             data = data.replace(needle, 'function wB(){return"";return', 1)
@@ -139,45 +143,119 @@ def ensure_openssl_xcurl_set():
             marker.read_text().strip() == OPENSSL_XCURL_REV:
         return True
     asset = f"openssl-xcurl-set-{OPENSSL_XCURL_REV}.tar.gz"
+    # Unreleased AppImage/zipapp candidates carry this reviewed asset beside
+    # the launcher, just like the engine archive. Prefer that exact sibling so
+    # local cross-distribution testing does not depend on publishing anything.
+    anchors = []
+    appimage = os.environ.get("APPIMAGE", "").strip()
+    if appimage:
+        anchors.append(Path(appimage).expanduser().resolve().parent)
     try:
-        rels = gh_releases(WINEGDK_PREBUILT_REPO, 30)
-    except Exception as e:
-        warn(f"OpenSSL XCurl set lookup failed ({e}).")
-        return have
+        anchors.append(Path(sys.argv[0]).expanduser().resolve().parent)
+    except (OSError, RuntimeError):
+        pass
+    tar = next((anchor / asset for anchor in anchors
+                if (anchor / asset).is_file()), None)
+    local_archive = tar is not None
     url = None
-    for rel in rels or []:
-        url, _name, _ = asset_url(rel, lambda n: n == asset)
-        if url:
-            break
-    if not url:
-        warn(f"OpenSSL XCurl set asset '{asset}' not published yet.")
-        return have
-    tar = CACHE / asset
-    if not tar.exists():
-        info("Downloading the online-login components (one-time) …")
+    if not local_archive:
         try:
-            download(url, tar, "Online-login components")
-        except BolError:
+            rels = gh_releases(WINEGDK_PREBUILT_REPO, 30)
+        except Exception as e:
+            warn(f"OpenSSL XCurl set lookup failed ({e}).")
             return have
-    tmp = OPENSSL_XCURL_SET.parent / ".set-dl"
-    shutil.rmtree(tmp, ignore_errors=True)
-    tmp.mkdir(parents=True, exist_ok=True)
-    try:
-        with tarfile.open(tar) as t:
-            t.extractall(tmp)
-    except Exception as e:
-        warn(f"OpenSSL XCurl set archive unreadable ({e}).")
-        shutil.rmtree(tmp, ignore_errors=True)
-        tar.unlink(missing_ok=True)
-        return have
+        url = None
+        for rel in rels or []:
+            url, _name, _ = asset_url(rel, lambda n: n == asset)
+            if url:
+                break
+        if not url:
+            warn(f"OpenSSL XCurl set asset '{asset}' not published yet.")
+            return have
+        tar = CACHE / asset
+    expected_hash = OPENSSL_XCURL_ARCHIVE_SHA256.strip().lower()
+    retry_available = not local_archive
+    while True:
+        if not tar.is_file():
+            if local_archive:
+                return have
+            info("Downloading the online-login components (one-time) …")
+            try:
+                download(url, tar, "Online-login components")
+            except BolError:
+                return have
+
+        invalid = False
+        try:
+            actual_hash = hashlib.sha256(tar.read_bytes()).hexdigest()
+        except OSError as e:
+            warn(f"OpenSSL XCurl set archive unreadable ({e}).")
+            invalid = True
+        else:
+            if actual_hash != expected_hash:
+                warn("OpenSSL XCurl set archive SHA-256 mismatch (expected %s, "
+                     "got %s)." % (expected_hash, actual_hash))
+                invalid = True
+
+        tmp = None
+        if not invalid:
+            OPENSSL_XCURL_SET.parent.mkdir(parents=True, exist_ok=True)
+            tmp = Path(tempfile.mkdtemp(
+                prefix=".set-dl-", dir=OPENSSL_XCURL_SET.parent))
+            try:
+                with tarfile.open(tar) as archive:
+                    safe_extract_tar(archive, tmp)
+            except Exception as e:
+                warn(f"OpenSSL XCurl set archive unreadable ({e}).")
+                shutil.rmtree(tmp, ignore_errors=True)
+                tmp = None
+                invalid = True
+
+        if not invalid:
+            break
+        # A sibling is an explicit local candidate. Never delete or silently
+        # replace it with unrelated network bytes when its pin/TAR is invalid.
+        if local_archive:
+            return have
+        try:
+            tar.unlink(missing_ok=True)
+        except OSError as e:
+            warn(f"Could not remove invalid OpenSSL XCurl cache ({e}).")
+            return have
+        if not retry_available:
+            return have
+        # Retry exactly once in this call. The release lookup is deliberately
+        # not repeated; only the reviewed asset URL above is downloaded again.
+        retry_available = False
+
+    assert tmp is not None
     # Merge into the set dir (don't blow away a maintainer's working tree),
     # then stamp the rev so we skip next time.
-    OPENSSL_XCURL_SET.mkdir(parents=True, exist_ok=True)
-    for f in tmp.iterdir():
-        if f.is_file():
-            shutil.copy2(f, OPENSSL_XCURL_SET / f.name)
-    shutil.rmtree(tmp, ignore_errors=True)
-    marker.write_text(OPENSSL_XCURL_REV)
+    try:
+        OPENSSL_XCURL_SET.mkdir(parents=True, exist_ok=True)
+        for f in tmp.iterdir():
+            if f.is_file() and not f.is_symlink():
+                destination = OPENSSL_XCURL_SET / f.name
+                fd, temporary_name = tempfile.mkstemp(
+                    prefix="." + f.name + "-", dir=OPENSSL_XCURL_SET)
+                os.close(fd)
+                temporary = Path(temporary_name)
+                try:
+                    shutil.copy2(f, temporary)
+                    temporary.replace(destination)
+                finally:
+                    temporary.unlink(missing_ok=True)
+        marker_fd, marker_name = tempfile.mkstemp(
+            prefix=".rev-", dir=OPENSSL_XCURL_SET)
+        marker_tmp = Path(marker_name)
+        try:
+            with os.fdopen(marker_fd, "w") as marker_stream:
+                marker_stream.write(OPENSSL_XCURL_REV)
+            marker_tmp.replace(marker)
+        finally:
+            marker_tmp.unlink(missing_ok=True)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
     ok("Online-login components ready.")
     return True
 
@@ -191,7 +269,7 @@ def _install_openssl_xcurl(game_dir: Path):
     curl_easy_init and forwards everything else), xcurl_real.dll = the real
     OpenSSL libcurl, plus cacert.pem and the libssl/zlib dependency set.
     Idempotent."""
-    ensure_openssl_xcurl_set()                 # fetch the 20 MB set on first use
+    ensure_openssl_xcurl_set()
     s = OPENSSL_XCURL_SET
     libcurl = s / "libcurl-4.dll"
     shim = s / "xcurl-cashim.dll"
@@ -214,12 +292,9 @@ def _install_openssl_xcurl(game_dir: Path):
                                                   ".1export-bak")):
             continue
         shutil.copy2(dll, game_dir / dll.name)
-    # the real OpenSSL libcurl the shim forwards to
     shutil.copy2(libcurl, game_dir / "xcurl_real.dll")
-    # the CA-injecting shim becomes XCurl.dll (both casings libHttpClient probes)
     for nm in ("XCurl.dll", "Xcurl.dll"):
         shutil.copy2(shim, game_dir / nm)
-    # the CA bundle the shim points CURLOPT_CAINFO at (fix_curl_ssl downloads it)
     cacert = CACHE / "cacert.pem"
     if not cacert.exists():
         try:
@@ -265,7 +340,7 @@ def _install_cryptbase_in_prefix(pfx=None):
         import hashlib
         if dst.exists() and hashlib.sha1(dst.read_bytes()).digest() == \
                 hashlib.sha1(src.read_bytes()).digest():
-            return                                  # already our stub
+            return
         # An existing prefix cryptbase may be a non-functional placeholder —
         # replace it, keeping a one-time backup.
         bak = sys32 / "cryptbase.dll.bol-orig"

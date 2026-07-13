@@ -69,6 +69,40 @@
   </content_rating>
 
   <releases>
+    <release version="1.3.0" date="2026-07-13">
+      <description>
+        <p>Fixes the menu, ESC/back, pause, and dialog freeze reported in
+           issues #27, #29, and #30 across both old and new Vulkan drivers.</p>
+        <ul>
+          <li>ships one reviewed vkd3d-proton 3.0.1 build containing both
+              device-generated-command paths: EXT DGC on current drivers and
+              the restored NV DGC fallback on older NVIDIA drivers;</li>
+          <li>enables raw-VA root CBVs for Minecraft's indirect menu commands,
+              preventing the render-thread stall while audio continues;</li>
+          <li>removes the launcher's redundant Vulkan hardware probe and lets
+              the universal engine choose EXT/NV inside the game process;</li>
+          <li>blocks degraded FBDEV/software X11 sessions and recent fatal GPU
+              kernel faults before Wine or Vulkan starts, preventing a broken
+              host driver from turning PLAY into a full-system hard lock;</li>
+          <li>records each GPU launch durably, checks the previous kernel boot,
+              and refuses a blind retry after a power-loss interruption until
+              the repaired incident is explicitly acknowledged;</li>
+          <li>writes WineGDK/GameInput registry values offline and atomically,
+              eliminating the pre-game UMU/Explorer processes; isolates the
+              managed prefix and disables automatic kill/relaunch loops;</li>
+          <li>fixes the 1.2.9 engine updater incorrectly treating the managed
+              WineGDK engine as a custom engine, and makes engine replacement
+              validated and transactional;</li>
+          <li>reactivates the guarded Microsoft/Xbox server patches when an old
+              compatibility preference survived an engine upgrade, while
+              keeping an explicit per-revision troubleshooting fallback; and
+              refuses incomplete or expired multiplayer token payloads, also
+              on Python 3.9 and across Microsoft account changes;</li>
+          <li>adds a precise diagnostic when an old engine cannot create
+              Minecraft's ExecuteIndirect command signatures.</li>
+        </ul>
+      </description>
+    </release>
     <release version="1.2.9" date="2026-07-11">
       <description>
         <p>Makes sure the graphics-engine fix from 1.2.8 actually reaches you:

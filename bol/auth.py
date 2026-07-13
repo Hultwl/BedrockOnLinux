@@ -3,28 +3,31 @@
 
 import json
 import os
-import subprocess
+import re
 import threading
 import time
+from contextlib import contextmanager
+from pathlib import Path
 
 from .config import (
     DATA,
-    LOGS,
     MSA_CLIENT_ID,
     MSA_CONNECT,
     MSA_DIR,
     MSA_SCOPE,
     MSA_TOKEN,
+    WINEGDK_BUILD_REV,
     WINEGDK_REG,
 )
 from .log import BolError, die, err, info, ok, warn
-from .prefix import proton_umu_cmd
-from .util import http_post_form
-
-# ----------------------------------------------------------------------
-# In-game Microsoft login (this branch: no ProxyPass at all)
-# ----------------------------------------------------------------------
-
+from .prefix import active_prefix
+from .util import http_post_form, load_settings, save_settings
+from .wine_registry import (
+    reg_delete,
+    reg_dword,
+    reg_sz,
+    update_prefix_registry,
+)
 
 def msa_load():
     f = MSA_DIR / "token.json"
@@ -39,22 +42,109 @@ def msa_load():
 def msa_save(tok):
     MSA_DIR.mkdir(parents=True, exist_ok=True)
     p = MSA_DIR / "token.json"
-    p.write_text(json.dumps(tok, indent=2))
+    import tempfile
+    fd, tmp = tempfile.mkstemp(prefix=".token-", suffix=".tmp", dir=MSA_DIR)
     try:
-        os.chmod(p, 0o600)
+        with os.fdopen(fd, "w") as stream:
+            json.dump(tok, stream, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, p)
+        os.chmod(MSA_DIR, 0o700)
     except Exception:
-        pass
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def msa_signed_in():
     return bool(msa_load().get("refresh_token"))
 
 
+def _msa_facet_engine_stamp(settings):
+    managed = (settings.get("proton_source", "winegdk") == "winegdk"
+               and not settings.get("proton_dir")
+               and not settings.get("proton_url"))
+    if managed:
+        return f"winegdk:{WINEGDK_BUILD_REV}"
+    return "custom"
+
+
+def force_msa_facet_enabled():
+    """Return whether WineGDK's online-account patches should be enabled.
+
+    Older engine revisions exposed a troubleshooting toggle because their
+    forced MSA facet could dereference an absent XSAPI account object.  The
+    managed engine now carries the full-chain null guard, but an old persisted
+    ``false`` otherwise survives every launcher/engine upgrade and silently
+    leaves the Servers tab locked even after the underlying crash was fixed.
+
+    Remember the engine revision on which an explicit choice was made.  A new
+    managed revision gets one fresh attempt with online access enabled; if that
+    still fails on an unusual setup, switching it off again records the current
+    revision and remains respected.  ``BOL_DISABLE_SERVER_PATCHES=1`` is the
+    non-persistent emergency escape hatch for launches that cannot reach the
+    GUI (the earlier internal name ``BOL_DISABLE_MSA_FACET`` remains accepted).
+    """
+    disabled = (os.environ.get("BOL_DISABLE_SERVER_PATCHES")
+                or os.environ.get("BOL_DISABLE_MSA_FACET", "")).strip().lower()
+    if disabled in {"1", "true", "yes", "on"}:
+        warn("BOL_DISABLE_SERVER_PATCHES is set — Microsoft/Xbox server "
+             "access patches are disabled for this launch.")
+        return False
+
+    settings = load_settings()
+    enabled = settings.get("force_msa_facet", True)
+    current_stamp = _msa_facet_engine_stamp(settings)
+    managed = current_stamp.startswith("winegdk:")
+    stamped_rev = settings.get("force_msa_facet_engine_rev")
+    if managed and stamped_rev != current_stamp:
+        if enabled is False:
+            info("Re-enabling Microsoft/Xbox server access for the new guarded "
+                 f"engine {WINEGDK_BUILD_REV}.")
+        settings["force_msa_facet"] = True
+        settings["force_msa_facet_engine_rev"] = current_stamp
+        save_settings(settings)
+        return True
+    return bool(enabled)
+
+
+def set_force_msa_facet(enabled):
+    """Persist an explicit online-account patch choice for this engine."""
+    settings = load_settings()
+    settings["force_msa_facet"] = bool(enabled)
+    settings["force_msa_facet_engine_rev"] = _msa_facet_engine_stamp(settings)
+    save_settings(settings)
+
+
 def msa_logout():
+    """Forget account credentials without retaining reusable Xbox tokens."""
     try:
-        (MSA_DIR / "token.json").unlink(missing_ok=True)
-    except Exception:
-        pass
+        # Rotate the account generation, purge Xbox tokens and remove the MSA
+        # refresh token under one lock. An in-flight login/launch either wins
+        # before this block (and is then deleted) or observes the new epoch and
+        # is refused; it can never resurrect the old account afterwards.
+        _purge_account_preauth(MSA_DIR / "token.json")
+        if MSA_DIR.is_dir():
+            try:
+                fd = os.open(MSA_DIR, os.O_RDONLY
+                             | getattr(os, "O_DIRECTORY", 0))
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+            except OSError:
+                pass
+    except Exception as exc:
+        # Fail closed: keeping the current account linked is safer than showing
+        # "signed out" while its old XSTS cache could survive for a new login.
+        raise BolError("Could not safely clear the Microsoft/Xbox account "
+                       "cache; sign-out was cancelled.") from exc
+    return True
 
 
 def msa_refresh(refresh_token):
@@ -73,9 +163,9 @@ class NativeAuth:
     ProxyPass (`.auth`, `.start`, `.stop`, `.running`)."""
 
     def __init__(self):
-        self.auth = None        # (url, code)
+        self.auth = None
         self.online = False
-        self.proc = None        # GUI compatibility (no subprocess here)
+        self.proc = None
         self.dest = None
         self._stop = False
 
@@ -93,11 +183,19 @@ class NativeAuth:
             ok("Microsoft account already linked (in-game login)")
             return
         self._stop = False
-        threading.Thread(target=self._flow, args=(on_auth, on_online),
+        # Capture the account generation synchronously before the worker can
+        # race a Sign-out. A token response from this flow may only be stored
+        # while this exact generation is still current.
+        account_epoch = _account_cache_epoch(DATA / "winegdk-preauth")
+        threading.Thread(target=self._flow,
+                          args=(on_auth, on_online, account_epoch),
                           daemon=True).start()
 
-    def _flow(self, on_auth, on_online):
+    def _flow(self, on_auth, on_online, account_epoch=None):
         try:
+            if account_epoch is None:
+                account_epoch = _account_cache_epoch(
+                    DATA / "winegdk-preauth")
             d = http_post_form(MSA_CONNECT, {
                 "client_id": MSA_CLIENT_ID, "scope": MSA_SCOPE,
                 "response_type": "device_code"})
@@ -115,10 +213,14 @@ class NativeAuth:
             dc = d["device_code"]
             while not self._stop and time.time() < deadline:
                 time.sleep(interval)
+                if self._stop:
+                    return
                 # Legacy live.com grant string — matches WineGDK XUser.c.
                 t = http_post_form(MSA_TOKEN, {
                     "client_id": MSA_CLIENT_ID,
                     "grant_type": "device_code", "device_code": dc})
+                if self._stop:
+                    return
                 e = t.get("error")
                 if e == "authorization_pending":
                     continue
@@ -129,8 +231,15 @@ class NativeAuth:
                     die(f"Microsoft sign-in failed: "
                         f"{t.get('error_description') or e}")
                 if t.get("refresh_token"):
-                    msa_save({"refresh_token": t["refresh_token"],
-                              "obtained": int(time.time())})
+                    token = {"refresh_token": t["refresh_token"],
+                             "obtained": int(time.time())}
+                    if not msa_save_for_account_epoch(token, account_epoch):
+                        warn("Microsoft sign-in response arrived after the "
+                             "account was signed out; discarded it.")
+                        return
+                    if self._stop or _account_cache_epoch(
+                            DATA / "winegdk-preauth") != account_epoch:
+                        return
                     self.auth = None
                     self.online = True
                     if on_online:
@@ -161,26 +270,300 @@ class _HttpResp:
         return json.loads(self._raw)
 
 
-def xbl_preauth(msa_access_token):
+_ONLINE_PREAUTH_REQUIREMENTS = {
+    "device_token": "device_token_expiry",
+    "user_token": "user_token_expiry",
+    "xbl_token": "xbl_token_expiry",
+    "sisu_token": "sisu_expiry",
+    "sisu_rp": None,
+    "sisu_uhs": None,
+    "mp_token": "mp_expiry",
+    "mp_rp": None,
+    "mp_uhs": None,
+    "xbl_xuid": None,
+}
+
+
+_XBOX_SUBMICROSECOND_FRACTION = re.compile(
+    r"(\.\d{6})\d+(?=(?:Z|[+-]\d{2}:\d{2})?$)"
+)
+
+
+def _normalize_xbox_expiry(raw):
+    """Convert Xbox's ISO timestamp to Python 3.9's accepted grammar."""
+    normalized = _XBOX_SUBMICROSECOND_FRACTION.sub(r"\1", raw.strip())
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
+    return normalized
+
+
+def _parse_xbox_expiry(raw):
+    """Parse an Xbox ``NotAfter`` timestamp on every supported Python.
+
+    Xbox currently returns seven fractional-second digits (100 ns precision),
+    while :meth:`datetime.datetime.fromisoformat` on Python 3.9 accepts only
+    three or six.  Discarding precision below one microsecond is harmless for
+    expiry checks and keeps the portable zipapp compatible with Python 3.9.
+    """
+    from datetime import datetime
+
+    return datetime.fromisoformat(_normalize_xbox_expiry(raw))
+
+
+def _online_preauth_problems(payload, now=None, min_ttl=60):
+    """Describe missing or expired fields in an online pre-auth payload."""
+    from datetime import timezone
+
+    if not isinstance(payload, dict):
+        return ["invalid JSON object"]
+    now = time.time() if now is None else now
+    problems = []
+    for field, expiry_field in _ONLINE_PREAUTH_REQUIREMENTS.items():
+        if not payload.get(field):
+            problems.append(f"missing {field}")
+            continue
+        if not expiry_field:
+            continue
+        raw = payload.get(expiry_field)
+        if not isinstance(raw, str) or not raw.strip():
+            problems.append(f"missing {expiry_field}")
+            continue
+        try:
+            stamp = _parse_xbox_expiry(raw)
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=timezone.utc)
+            if stamp.timestamp() <= now + min_ttl:
+                problems.append(f"expired {field}")
+        except (ValueError, OverflowError):
+            problems.append(f"invalid {expiry_field}")
+    return problems
+
+
+def _load_online_preauth(path):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+@contextmanager
+def _account_cache_lock(cache):
+    """Serialize account-token stores and logout purges."""
+    import fcntl
+
+    cache.mkdir(parents=True, exist_ok=True)
+    lock_path = cache / ".account-cache.lock"
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        os.chmod(lock_path, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def _account_cache_epoch(cache):
+    """Return the logout generation; legacy installs have no marker yet."""
+    marker = cache / ".account-epoch"
+    try:
+        value = marker.read_text().strip()
+    except FileNotFoundError:
+        return "legacy"
+    except OSError:
+        return None
+    if re.fullmatch(r"[0-9a-f]{32}", value):
+        return value
+    return None
+
+
+def _cached_account_matches(payload, epoch):
+    if (epoch is None or not isinstance(payload, dict)
+            or (epoch != "legacy"
+                and not re.fullmatch(r"[0-9a-f]{32}", epoch))):
+        return False
+    return payload.get("_account_epoch", "legacy") == epoch
+
+
+def msa_save_for_account_epoch(token, expected_epoch):
+    """Store a login response only if no logout rotated its generation.
+
+    The same cache lock serializes this check with ``_purge_account_preauth``.
+    If saving wins, the following logout deletes the token; if logout wins,
+    the generation mismatch rejects the in-flight response.
+    """
+
+    if (expected_epoch != "legacy"
+            and (not isinstance(expected_epoch, str)
+                 or not re.fullmatch(r"[0-9a-f]{32}", expected_epoch))):
+        return False
+    cache = DATA / "winegdk-preauth"
+    with _account_cache_lock(cache):
+        if _account_cache_epoch(cache) != expected_epoch:
+            return False
+        msa_save(token)
+    return True
+
+
+def msa_session_snapshot():
+    """Read the refresh token and account generation atomically."""
+
+    cache = DATA / "winegdk-preauth"
+    with _account_cache_lock(cache):
+        return msa_load(), _account_cache_epoch(cache)
+
+
+def account_epoch_is_current(expected_epoch):
+    """Check a launch's account generation under the same logout lock."""
+
+    cache = DATA / "winegdk-preauth"
+    with _account_cache_lock(cache):
+        return (_account_cache_epoch(cache) == expected_epoch
+                and expected_epoch is not None)
+
+
+def _purge_account_preauth(msa_token_path=None):
+    """Invalidate and remove account-bound XSTS data, preserving device keys."""
+    import tempfile
+
+    cache = DATA / "winegdk-preauth"
+    cache.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(cache, 0o700)
+    except OSError:
+        pass
+    with _account_cache_lock(cache):
+        # Rotate first. If power is lost before unlink, any old device.json is
+        # still rejected on the next run because its generation no longer
+        # matches. device-key.pem and device-id.txt deliberately survive.
+        fd, tmp = tempfile.mkstemp(prefix=".account-epoch-", suffix=".tmp",
+                                   dir=cache)
+        staged = tmp
+        try:
+            with os.fdopen(fd, "w") as stream:
+                stream.write(os.urandom(16).hex() + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.chmod(staged, 0o600)
+            os.replace(staged, cache / ".account-epoch")
+            staged = None
+        finally:
+            if staged is not None:
+                try:
+                    os.unlink(staged)
+                except OSError:
+                    pass
+
+        (cache / "device.json").unlink(missing_ok=True)
+        # A hard power-off may leave a pre-rename file containing the same
+        # account tokens. It is never loaded, but remove it on logout as well.
+        for stale in cache.glob(".device-*.tmp"):
+            stale.unlink(missing_ok=True)
+        if msa_token_path is not None:
+            Path(msa_token_path).unlink(missing_ok=True)
+        try:
+            dir_fd = os.open(cache, os.O_RDONLY
+                             | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
+
+
+def _store_online_preauth(path, payload, expected_epoch=None):
+    """Atomically persist a complete online payload; never store a partial."""
+    if _online_preauth_problems(payload):
+        return False
+    import tempfile
+    with _account_cache_lock(path.parent):
+        current_epoch = _account_cache_epoch(path.parent)
+        if current_epoch is None:
+            return False
+        if (expected_epoch is not None
+                and current_epoch != expected_epoch):
+            return False
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".device-",
+                                   suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(json.dumps(payload, indent=2))
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, path)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    return True
+
+
+def xbl_preauth(msa_access_token, expected_account_epoch=None):
     """Run the whole Xbox Live auth chain (device + user + SISU tokens) from
     the host's OpenSSL stack and persist it as winegdk-preauth/device.json,
     where xgameruntime.dll short-circuits its own HTTP calls.
 
     Needed because Azure TCP-RSTs every *.auth.xboxlive.com / sisu call made
     through Wine's GnuTLS (fingerprinted as non-Schannel) — the same requests
-    from the host succeed. Returns True if at least the device token landed;
-    False lets the caller fall back to the Wine-side path."""
+    from the host succeed. Returns True only when a complete, unexpired online
+    payload (including the multiplayer XSTS token) is available. A failed
+    refresh never overwrites a previously valid payload with device-only data.
+    """
     import base64, uuid as _uuid
+    cache = DATA / "winegdk-preauth"
+    cache.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(cache, 0o700)
+    except OSError:
+        pass
+    out_path = cache / "device.json"
+    current_epoch = _account_cache_epoch(cache)
+    account_epoch = (current_epoch if expected_account_epoch is None
+                     else expected_account_epoch)
+    if current_epoch != account_epoch or account_epoch is None:
+        warn("xbl_preauth: the Microsoft account changed before Xbox "
+             "pre-auth started; refusing stale credentials.")
+        return False
+    if account_epoch is None:
+        warn("Xbox Live pre-auth: account-cache generation is invalid or "
+             "unreadable; refusing cached credentials. Sign out and sign in "
+             "again to rebuild it safely.")
+        return False
+    cached = _load_online_preauth(out_path)
+    cached_ready = (_cached_account_matches(cached, account_epoch)
+                    and not _online_preauth_problems(cached))
+
+    def _fallback(message):
+        warn(message)
+        current_epoch = _account_cache_epoch(cache)
+        current_ready = (
+            current_epoch == account_epoch
+            and _cached_account_matches(cached, account_epoch)
+            and not _online_preauth_problems(cached)
+        )
+        if current_ready:
+            info("Xbox Live pre-auth: keeping the complete unexpired cached "
+                 "online tokens.")
+            return True
+        if cached_ready and current_epoch == account_epoch:
+            warn("Xbox Live pre-auth: cached online tokens expired while the "
+                 "refresh was in progress; refusing stale credentials.")
+        return False
+
+    if not msa_access_token:
+        return _fallback("xbl_preauth: no fresh Microsoft access token; cannot "
+                         "refresh the Xbox multiplayer chain.")
     try:
         from cryptography.hazmat.primitives.asymmetric import ec
         from cryptography.hazmat.primitives import hashes, serialization
     except ImportError as e:
-        warn(f"xbl_preauth: missing Python dep ({e}) — skipping")
-        return False
-    cache = DATA / "winegdk-preauth"
-    cache.mkdir(parents=True, exist_ok=True)
+        return _fallback(f"xbl_preauth: missing Python dep ({e}) — cannot "
+                         "refresh online tokens.")
     key_path = cache / "device-key.pem"
-    out_path = cache / "device.json"
     # Reuse persisted EC P-256 key + UUID across launches so Xbox Live sees
     # the same device on every session.
     if key_path.exists() and (cache / "device-id.txt").exists():
@@ -200,6 +583,10 @@ def xbl_preauth(msa_access_token):
                                        serialization.PrivateFormat.PKCS8,
                                        serialization.NoEncryption()))
         (cache / "device-id.txt").write_text(device_id)
+    try:
+        os.chmod(key_path, 0o600)
+    except OSError:
+        pass
     pub_numbers = priv.public_key().public_numbers()
     x_b64 = base64.b64encode(pub_numbers.x.to_bytes(32, "big")).decode()
     y_b64 = base64.b64encode(pub_numbers.y.to_bytes(32, "big")).decode()
@@ -245,7 +632,6 @@ def xbl_preauth(msa_access_token):
         except urllib.error.HTTPError as e:
             return _HttpResp(e.code, e.read())
 
-    # ---- 1. /device/authenticate ----
     try:
         r = _xbl_post("https://device.auth.xboxlive.com/device/authenticate", {
             "RelyingParty": "http://auth.xboxlive.com",
@@ -259,15 +645,13 @@ def xbl_preauth(msa_access_token):
             },
         })
     except Exception as e:
-        warn(f"xbl_preauth: device.auth POST failed: {e}")
-        return False
+        return _fallback(f"xbl_preauth: device.auth POST failed: {e}")
     if r.status_code != 200:
-        warn(f"xbl_preauth: device.auth HTTP {r.status_code} — {r.text[:200]}")
-        return False
+        return _fallback(f"xbl_preauth: device.auth HTTP {r.status_code} — "
+                         f"{r.text[:200]}")
     j = r.json()
     device_token = j["Token"]
 
-    # ---- 2. /user/authenticate (AuthMethod=RPS, RpsTicket="t=<token>") ----
     user_token = None
     user_token_expiry = None
     if msa_access_token:
@@ -326,7 +710,6 @@ def xbl_preauth(msa_access_token):
     except (KeyError, IndexError, TypeError):
         pass
 
-    # ---- 3b. sisu /authorize for the PlayFab RP MC pins ----
     pf_sisu = _sisu("https://b980a380.minecraft.playfabapi.com/") or {}
     pf_auth = pf_sisu.get("AuthorizationToken", {}) if pf_sisu else {}
     sisu_rp = "https://b980a380.minecraft.playfabapi.com/" if pf_auth.get("Token") else None
@@ -384,58 +767,50 @@ def xbl_preauth(msa_access_token):
         + priv_d.to_bytes(32, "big")
     )
     out = {
+        # Logout rotates this non-secret generation before deleting the file.
+        # It prevents an in-flight request or a crash-left cache from crossing
+        # into the next Microsoft account.
+        "_account_epoch": account_epoch,
         "device_id": device_id,
         "ecc_private_blob_b64": base64.b64encode(ecc_blob).decode(),
         "device_token": device_token,
         "device_token_expiry": j.get("NotAfter", ""),
         "user_token": user_token,
         "user_token_expiry": user_token_expiry,
-        # SISU for http://xboxlive.com — used as the bootstrap XSTS token MC
-        # extracts xuid/gamertag/agegroup from in LoadDefaultUser.
         "xbl_token": xbl_token,
         "xbl_token_expiry": xbl_expiry,
         "xbl_xuid": xbl_claims.get("xid"),
         "xbl_gamertag": xbl_claims.get("gtg"),
         "xbl_age_group": xbl_claims.get("agg"),
         "xbl_uhs": xbl_claims.get("uhs"),
-        # SISU for the PlayFab RP — cached and used by
-        # XUserGetTokenAndSignatureProvider so it never re-hits sisu.xboxlive.
         "sisu_rp": sisu_rp,
         "sisu_token": sisu_token,
         "sisu_uhs": sisu_uhs,
         "sisu_expiry": sisu_expiry,
-        # SISU for the multiplayer RP — same idea, used when joining a
-        # third-party/external server (https://multiplayer.minecraft.net/).
         "mp_rp": mp_rp,
         "mp_token": mp_token,
         "mp_uhs": mp_uhs,
         "mp_expiry": mp_expiry,
-        # SISU for the licensing RP — used by the in-game Marketplace
-        # (http://licensing.xboxlive.com).
         "lic_rp": lic_rp,
         "lic_token": lic_token,
         "lic_uhs": lic_uhs,
         "lic_expiry": lic_expiry,
         "obtained": int(_time.time()),
     }
+    problems = _online_preauth_problems(out)
+    if problems:
+        return _fallback("xbl_preauth: incomplete online chain ("
+                         + ", ".join(problems) + "); refusing to replace "
+                         "device.json with a partial payload.")
     # Atomic write: two launches (or a launch racing a stale one) both ran
     # xbl_preauth and a plain write_text let their output interleave, leaving a
     # corrupted xbl_xuid in device.json — which the game then loads and faults
     # on. Write to a temp file in the same dir and rename, so a reader only ever
     # sees a complete file and the last writer wins cleanly.
-    import tempfile
-    fd, tmp = tempfile.mkstemp(dir=str(out_path.parent), prefix=".device-",
-                               suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w") as f:
-            f.write(json.dumps(out, indent=2))
-        os.replace(tmp, out_path)
-    except Exception:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+    if not _store_online_preauth(out_path, out,
+                                 expected_epoch=account_epoch):
+        return _fallback("xbl_preauth: account changed while refreshing; "
+                         "refusing to store or reuse the old online payload.")
     bits = ["device"]
     if user_token: bits.append("user")
     if xbl_token: bits.append(f"XBL(xuid={xbl_claims.get('xid')},gtg={xbl_claims.get('gtg')})")
@@ -448,24 +823,25 @@ def xbl_preauth(msa_access_token):
 
 def wine_reg_set_refresh_token(token):
     """Seed the MSA refresh token where WineGDK's XUser reads it
-    (HKLM\\Software\\Wine\\WineGDK 'RefreshToken'), written through the same
-    proton/umu runtime (and prefix) used to launch the game."""
-    cmd, env = proton_umu_cmd("reg")
-    cmd += ["add", "HKLM\\" + WINEGDK_REG, "/v", "RefreshToken",
-            "/t", "REG_SZ", "/d", token, "/f"]
-    LOGS.mkdir(parents=True, exist_ok=True)
-    log = open(LOGS / "native-login.log", "w")
-    try:
-        rc = subprocess.run(cmd, env=env, stdout=log,
-                            stderr=subprocess.STDOUT, timeout=120).returncode
-    except Exception as e:
-        warn(f"Could not write WineGDK RefreshToken: {e}")
+    (HKLM\\Software\\Wine\\WineGDK 'RefreshToken').  The prefix is offline at
+    this point, so write ``system.reg`` atomically instead of starting a whole
+    UMU/Wine/Explorer session merely to run ``reg.exe``.  Apart from being much
+    faster, this avoids a second graphics-driver initialisation before the
+    actual game."""
+    if not isinstance(token, str) or not token or "\x00" in token:
+        warn("Could not write WineGDK RefreshToken: invalid token value.")
         return False
-    if rc == 0:
-        ok("In-game login token written to the Wine prefix")
-        return True
-    warn(f"reg add returned {rc} — see logs/native-login.log")
-    return False
+    try:
+        update_prefix_registry(
+            active_prefix(),
+            machine=[reg_sz(WINEGDK_REG, "RefreshToken", token)],
+        )
+    except Exception as e:
+        # Never include the token in an exception/log message.
+        warn(f"Could not write WineGDK RefreshToken offline: {type(e).__name__}")
+        return False
+    ok("In-game login token written to the offline Wine prefix")
+    return True
 
 
 def wine_apply_winegdk_prereqs():
@@ -473,49 +849,37 @@ def wine_apply_winegdk_prereqs():
     1 = Win32 PC would block the Servers tab as a 'dev build'), TLS 1.2
     forced, and the WindowsAppRuntime UI-mute env vars in HKCU\\Environment
     (pressure-vessel filters MICROSOFT_* out of the host env)."""
-    LOGS.mkdir(parents=True, exist_ok=True)
-    log = open(LOGS / "native-login.log", "a")
-    def _regadd(*args):
-        cmd, env = proton_umu_cmd("reg")
-        cmd += ["add", *args, "/f"]
-        try:
-            subprocess.run(cmd, env=env, stdout=log,
-                           stderr=subprocess.STDOUT, timeout=120)
-        except Exception as e:
-            warn(f"reg add {args[0]} failed: {e}")
-    def _regdel(key, value):
-        cmd, env = proton_umu_cmd("reg")
-        cmd += ["delete", key, "/v", value, "/f"]
-        try:
-            subprocess.run(cmd, env=env, stdout=log,
-                           stderr=subprocess.STDOUT, timeout=120)
-        except Exception as e:
-            warn(f"reg delete {key} failed: {e}")
-    _regadd(r"HKLM\Software\Microsoft\Windows NT\CurrentVersion\OEM",
-            "/v", "ConsoleMode", "/t", "REG_DWORD", "/d", "8")
+    machine = [
+        reg_dword(r"Software\Microsoft\Windows NT\CurrentVersion\OEM",
+                  "ConsoleMode", 8),
+    ]
     # Force the in-game "signed in with Microsoft" facet (unlocks the Servers
     # tab). The engine reads this and applies the patch only when 1 (default);
     # users whose game crashes on launch (the XSAPI account object never
     # populates under Wine — issue #17/#18) set it 0 to fall back to the
     # pre-patch behaviour (Servers greyed, but the game runs).
-    from .util import load_settings
-    _regadd(r"HKLM\Software\Wine\WineGDK", "/v", "ForceMsaFacet",
-            "/t", "REG_DWORD", "/d",
-            "1" if load_settings().get("force_msa_facet", True) else "0")
+    facet_enabled = force_msa_facet_enabled()
+    machine.append(reg_dword(WINEGDK_REG, "ForceMsaFacet",
+                             1 if facet_enabled else 0))
     # Azure rejects Wine GnuTLS' TLS 1.3 handshake (7-byte fatal Alert →
     # 0x80090304); forcing TLS 1.2 via DefaultSecureProtocols lets the
     # SISU/XSTS and PlayFab POSTs through.
-    _regadd(r"HKLM\Software\Microsoft\Windows\CurrentVersion\Internet Settings\WinHttp",
-            "/v", "DefaultSecureProtocols", "/t", "REG_DWORD", "/d", "2560")
-    _regadd(r"HKLM\Software\Microsoft\SchannelTLS\Protocols\TLS 1.3\Client",
-            "/v", "DisabledByDefault", "/t", "REG_DWORD", "/d", "1")
+    machine.extend([
+        reg_dword(
+            r"Software\Microsoft\Windows\CurrentVersion\Internet Settings\WinHttp",
+            "DefaultSecureProtocols", 2560),
+        reg_dword(
+            r"Software\Microsoft\SchannelTLS\Protocols\TLS 1.3\Client",
+            "DisabledByDefault", 1),
+    ])
+    user = []
     for name, val in (
         ("MICROSOFT_WINDOWSAPPRUNTIME_BOOTSTRAP_INITIALIZE_SHOWUI", "0"),
         ("MICROSOFT_WINDOWSAPPRUNTIME_BOOTSTRAP_INITIALIZE_FAILFAST", "0"),
         ("MICROSOFT_WINDOWSAPPRUNTIME_DEPLOYMENT_INITIALIZE_ONERRORSHOWUI",
          "0"),
     ):
-        _regadd(r"HKCU\Environment", "/v", name, "/t", "REG_SZ", "/d", val)
+        user.append(reg_sz("Environment", name, val))
     # Issue #26: in windowed mode the mouse cursor escapes the game window when
     # the player looks around. Minecraft confines the cursor with ClipCursor
     # during mouse-look, but under Wine that grab is unreliable for an
@@ -525,9 +889,8 @@ def wine_apply_winegdk_prereqs():
     # owning X window it fully controls, which makes ClipCursor confine to the
     # game window reliably. Opt-in (setting `confine_cursor` / env
     # BOL_CONFINE_CURSOR=1) because it changes windowing for the whole prefix.
-    # A persisted marker keeps the common (off) path from paying two extra
-    # `wine reg` calls every launch, while still reverting cleanly on toggle-off.
-    from .util import _screen_wh, save_settings
+    # A persisted marker lets the common path revert cleanly on toggle-off.
+    from .util import _screen_wh
     confine = (os.environ.get("BOL_CONFINE_CURSOR", "").lower()
                in ("1", "yes", "on", "true")
                or load_settings().get("confine_cursor", False))
@@ -535,19 +898,36 @@ def wine_apply_winegdk_prereqs():
     if confine:
         # Re-ensure every launch (not just on the enable edge) so the keys
         # survive a prefix reset, which recreates the prefix and would wipe
-        # them. Only opt-in users reach this path, so the extra reg calls are
-        # never paid by the default-off majority.
+        # them.
         wh = _screen_wh() or ("1920", "1080")
-        _regadd(r"HKCU\Software\Wine\Explorer", "/v", "Desktop",
-                "/t", "REG_SZ", "/d", "Default")
-        _regadd(r"HKCU\Software\Wine\Explorer\Desktops", "/v", "Default",
-                "/t", "REG_SZ", "/d", f"{wh[0]}x{wh[1]}")
+        user.extend([
+            reg_sz(r"Software\Wine\Explorer", "Desktop", "Default"),
+            reg_sz(r"Software\Wine\Explorer\Desktops", "Default",
+                   f"{wh[0]}x{wh[1]}"),
+        ])
+    elif applied:
+        user.extend([
+            reg_delete(r"Software\Wine\Explorer", "Desktop"),
+            reg_delete(r"Software\Wine\Explorer\Desktops", "Default"),
+        ])
+
+    try:
+        update_prefix_registry(active_prefix(), machine=machine, user=user)
+    except Exception as e:
+        die("Could not configure the offline WineGDK registry safely "
+            f"({type(e).__name__}). Repair the managed Wine prefix and try "
+            "again.")
+
+    if confine:
         if not applied:
-            s2 = load_settings(); s2["_confine_applied"] = True; save_settings(s2)
+            s2 = load_settings()
+            s2["_confine_applied"] = True
+            save_settings(s2)
         ok(f"Cursor confinement ON (virtual desktop {wh[0]}x{wh[1]}).")
     elif applied:
-        _regdel(r"HKCU\Software\Wine\Explorer", "Desktop")
-        _regdel(r"HKCU\Software\Wine\Explorer\Desktops", "Default")
-        s2 = load_settings(); s2["_confine_applied"] = False; save_settings(s2)
+        s2 = load_settings()
+        s2["_confine_applied"] = False
+        save_settings(s2)
         ok("Cursor confinement OFF (virtual desktop removed).")
-    ok("WineGDK prereqs applied (ConsoleMode=8, TLS 1.2 forced, UI muted)")
+    ok("WineGDK prereqs applied offline (ConsoleMode=8, TLS 1.2 forced, "
+       "UI muted)")

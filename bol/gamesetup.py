@@ -11,17 +11,29 @@ from .fixups import fix_curl_ssl, hide_signin_button, install_gdk_xbox_dlls
 from .gameinput import install_gameinput
 from .games import _auto_mc_version, _game_root, download_game, use_game_dir
 from .log import info, ok, warn
-from .prefix import active_prefix, boot_prefix, ensure_umu
+from .prefix import (
+    active_prefix,
+    boot_prefix,
+    ensure_umu,
+    prefix_operation_lock,
+)
 from .proton import ensure_proton
 from .util import load_settings, mkdirs
 from .winegdk import ensure_winegdk
 
-def do_setup(game_dir=None, mc_ver=None, proton_tag=None, pp_tag=None,
-             force=False, progress=None):
+def do_setup(game_dir=None, mc_ver=None, proton_tag=None, force=False,
+             progress=None):
+    """Install/update shared game, engine and prefix state exclusively."""
+    with prefix_operation_lock("install or update BedrockOnLinux"):
+        return _do_setup(game_dir, mc_ver, proton_tag, force, progress)
+
+
+def _do_setup(game_dir=None, mc_ver=None, proton_tag=None, force=False,
+              progress=None):
     mkdirs()
     s = load_settings()
-    ensure_login_deps()                        # cryptography for native login
-    if mc_ver:                                 # download chosen MC version
+    ensure_login_deps()
+    if mc_ver:
         use_game_dir(download_game(mc_ver, progress, force=force))
     elif game_dir and _game_root(Path(game_dir).expanduser()):
         use_game_dir(game_dir)
@@ -33,18 +45,25 @@ def do_setup(game_dir=None, mc_ver=None, proton_tag=None, pp_tag=None,
     gd = Path(load_settings()["game_dir"])
     if load_settings().get("proton_source") == "winegdk":
         ensure_winegdk(force, progress)
-        install_gdk_xbox_dlls(gd)       # before fix_curl_ssl, which keeps XCurl
+        install_gdk_xbox_dlls(gd)
     else:
-        ensure_proton(proton_tag, force, progress)  # user-supplied dir/url
+        ensure_proton(proton_tag, force, progress)
     ensure_umu(force)
     fix_curl_ssl(gd)
-    boot_prefix()                              # create the prefix (system32) first
+    boot_prefix()
     install_gameinput(active_prefix(), gd)
-    hide_signin_button(gd)                     # cosmetic: drop the dead in-game Sign-in button
+    hide_signin_button(gd)
     ok("Setup complete — click PLAY, then sign in to Microsoft in-game.")
 
 
 _DIAG_RULES = [
+    (r"d3d12_command_signature_init_state_template_dgc_(?:ext|nv):.*"
+     r"Cannot implement command signature|"
+     r"d3d12_command_signature_create: Device generated commands is not "
+     r"supported by implementation",
+     "The installed engine cannot run Minecraft's ExecuteIndirect menu path "
+     "on this Vulkan driver — install the 1.3.0 compatibility engine "
+     "('bedrock-on-linux setup --force')."),
     (r"Unimplemented function combase\.dll\.RoOriginateError|"
      r"RoOriginateErrorW",
      "combase patch missing — re-run 'Install / Update'."),
@@ -106,6 +125,16 @@ def diagnose():
     # engine.
     if re.search(r"InitializeApiImplEx2 patched|preauth: loaded user/XSTS", text):
         hits = [h for h in hits if "no WineGDK XUser" not in h]
+    settings = load_settings()
+    server_patches = settings.get("force_msa_facet", True)
+    if not server_patches:
+        hits.append("Microsoft/Xbox server access is disabled in Settings — "
+                    "enable it before PLAY to unlock the Servers tab.")
+    elif re.search(r"preauth: loaded user/XSTS", text, re.I) and not re.search(
+            r"patched online-server join gate", text, re.I):
+        hits.append("Xbox tokens loaded, but the WineGDK online-server memory "
+                    "patch did not activate — reinstall/update the managed "
+                    "compatibility engine before trying Servers again.")
     # Software-rendering fallback: if DXVK/vkd3d only found llvmpipe (Mesa's CPU
     # rasteriser) and no real GPU Vulkan device, the GPU driver isn't active in
     # the container. The game then runs on the CPU — slow, and the OreUI Play

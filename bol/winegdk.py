@@ -1,304 +1,415 @@
-"""bol.winegdk — WineGDK engine sync, build and prebuilt install."""
+"""Install and validate the reviewed prebuilt WineGDK engine."""
 # SPDX-License-Identifier: MIT
 
+import hashlib
 import os
+import posixpath
 import shutil
-import subprocess
+import sys
 import tarfile
-from pathlib import Path
+import tempfile
+from pathlib import Path, PurePosixPath
 
 from .config import (
     CACHE,
-    GDK_PROTON_REPO,
-    LOGS,
     PROTON_DIR,
-    WINEGDK_BRANCH,
+    WINEGDK_ARCHIVE_SHA256,
     WINEGDK_BUILD_REV,
     WINEGDK_OUT,
     WINEGDK_PREBUILT_REPO,
-    WINEGDK_REPO,
-    WINEGDK_SRC,
-    WINE_BUILD_PKGS,
 )
-from .log import BolError, die, info, ok, warn
+from .engine_lock import managed_engine_lock
+from .log import die, info, ok, warn
 from .proton import patch_proton
 from .util import (
     asset_url,
     download,
-    gh_latest,
     gh_releases,
     load_settings,
-    run,
     save_settings,
 )
 
-def _pm_hint():
-    return next((h for pm, h in (
-        ("apt-get", "sudo apt install {}"), ("dnf", "sudo dnf install {}"),
-        ("pacman", "sudo pacman -S {}"), ("zypper", "sudo zypper in {}"))
-        if shutil.which(pm)), "install: {}")
+def _extract_archive(archive, destination: Path):
+    """Extract a trusted engine archive without permitting path escapes.
+
+    Python 3.12+'s data filter also validates links and special files.  Keep a
+    lexical traversal check for supported older Python versions where that
+    filter is unavailable.
+    """
+    members = archive.getmembers()
+    symlinks = set()
+    names = set()
+    for member in members:
+        raw_name = member.name
+        name = posixpath.normpath(raw_name)
+        pure = PurePosixPath(name)
+        if (not raw_name or name in ("", ".") or pure.is_absolute()
+                or name == ".." or name.startswith("../")):
+            raise ValueError(f"unsafe path in engine archive: {raw_name}")
+        if name in names:
+            raise ValueError(f"duplicate path in engine archive: {raw_name}")
+        names.add(name)
+        if not (member.isfile() or member.isdir() or member.issym()):
+            # r11 is packed with --hard-dereference. Rejecting hard links and
+            # special/PAX-only members keeps extraction safe on Python < 3.12.
+            raise ValueError(f"unsupported entry in engine archive: {raw_name}")
+        if member.issym():
+            target = member.linkname
+            if not target or PurePosixPath(target).is_absolute():
+                raise ValueError(
+                    f"unsafe symlink in engine archive: {raw_name} -> {target}")
+            resolved = posixpath.normpath(
+                posixpath.join(posixpath.dirname(name), target))
+            if resolved == ".." or resolved.startswith("../"):
+                raise ValueError(
+                    f"unsafe symlink in engine archive: {raw_name} -> {target}")
+            symlinks.add(name)
+
+    # A regular member below a path that the archive itself makes a symlink can
+    # otherwise make old tarfile versions write through that link.
+    for name in names:
+        parts = PurePosixPath(name).parts
+        for end in range(1, len(parts)):
+            if PurePosixPath(*parts[:end]).as_posix() in symlinks:
+                raise ValueError(
+                    f"archive member is nested below a symlink: {name}")
+
+    if hasattr(tarfile, "data_filter"):
+        archive.extractall(destination, members=members, filter="data")
+    else:
+        archive.extractall(destination, members=members)
 
 
-def _stock_proton_root(progress=None):
-    """Latest Weather-OS GDK-Proton extracted to PROTON_DIR/_stock — the
-    overlay base for a WineGDK build (kept apart from the active proton)."""
-    base = PROTON_DIR / "_stock"
-    root = next(base.glob("GDK-Proton*"), None) if base.exists() else None
-    if root and (root / "proton").exists():
-        return root
-    rel = gh_latest(GDK_PROTON_REPO)
-    url, fname, _ = asset_url(rel, lambda n: n.endswith(".tar.gz"))
-    if not url:
-        die("Stock GDK-Proton archive not found.")
-    tar = CACHE / fname
-    if not tar.exists():
-        info(f"Downloading base GDK-Proton {rel['tag_name']} …")
-        download(url, tar, "GDK-Proton (base)", progress)
-    info("Extracting base GDK-Proton …")
-    shutil.rmtree(base, ignore_errors=True)
-    base.mkdir(parents=True)
-    with tarfile.open(tar) as t:
-        t.extractall(base)
-    root = next(base.glob("GDK-Proton*"))
-    if not (root / "proton").exists():
-        die("Invalid base GDK-Proton archive.")
-    return root
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
-def _winegdk_sync():
-    """Clone or shallow-update the WineGDK fork; return its HEAD commit."""
-    s = load_settings()
-    repo = s.get("winegdk_repo") or WINEGDK_REPO
-    branch = s.get("winegdk_branch") or WINEGDK_BRANCH
-    if not shutil.which("git"):
-        die("git is required — " + _pm_hint().format("git"))
-    synced = False
-    if (WINEGDK_SRC / ".git").is_dir():
-        info(f"Updating WineGDK ({branch}) …")
-        # The configured repo/branch can change (pivot) — point origin at
-        # it before fetching.
-        subprocess.run(["git", "-C", str(WINEGDK_SRC), "remote", "set-url",
-                        "origin", repo], capture_output=True)
-        if subprocess.run(["git", "-C", str(WINEGDK_SRC), "fetch",
-                           "--depth=1", "origin", branch],
-                          capture_output=True).returncode == 0 and \
-           subprocess.run(["git", "-C", str(WINEGDK_SRC), "checkout", "-q",
-                           "-B", branch, "FETCH_HEAD"],
-                          capture_output=True).returncode == 0:
-            synced = True
-        else:
-            warn("WineGDK source out of sync — re-cloning cleanly.")
-    if not synced:
-        info(f"Cloning WineGDK {repo} ({branch}) — large, one time …")
-        shutil.rmtree(WINEGDK_SRC, ignore_errors=True)
-        run(["git", "clone", "--depth=1", "--branch", branch, repo,
-             str(WINEGDK_SRC)])
-    r = subprocess.run(["git", "-C", str(WINEGDK_SRC), "rev-parse", "HEAD"],
-                        capture_output=True, text=True)
-    return r.stdout.strip()
+def _verify_engine_archive(path: Path):
+    expected = WINEGDK_ARCHIVE_SHA256.strip().lower()
+    if len(expected) != 64 or any(c not in "0123456789abcdef" for c in expected):
+        raise ValueError(
+            "launcher has no valid SHA-256 pin for engine revision %s" %
+            WINEGDK_BUILD_REV)
+    actual = _sha256_file(path)
+    if actual != expected:
+        raise ValueError(
+            "engine archive SHA-256 mismatch (expected %s, got %s)" %
+            (expected, actual))
 
 
 def _wire_winegdk():
-    """Point the launcher at the WineGDK engine (however it was produced) and
-    apply the runtime patches. Shared by the prebuilt and source-build paths."""
+    """Select the managed WineGDK engine and apply its runtime patches."""
     s = load_settings()
     s["proton"] = str(WINEGDK_OUT)
     s["proton_tag"] = "winegdk"
-    s["proton_dir"] = str(WINEGDK_OUT)   # so launch/patch treat it as custom
     s["proton_source"] = "winegdk"
-    s["native_login"] = True             # the whole point of this engine
+    # These fields mean "user-supplied engine" everywhere else.  Releases up
+    # to 1.2.9 also used proton_dir for the managed canonical path, which made
+    # custom_proton() suppress managed updates.  Wiring is the migration point:
+    # once this function selects WineGDK, stale custom markers must disappear.
+    s.pop("proton_dir", None)
+    s.pop("proton_url", None)
     save_settings(s)
-    patch_proton(WINEGDK_OUT, strict=False)
+    # combase/ntdll patching mutates the managed tree. Serialize it with engine
+    # replacement and vkd3d activation so two launchers cannot patch a tree
+    # while another process renames it.
+    with managed_engine_lock(PROTON_DIR):
+        patch_proton(WINEGDK_OUT, strict=False)
     return WINEGDK_OUT
 
 
-def _install_prebuilt_winegdk(progress=None):
+def _remove_path(path: Path):
+    """Remove a file/symlink/tree without following a directory symlink."""
+    try:
+        if path.is_symlink() or path.is_file():
+            path.unlink()
+        elif path.exists():
+            shutil.rmtree(path)
+    except FileNotFoundError:
+        pass
+
+
+def _validate_engine_candidate(root: Path):
+    """Reject an incomplete or mislabeled engine before touching the active one."""
+    if not (root / "proton").is_file() or not (root / "files").is_dir():
+        raise ValueError("archive has no complete Proton tree")
+    # Imported lazily so source-only development remains usable while the
+    # validator is built alongside this installer.  Managed archives carry a
+    # hash-pinned content manifest; it rejects revision, component or DLL-byte
+    # mismatches before the active engine is touched.
+    from .vkd3d import validate_engine_manifest
+    validate_engine_manifest(
+        root, WINEGDK_BUILD_REV, enforce_pins=True)
+
+
+def _recover_interrupted_engine_swap_locked():
+    """Recover a validated rollback left by a crash during atomic activation.
+
+    The caller owns ``managed_engine_lock(PROTON_DIR)``.  A valid active r11
+    tree is authoritative and makes an old rollback disposable.  If the active
+    tree is absent or invalid but the rollback validates as the current pinned
+    revision, restore it transactionally before any network lookup.  When
+    neither validates, preserve both until a new candidate has itself been
+    downloaded and validated; diagnostic leftovers are preferable to deleting
+    the only recoverable bytes while offline.
+    """
+    backup = WINEGDK_OUT.with_name("." + WINEGDK_OUT.name + ".rollback")
+    if not (backup.exists() or backup.is_symlink()):
+        return
+
+    active_exists = WINEGDK_OUT.exists() or WINEGDK_OUT.is_symlink()
+    active_valid = False
+    backup_valid = False
+    active_error = backup_error = None
+    if active_exists:
+        try:
+            _validate_engine_candidate(WINEGDK_OUT)
+            active_valid = True
+        except Exception as exc:  # noqa: BLE001 - recovery must inspect damage
+            active_error = exc
+    try:
+        _validate_engine_candidate(backup)
+        backup_valid = True
+    except Exception as exc:  # noqa: BLE001 - preserve invalid diagnostics
+        backup_error = exc
+
+    if active_valid:
+        try:
+            _remove_path(backup)
+        except OSError as exc:
+            warn("Could not remove stale game-engine rollback: %s" % exc)
+        return
+    if not backup_valid:
+        warn("Interrupted game-engine swap could not be auto-recovered "
+             "(active: %s; rollback: %s); preserving both for replacement." %
+             (active_error or "missing", backup_error))
+        return
+
+    displaced = WINEGDK_OUT.with_name(
+        "." + WINEGDK_OUT.name + ".interrupted-invalid")
+    if displaced.exists() or displaced.is_symlink():
+        _remove_path(displaced)
+    if active_exists:
+        WINEGDK_OUT.replace(displaced)
+    try:
+        backup.replace(WINEGDK_OUT)
+    except Exception:
+        if active_exists and (displaced.exists() or displaced.is_symlink()) \
+                and not (WINEGDK_OUT.exists() or WINEGDK_OUT.is_symlink()):
+            displaced.replace(WINEGDK_OUT)
+        raise
+    else:
+        if displaced.exists() or displaced.is_symlink():
+            try:
+                _remove_path(displaced)
+            except OSError as exc:
+                warn("Recovered the game engine but could not remove the "
+                     "invalid interrupted tree: %s" % exc)
+        warn("Recovered the verified game engine after an interrupted update.")
+
+
+def _activate_engine(candidate: Path):
+    """Atomically replace the managed engine, restoring it on rename failure.
+
+    ``candidate`` has already been fully extracted and validated on the same
+    filesystem.  The active tree is renamed, never deleted, until the new tree
+    is in place.  This makes a failed update unable to strand the launcher with
+    a partial engine.
+    """
+    with managed_engine_lock(PROTON_DIR):
+        _activate_engine_locked(candidate)
+
+
+def _activate_engine_locked(candidate: Path):
+    """Implementation of the engine swap while the stable lock is held."""
+    WINEGDK_OUT.parent.mkdir(parents=True, exist_ok=True)
+    backup = WINEGDK_OUT.with_name("." + WINEGDK_OUT.name + ".rollback")
+
+    # Recover a previous interrupted swap before attempting another one.
+    if backup.exists() or backup.is_symlink():
+        if not WINEGDK_OUT.exists():
+            backup.replace(WINEGDK_OUT)
+        else:
+            _remove_path(backup)
+
+    had_current = WINEGDK_OUT.exists() or WINEGDK_OUT.is_symlink()
+    if had_current:
+        WINEGDK_OUT.replace(backup)
+    try:
+        candidate.replace(WINEGDK_OUT)
+    except Exception:
+        # rename(2) is atomic on this filesystem.  Nevertheless remove a path
+        # left by an exotic filesystem before putting the known-good tree back.
+        if WINEGDK_OUT.exists() or WINEGDK_OUT.is_symlink():
+            _remove_path(WINEGDK_OUT)
+        if had_current and (backup.exists() or backup.is_symlink()):
+            backup.replace(WINEGDK_OUT)
+        raise
+    else:
+        if backup.exists() or backup.is_symlink():
+            try:
+                _remove_path(backup)
+            except OSError as exc:
+                # The candidate is already atomically active. Cleanup failure
+                # must not be reported as a rejected install (or make setup
+                # die); recovery will validate the active tree and retry this
+                # harmless stale rollback on the next invocation.
+                warn("Could not remove old game-engine rollback: %s" % exc)
+
+
+def _install_prebuilt_winegdk(progress=None, force=False):
+    """Install while holding the stable engine lock for the whole transaction.
+
+    The download cache uses one ``.part`` filename per asset.  Keeping lookup,
+    download, extraction and activation under the same inter-process lock
+    prevents two launcher instances from deleting or renaming each other's
+    partial archive during an r10→r11 update.
+    """
+    with managed_engine_lock(PROTON_DIR):
+        _recover_interrupted_engine_swap_locked()
+        return _install_prebuilt_winegdk_locked(progress, force)
+
+
+def _install_prebuilt_winegdk_locked(progress=None, force=False):
     """Fetch + unpack a prebuilt GDK-Proton-xuser engine so end users never
     compile a full Wine. Looks for an asset named for the current build rev on
-    the app's own releases. Returns True on success, False (→ source-build
-    fallback) when no matching asset is published or the archive is unusable.
-    Any network/IO error degrades to False — it never breaks the build path."""
+    the app's own releases, or use BOL_ENGINE_ARCHIVE for an explicit local
+    archive.  The candidate is validated and transactionally activated.  False
+    means no safe replacement was installed; callers may keep the current one."""
     asset = f"GDK-Proton-xuser-{WINEGDK_BUILD_REV}.tar.gz"
-    try:
-        rels = gh_releases(WINEGDK_PREBUILT_REPO, 30)
-    except Exception as e:
-        warn(f"Prebuilt engine lookup failed ({e}) — will build from source.")
-        return False
-    url = name = None
-    for rel in rels or []:
-        url, name, _ = asset_url(rel, lambda n: n == asset)
-        if url:
-            break
-    if not url:
-        return False
-    tar = CACHE / name
-    if not tar.exists():
-        info("Downloading the game engine (prebuilt, one-time) …")
+    override = os.environ.get("BOL_ENGINE_ARCHIVE", "").strip()
+    if not override:
+        # Portable candidates are shipped beside their exact engine archive.
+        # AppImage exposes its original path through APPIMAGE; zipapps use
+        # argv[0]. The normal hash-pinned manifest validation still applies.
+        anchors = []
+        appimage = os.environ.get("APPIMAGE", "").strip()
+        if appimage:
+            anchors.append(Path(appimage).expanduser().resolve().parent)
         try:
-            download(url, tar, "Game engine", progress)
-        except BolError:
-            return False
-    info("Unpacking the game engine …")
-    tmp = PROTON_DIR / ".xuser-dl"
-    shutil.rmtree(tmp, ignore_errors=True)
-    tmp.mkdir(parents=True, exist_ok=True)
-    try:
-        with tarfile.open(tar) as t:
-            t.extractall(tmp)
-    except Exception as e:
-        warn(f"Prebuilt engine archive unreadable ({e}) — building instead.")
-        shutil.rmtree(tmp, ignore_errors=True)
-        try:
-            tar.unlink()                 # drop the bad/partial cache copy
-        except OSError:
+            anchors.append(Path(sys.argv[0]).expanduser().resolve().parent)
+        except (OSError, RuntimeError):
             pass
+        for anchor in anchors:
+            sibling = anchor / asset
+            if sibling.is_file():
+                override = str(sibling)
+                break
+    local_archive = bool(override)
+    if local_archive:
+        archive = Path(override).expanduser()
+        if not archive.is_file():
+            warn(f"BOL_ENGINE_ARCHIVE does not exist: {archive}")
+            return False
+        info(f"Using local game engine archive: {archive}")
+    else:
+        try:
+            rels = gh_releases(WINEGDK_PREBUILT_REPO, 30)
+        except Exception as e:
+            warn(f"Prebuilt engine lookup failed ({e}).")
+            return False
+        url = name = None
+        for rel in rels or []:
+            url, name, _ = asset_url(rel, lambda n: n == asset)
+            if url:
+                break
+        if not url:
+            return False
+        archive = CACHE / name
+        if force:
+            # A release asset may have been corrected under the same filename;
+            # --force must not silently reinstall the stale cached bytes.
+            _remove_path(archive)
+            _remove_path(archive.with_suffix(archive.suffix + ".part"))
+        if not archive.exists():
+            info("Downloading the game engine (prebuilt, one-time) …")
+            try:
+                download(url, archive, "Game engine", progress)
+            except Exception as e:
+                warn(f"Game engine download failed ({e}).")
+                return False
+
+    info("Unpacking and validating the game engine …")
+    PROTON_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = Path(tempfile.mkdtemp(prefix=".xuser-dl-", dir=PROTON_DIR))
+    try:
+        _verify_engine_archive(archive)
+        with tarfile.open(archive) as t:
+            _extract_archive(t, tmp)
+        root = tmp if (tmp / "proton").is_file() else next(
+            (p for p in tmp.iterdir() if p.is_dir()
+             and (p / "proton").is_file()), None)
+        if root is None:
+            raise ValueError("archive has no Proton tree")
+        _validate_engine_candidate(root)
+        # The wrapper already owns the stable lock; taking it again through
+        # _activate_engine() could deadlock because flock locks are tied to
+        # independently opened file descriptions.
+        _activate_engine_locked(root)
+    except Exception as e:
+        warn(f"Prebuilt engine rejected ({e}) — keeping the installed engine.")
+        if not local_archive:
+            _remove_path(archive)        # retry corrected bytes next time
         return False
-    # Accept a tarball whose top level IS the proton tree, or one that wraps a
-    # single GDK-Proton* directory.
-    root = tmp if (tmp / "proton").exists() else next(
-        (p for p in tmp.iterdir() if (p / "proton").exists()), None)
-    if root is None:
-        warn("Prebuilt engine archive has no proton tree — building instead.")
+    finally:
         shutil.rmtree(tmp, ignore_errors=True)
-        return False
-    WINEGDK_OUT.parent.mkdir(parents=True, exist_ok=True)
-    shutil.rmtree(WINEGDK_OUT, ignore_errors=True)
-    root.replace(WINEGDK_OUT)            # same filesystem (both under PROTON_DIR)
-    shutil.rmtree(tmp, ignore_errors=True)
     ok("Game engine ready (prebuilt — no compiler needed).")
     return True
 
 
 def ensure_winegdk(force=False, progress=None):
     """Provide the WineGDK engine (XUser + request signing) and wire it in:
-    download the prebuilt asset when published, else build the fork from
-    source (long; cached by source commit)."""
+    install only the reviewed, manifest-pinned compatibility archive."""
     s = load_settings()
-    if not force and (WINEGDK_OUT / "proton").exists() \
-            and s.get("winegdk_built", "").endswith(":" + WINEGDK_BUILD_REV):
+    installed_current = False
+    # Inspect and recover the on-disk state under the same stable lock used by
+    # activation.  Without this, a power loss after active→rollback but before
+    # candidate→active made an offline launch report "no engine" even though a
+    # complete, verified r11 rollback was still present.
+    with managed_engine_lock(PROTON_DIR):
+        _recover_interrupted_engine_swap_locked()
+        installed = (WINEGDK_OUT / "proton").is_file()
+        if installed:
+            try:
+                # Settings are only a cache. Releases up to 1.2.9 could leave
+                # the setting and extracted tree on different revisions. The
+                # hash-pinned on-disk manifest is authoritative.
+                _validate_engine_candidate(WINEGDK_OUT)
+                installed_current = True
+            except Exception as exc:  # invalid candidates auto-heal
+                warn("Installed game engine needs replacement (%s)." % exc)
+    if not force and installed_current:
+        expected_stamp = "prebuilt:" + WINEGDK_BUILD_REV
+        if s.get("winegdk_built") != expected_stamp:
+            s["winegdk_built"] = expected_stamp
+            save_settings(s)
         info(f"WineGDK engine ready ({WINEGDK_BUILD_REV}).")
         return _wire_winegdk()
-    # Engine present but built for a different rev → a newer engine was
-    # published; auto-update it (same mechanism as the launcher's self-update).
-    if (WINEGDK_OUT / "proton").exists() and s.get("winegdk_built"):
+    if installed:
         info(f"Updating the game engine → {WINEGDK_BUILD_REV} …")
-    if _install_prebuilt_winegdk(progress):     # re-fetched on --force too
+    if _install_prebuilt_winegdk(progress, force=force):
         s = load_settings()
         s["winegdk_built"] = "prebuilt:" + WINEGDK_BUILD_REV
         save_settings(s)
         return _wire_winegdk()
-    info("No prebuilt engine published — building from source (one-time, long).")
-    commit = _winegdk_sync()
-    want = commit + ":" + WINEGDK_BUILD_REV
-    s = load_settings()
-    if (WINEGDK_OUT / "proton").exists() and s.get("winegdk_built") == want \
-            and not force:
-        info(f"WineGDK build up to date ({commit[:9]})")
-    else:
-        need = [t for t in ("git", "gcc", "make", "flex", "bison",
-                             "x86_64-w64-mingw32-gcc",
-                             "i686-w64-mingw32-gcc") if not shutil.which(t)]
-        if need:
-            die("No prebuilt engine was available to download, so it has to "
-                "be built from source — but these tools are missing: "
-                + " ".join(need) + "\n"
-                "  This usually means no prebuilt was published for this "
-                "version yet (please report it). To build locally instead "
-                "(no deb-src needed):\n  "
-                + _pm_hint().format(WINE_BUILD_PKGS)
-                + "\n  then re-run.")
-        base = _stock_proton_root(progress)
-        # Build Wine straight into a fresh copy of the stock GDK-Proton's
-        # files/ so wine + wineserver + libwine come from the SAME build
-        # (a partial overlay gives "wineserver version mismatch" crashes).
-        info("Preparing GDK-Proton base …")
-        shutil.rmtree(WINEGDK_OUT, ignore_errors=True)
-        run(["cp", "-a", str(base), str(WINEGDK_OUT)])
-        prefix = WINEGDK_OUT / "files"
-        bdir = WINEGDK_SRC / "build-bol"
-        cfg_stamp = bdir / ".bol-configured"
-        logf = LOGS / "winegdk-build.log"
-        LOGS.mkdir(parents=True, exist_ok=True)
-        info(f"Building WineGDK — long (full Wine build); log: {logf}")
-        # Incremental: the build dir is stamped with commit + build rev +
-        # prefix, and only wiped when that changes (or --force) — an aborted
-        # build resumes via `make`. A build-rev change means a different
-        # Wine layout, so cached objects must be discarded.
-        stamp_want = f"{commit}|{WINEGDK_BUILD_REV}|{prefix}"
-        stamp_have = cfg_stamp.read_text().strip() if cfg_stamp.exists() else ""
-        # Legacy stamp formats only match while the layout rev is unchanged.
-        if stamp_have in (str(prefix), f"{commit}|{prefix}") \
-                and WINEGDK_BUILD_REV == "ovl2-prefix":
-            stamp_have = stamp_want
-        clean = force or stamp_have != stamp_want
-        if clean:
-            shutil.rmtree(bdir, ignore_errors=True)
-            bdir.mkdir(parents=True, exist_ok=True)
-        else:
-            info(f"  resuming previous build ({commit[:9]}) — incremental.")
-        with open(logf, "a" if not clean else "w") as lf:
-            def sh(cmd, cwd):
-                lf.write("\n$ " + " ".join(cmd) + "\n")
-                lf.flush()
-                if subprocess.run(cmd, cwd=str(cwd), stdout=lf,
-                                  stderr=subprocess.STDOUT).returncode:
-                    die(f"WineGDK build failed: {' '.join(cmd[:2])} … — "
-                        f"see {logf}")
-            if clean:
-                # --enable-archs builds the i386 PE half too — WoW64 needs it
-                # to run 32-bit binaries (msiexec, installers); --enable-win64
-                # alone makes any 32-bit exec die in loader_init.
-                sh([str(WINEGDK_SRC / "configure"),
-                    "--enable-archs=i386,x86_64",
-                    "--disable-tests", f"--prefix={prefix}"], bdir)
-                cfg_stamp.write_text(stamp_want)
-            info("  configure done — compiling (the long part) …")
-            sh(["make", f"-j{os.cpu_count() or 2}"], bdir)
-            info("  compiled — installing Wine into the Proton tree …")
-            sh(["make", "install"], bdir)
-        # Wine 11 produces a single `wine` binary, but the Proton script
-        # still calls `wine64`/`wine64-preloader` by name — left stale from
-        # the base copy, those abort with "could not load ntdll.so". Symlink
-        # the legacy names to the unified loader.
-        bin_dir = prefix / "bin"
-        if (bin_dir / "wine").is_file():
-            for legacy in ("wine64", "wine64-preloader", "wine-preloader"):
-                p = bin_dir / legacy
-                try:
-                    if p.exists() or p.is_symlink():
-                        p.unlink()
-                    p.symlink_to("wine")
-                except OSError as e:
-                    warn(f"wine binary symlink {legacy} failed: {e}")
-        # Wine 11 ntdll.so needs libunwind.so.8, which the Steam Linux
-        # Runtime container doesn't carry — stage the host copy into
-        # files/lib/x86_64-linux-gnu (on Proton's LD_LIBRARY_PATH).
-        for cand in ("/lib/x86_64-linux-gnu/libunwind.so.8.1.0",
-                     "/usr/lib/x86_64-linux-gnu/libunwind.so.8.1.0",
-                     "/lib/x86_64-linux-gnu/libunwind.so.8",
-                     "/usr/lib/x86_64-linux-gnu/libunwind.so.8"):
-            src = Path(cand)
-            if src.is_file():
-                real = src.resolve()
-                dest_dir = prefix / "lib" / "x86_64-linux-gnu"
-                dest_dir.mkdir(parents=True, exist_ok=True)
-                try:
-                    shutil.copy2(real, dest_dir / real.name)
-                    link = dest_dir / "libunwind.so.8"
-                    if link.exists() or link.is_symlink():
-                        link.unlink()
-                    link.symlink_to(real.name)
-                except OSError as e:
-                    warn(f"libunwind staging failed: {e}")
-                break
-        else:
-            warn("libunwind.so.8 not found on host — install libunwind8 "
-                 "(or libunwind-dev) so the runtime can load ntdll.so.")
-        if not any((prefix).rglob("xgameruntime.dll")):
-            warn("xgameruntime.dll absent after install — build/layout off "
-                 "(see logs).")
-        s = load_settings()
-        s["winegdk_built"] = want
-        save_settings(s)
-        ok(f"WineGDK GDK-Proton ready ({commit[:9]})")
-    return _wire_winegdk()
+    # An unavailable/invalid update must never destroy a working engine or fall
+    # into the source builder, which historically removed the active tree before
+    # compilation had succeeded.  Keep the old revision and retry next launch.
+    if installed_current:
+        warn(f"Game engine {WINEGDK_BUILD_REV} is unavailable — keeping the "
+             "installed engine.")
+        return _wire_winegdk()
+    if installed:
+        die("Required game engine %s could not be installed. The previous "
+            "engine was preserved but is incompatible with this launcher. "
+            "Keep %s beside the AppImage/zipapp and retry." %
+            (WINEGDK_BUILD_REV,
+             f"GDK-Proton-xuser-{WINEGDK_BUILD_REV}.tar.gz"))
+    die("No verified game-engine archive is available for %s. Connect to the "
+        "network and retry, or place %s beside the AppImage/zipapp." %
+        (WINEGDK_BUILD_REV,
+         f"GDK-Proton-xuser-{WINEGDK_BUILD_REV}.tar.gz"))

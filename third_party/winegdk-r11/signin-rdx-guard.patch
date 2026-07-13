@@ -1,0 +1,60 @@
+From 670eda2864dcb22d11c7f2c28973214d4755ad2f Mon Sep 17 00:00:00 2001
+From: Wyze3306 <remy.grisollet@gmail.com>
+Date: Tue, 23 Jun 2026 23:35:51 +0200
+Subject: [PATCH] xgameruntime: guard the sign-in lookup data pointer against
+ -1/non-canonical (#25)
+
+Patch 5's full-chain null-guard validated the collection pointer (rax) against
+both NULL and non-canonical, but the backing data pointer rdx = [rax+8] only
+against NULL. On a slow Steam Deck prefix the lookup runs before the collection
+is populated and [rax+8] comes back as 0xFFFFFFFFFFFFFFFF (-1): not NULL, so it
+passed the rdx test and the original cmp byte[rdx+0x19] page-faulted seconds
+after sign-in.
+
+Change the rdx guard from jz (0x74) to jle (0x7e): after test rdx,rdx it takes
+the 0-return on ZF=1 (NULL) OR SF=1 (bit 63 set = -1 / negative / high
+non-canonical), catching the crash value and the whole garbage class in the
+same 5 bytes. No code-cave size change.
+---
+ dlls/xgameruntime/main.c | 11 +++++++----
+ 1 file changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/dlls/xgameruntime/main.c b/dlls/xgameruntime/main.c
+index f7ed5c6667c..4a4cbf9c2b3 100644
+--- a/dlls/xgameruntime/main.c
++++ b/dlls/xgameruntime/main.c
+@@ -674,7 +674,10 @@ HRESULT WINAPI InitializeApiImplEx2( ULONG gdkVer, ULONG gsVer, CHAR mode, INITI
+                          * On a slow Steam Deck it runs before the collection is
+                          * populated, so any link can be NULL or a garbage /
+                          * non-canonical pointer and the routine page-faults
+-                         * (issue #21 rdx==NULL, issue #22 rax non-canonical).
++                         * (issue #21 rdx==NULL, issue #22 rax non-canonical,
++                         * issue #25 rdx==-1/non-canonical — the backing data
++                         * pointer was -1, which passed the old rdx!=NULL test
++                         * and faulted on cmp byte[rdx+0x19]).
+                          * "Empty/absent" is just a 0 return, so guard the WHOLE
+                          * chain: return 0 unless every link is a sane pointer,
+                          * else run the real lookup unchanged.
+@@ -688,7 +691,7 @@ HRESULT WINAPI InitializeApiImplEx2( ULONG gdkVer, ULONG gsVer, CHAR mode, INITI
+                          *   74 0e           jz  null_exit       ; NULL rax
+                          *   48 8b 50 08     mov rdx,[rax+8]     (relocated)
+                          *   48 85 d2        test rdx,rdx
+-                         *   74 05           jz  null_exit       ; NULL data ptr (#21)
++                         *   7e 05           jle null_exit       ; NULL or -1/non-canonical data ptr (#21,#25)
+                          *   e9 rel32        jmp match+9 (the cmp)
+                          * null_exit: 31 c0 / 48 83 c4 28 / 5f / 5e / c3
+                          * Fallback (no >=42 B cave): the original 24-byte guard
+@@ -703,8 +706,8 @@ HRESULT WINAPI InitializeApiImplEx2( ULONG gdkVer, ULONG gsVer, CHAR mode, INITI
+                             cave[14]=0x48; cave[15]=0x85; cave[16]=0xc0;
+                             cave[17]=0x74; cave[18]=0x0e;
+                             cave[19]=0x48; cave[20]=0x8b; cave[21]=0x50; cave[22]=0x08;
+-                            cave[23]=0x48; cave[24]=0x85; cave[25]=0xd2;
+-                            cave[26]=0x74; cave[27]=0x05;
++                            cave[23]=0x48; cave[24]=0x85; cave[25]=0xd2;  /* test rdx,rdx */
++                            cave[26]=0x7e; cave[27]=0x05;  /* jle (was jz): also reject -1/non-canonical rdx (#25) */
+                             cave[28]=0xe9;
+                             cave[29]=(BYTE)back; cave[30]=(BYTE)(back>>8);
+                             cave[31]=(BYTE)(back>>16); cave[32]=(BYTE)(back>>24);
+-- 
+2.47.2
+

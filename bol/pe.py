@@ -36,7 +36,7 @@ class PE:
         return None
 
     def off2rva(self, off):
-        for va, vsz, raw, rsz in self.secs:
+        for va, _, raw, rsz in self.secs:
             if raw <= off < raw + rsz:
                 return va + (off - raw)
         return None
