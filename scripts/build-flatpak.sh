@@ -165,7 +165,12 @@ flatpak install -y --user --noninteractive flathub \
   org.freedesktop.Platform//"$RTVER" org.freedesktop.Sdk//"$RTVER" 2>/dev/null || \
   echo "  (runtime/SDK pre-install skipped — the builder will fetch them)"
 
-BUILD_FLAGS=(--user --force-clean)
+# The checkout may live on eCryptfs or another FUSE-backed home directory.
+# Nesting flatpak-builder's read-only FUSE overlay there can leave 0555 Tcl/Tk
+# libraries inaccessible to eu-strip. The regular build sandbox still isolates
+# every module; disabling only that optional overlay makes local release builds
+# deterministic on both native and encrypted home filesystems.
+BUILD_FLAGS=(--user --force-clean --disable-rofiles-fuse)
 
 rm -f -- "$BUNDLE"
 "${FB[@]}" "${BUILD_FLAGS[@]}" --repo="$WORK/repo" \

@@ -15,6 +15,13 @@ runtime-version: '25.08'
 sdk: org.freedesktop.Sdk
 command: bedrock-on-linux
 
+# Tcl/Tk installs several shared libraries read-only. Disabling the optional
+# post-build strip/debug split keeps the manifest buildable by an unprivileged
+# flatpak-builder on native, encrypted, and FUSE-backed home filesystems.
+build-options:
+  strip: false
+  no-debuginfo: true
+
 finish-args:
   # GPU (Vulkan) + game controllers
   - --device=all
@@ -174,5 +181,5 @@ modules:
       #   git rev-parse vX.Y.Z^{commit}
       - type: git
         url: https://github.com/Wyze3306/BedrockOnLinux.git
-        tag: v1.3.0
-        commit: 0045b09ee2bb78b2be1cbcba2283b14be3bcc0ef
+        tag: v2.0.0
+        commit: 6e929009f43deb0c35730ac5f0031ac179e7f53e
