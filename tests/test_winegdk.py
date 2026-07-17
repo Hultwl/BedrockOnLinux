@@ -50,7 +50,7 @@ class ManagedProtonTests(unittest.TestCase):
 
 
 class WineGDKInstallTests(unittest.TestCase):
-    REV = "wow64-archs-r11"
+    REV = "wow64-archs-r12"
 
     def setUp(self):
         self._td = tempfile.TemporaryDirectory()
@@ -196,7 +196,7 @@ class WineGDKInstallTests(unittest.TestCase):
 
     def test_appimage_automatically_uses_exact_sibling_engine(self):
         asset = f"GDK-Proton-xuser-{self.REV}.tar.gz"
-        archive = self._archive(name=asset, marker="sibling-r11")
+        archive = self._archive(name=asset, marker="sibling-r12")
         appimage = self.base / "BedrockOnLinux-1.3.0-x86_64.AppImage"
         appimage.write_bytes(b"fixture")
 
@@ -208,7 +208,7 @@ class WineGDKInstallTests(unittest.TestCase):
             installed = winegdk._install_prebuilt_winegdk()
 
         self.assertTrue(installed)
-        self.assertEqual((self.engine / "proton").read_text(), "sibling-r11")
+        self.assertEqual((self.engine / "proton").read_text(), "sibling-r12")
         self.assertEqual(archive.parent, appimage.parent)
         releases.assert_not_called()
         download.assert_not_called()

@@ -1,1 +1,3 @@
 * text=auto eol=lf
+# Vendored patches preserve the exact upstream source whitespace they verify.
+third_party/**/*.patch whitespace=-blank-at-eol,-space-before-tab

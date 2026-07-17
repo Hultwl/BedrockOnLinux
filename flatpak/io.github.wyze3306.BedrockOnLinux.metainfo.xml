@@ -18,9 +18,10 @@
       <li>fetches a GDK-Proton built from a WineGDK fork that implements XUser
           and request signing, so you sign in to Microsoft inside the game —
           no relay, no proxy;</li>
-      <li>applies the binary patches the game needs to start and to join online
-          Bedrock servers;</li>
-      <li>fixes curl/SSL, then launches the game.</li>
+      <li>provides native Friends, invitations, public Servers and Realms
+          without scanning or rewriting the Minecraft process;</li>
+      <li>implements the WinAppSDK file picker used for world and skin imports;</li>
+      <li>verifies the engine, fixes curl/SSL, then launches the game.</li>
     </ul>
     <p>
       Sign in, open Play &#8226; Servers, and join native Bedrock servers
@@ -69,6 +70,28 @@
   </content_rating>
 
   <releases>
+    <release version="2.0.0" date="2026-07-17">
+      <description>
+        <p>Adds native Xbox services, working Friends and Realms, stable world
+           and skin imports, and removes the Minecraft process-memory patcher.</p>
+        <ul>
+          <li>implements native XGame, XUser, token signing, gamertags,
+              privileges and XSAPI context in WineGDK;</li>
+          <li>restores Friends, invitations, joining friends, public Servers
+              and the dedicated Bedrock Realms authentication audience;</li>
+          <li>implements single and multiple selection for the WinAppSDK
+              FileOpenPicker contract in both Wine PE architectures so world
+              and skin imports no longer crash;</li>
+          <li>upgrades existing managed installations automatically and keeps
+              engine replacement transactional and SHA-256 verified;</li>
+          <li>records normal wrapper completion before Wine teardown so a
+              delayed clean shutdown cannot become a permanent GPU block, while
+              interrupted and legacy sessions remain fail-closed;</li>
+          <li>ships reproducible WineGDK source provenance and rejects any
+              remnant of the former Minecraft memory-patch implementation.</li>
+        </ul>
+      </description>
+    </release>
     <release version="1.3.0" date="2026-07-13">
       <description>
         <p>Fixes the menu, ESC/back, pause, and dialog freeze reported in

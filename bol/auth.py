@@ -16,7 +16,6 @@ from .config import (
     MSA_DIR,
     MSA_SCOPE,
     MSA_TOKEN,
-    WINEGDK_BUILD_REV,
     WINEGDK_REG,
 )
 from .log import BolError, die, err, info, ok, warn
@@ -65,60 +64,6 @@ def msa_signed_in():
     return bool(msa_load().get("refresh_token"))
 
 
-def _msa_facet_engine_stamp(settings):
-    managed = (settings.get("proton_source", "winegdk") == "winegdk"
-               and not settings.get("proton_dir")
-               and not settings.get("proton_url"))
-    if managed:
-        return f"winegdk:{WINEGDK_BUILD_REV}"
-    return "custom"
-
-
-def force_msa_facet_enabled():
-    """Return whether WineGDK's online-account patches should be enabled.
-
-    Older engine revisions exposed a troubleshooting toggle because their
-    forced MSA facet could dereference an absent XSAPI account object.  The
-    managed engine now carries the full-chain null guard, but an old persisted
-    ``false`` otherwise survives every launcher/engine upgrade and silently
-    leaves the Servers tab locked even after the underlying crash was fixed.
-
-    Remember the engine revision on which an explicit choice was made.  A new
-    managed revision gets one fresh attempt with online access enabled; if that
-    still fails on an unusual setup, switching it off again records the current
-    revision and remains respected.  ``BOL_DISABLE_SERVER_PATCHES=1`` is the
-    non-persistent emergency escape hatch for launches that cannot reach the
-    GUI (the earlier internal name ``BOL_DISABLE_MSA_FACET`` remains accepted).
-    """
-    disabled = (os.environ.get("BOL_DISABLE_SERVER_PATCHES")
-                or os.environ.get("BOL_DISABLE_MSA_FACET", "")).strip().lower()
-    if disabled in {"1", "true", "yes", "on"}:
-        warn("BOL_DISABLE_SERVER_PATCHES is set — Microsoft/Xbox server "
-             "access patches are disabled for this launch.")
-        return False
-
-    settings = load_settings()
-    enabled = settings.get("force_msa_facet", True)
-    current_stamp = _msa_facet_engine_stamp(settings)
-    managed = current_stamp.startswith("winegdk:")
-    stamped_rev = settings.get("force_msa_facet_engine_rev")
-    if managed and stamped_rev != current_stamp:
-        if enabled is False:
-            info("Re-enabling Microsoft/Xbox server access for the new guarded "
-                 f"engine {WINEGDK_BUILD_REV}.")
-        settings["force_msa_facet"] = True
-        settings["force_msa_facet_engine_rev"] = current_stamp
-        save_settings(settings)
-        return True
-    return bool(enabled)
-
-
-def set_force_msa_facet(enabled):
-    """Persist an explicit online-account patch choice for this engine."""
-    settings = load_settings()
-    settings["force_msa_facet"] = bool(enabled)
-    settings["force_msa_facet_engine_rev"] = _msa_facet_engine_stamp(settings)
-    save_settings(settings)
 
 
 def msa_logout():
@@ -280,7 +225,20 @@ _ONLINE_PREAUTH_REQUIREMENTS = {
     "mp_token": "mp_expiry",
     "mp_rp": None,
     "mp_uhs": None,
+    "realms_token": "realms_expiry",
+    "realms_rp": None,
+    "realms_uhs": None,
     "xbl_xuid": None,
+}
+
+
+_WINEGDK_EXPIRY_EPOCH_FIELDS = {
+    "user_token_expiry": "user_token_expiry_epoch",
+    "xbl_token_expiry": "xbl_token_expiry_epoch",
+    "sisu_expiry": "sisu_expiry_epoch",
+    "mp_expiry": "mp_expiry_epoch",
+    "realms_expiry": "realms_expiry_epoch",
+    "lic_expiry": "lic_expiry_epoch",
 }
 
 
@@ -308,6 +266,102 @@ def _parse_xbox_expiry(raw):
     from datetime import datetime
 
     return datetime.fromisoformat(_normalize_xbox_expiry(raw))
+
+
+def _normalize_xbl_privileges(raw):
+    """Return an optional, canonical Xbox privilege claim.
+
+    Xbox currently exposes ``DisplayClaims.xui[0].prv`` as a space-separated
+    string.  Accept a sequence as well so the launcher remains tolerant of a
+    service-side representation change, but only retain unsigned decimal IDs.
+    Keeping this as a canonical string makes it straightforward for WineGDK's
+    small JSON reader to consume without trusting the original claim shape.
+    """
+    if isinstance(raw, str):
+        values = re.split(r"[\s,]+", raw.strip()) if raw.strip() else []
+    elif isinstance(raw, (list, tuple)):
+        values = raw
+    else:
+        return None
+
+    privileges = set()
+    for value in values:
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int):
+            privilege = value
+        elif isinstance(value, str) and re.fullmatch(r"[0-9]+", value):
+            # Xbox privilege values are 32-bit enum IDs.  Bound both the text
+            # length and parsed value so a malformed claim cannot grow an
+            # arbitrarily large Python integer.
+            if len(value) > 10:
+                continue
+            privilege = int(value, 10)
+        else:
+            continue
+        if 0 <= privilege <= 0xffffffff:
+            privileges.add(privilege)
+    if not privileges:
+        return None
+    return " ".join(str(privilege) for privilege in sorted(privileges))
+
+
+def _xbl_privilege_claim(claims):
+    """Return ``(present, canonical_value)`` for an XBL ``prv`` claim.
+
+    Presence is intentionally separate from the value: a legacy cache has no
+    privilege information and needs WineGDK's compatibility fallback, whereas
+    an explicit empty or malformed service claim means that no privileges were
+    granted and must fail closed.
+    """
+    if not isinstance(claims, dict) or "prv" not in claims:
+        return False, None
+    return True, _normalize_xbl_privileges(claims.get("prv")) or ""
+
+
+def _xbl_gamertag_claims(claims):
+    """Return optional modern gamertag claims under launcher cache keys."""
+    if not isinstance(claims, dict):
+        return {}
+    result = {}
+    for claim, field in (
+        ("mgt", "xbl_modern_gamertag"),
+        ("mgs", "xbl_modern_gamertag_suffix"),
+        ("umg", "xbl_unique_modern_gamertag"),
+    ):
+        value = claims.get(claim)
+        if isinstance(value, str):
+            result[field] = value
+    return result
+
+
+def _with_winegdk_expiry_epochs(payload):
+    """Return a copy with WineGDK's decimal epoch expiry fields.
+
+    The ISO ``NotAfter`` values remain the source of truth for launcher-side
+    validation.  WineGDK cannot parse those timestamps directly, so its
+    pre-auth loader consumes these derived string fields instead.
+    """
+    from datetime import timezone
+
+    if not isinstance(payload, dict):
+        return payload
+    enriched = dict(payload)
+    for iso_field, epoch_field in _WINEGDK_EXPIRY_EPOCH_FIELDS.items():
+        raw = enriched.get(iso_field)
+        try:
+            if not isinstance(raw, str) or not raw.strip():
+                raise ValueError
+            stamp = _parse_xbox_expiry(raw)
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=timezone.utc)
+            enriched[epoch_field] = str(int(stamp.timestamp()))
+        except (ValueError, OverflowError, OSError):
+            # Never preserve an epoch that disagrees with a missing or invalid
+            # ISO source value. Required ISO fields are still rejected by
+            # _online_preauth_problems below.
+            enriched.pop(epoch_field, None)
+    return enriched
 
 
 def _online_preauth_problems(payload, now=None, min_ttl=60):
@@ -474,6 +528,7 @@ def _purge_account_preauth(msa_token_path=None):
 
 def _store_online_preauth(path, payload, expected_epoch=None):
     """Atomically persist a complete online payload; never store a partial."""
+    payload = _with_winegdk_expiry_epochs(payload)
     if _online_preauth_problems(payload):
         return False
     import tempfile
@@ -510,8 +565,9 @@ def xbl_preauth(msa_access_token, expected_account_epoch=None):
     Needed because Azure TCP-RSTs every *.auth.xboxlive.com / sisu call made
     through Wine's GnuTLS (fingerprinted as non-Schannel) — the same requests
     from the host succeed. Returns True only when a complete, unexpired online
-    payload (including the multiplayer XSTS token) is available. A failed
-    refresh never overwrites a previously valid payload with device-only data.
+    payload (including the multiplayer and Realms XSTS tokens) is available.
+    A failed refresh never overwrites a previously valid payload with
+    device-only data.
     """
     import base64, uuid as _uuid
     cache = DATA / "winegdk-preauth"
@@ -546,6 +602,18 @@ def xbl_preauth(msa_access_token, expected_account_epoch=None):
             and not _online_preauth_problems(cached)
         )
         if current_ready:
+            upgraded = _with_winegdk_expiry_epochs(cached)
+            if upgraded != cached:
+                if not _store_online_preauth(
+                        out_path, upgraded, expected_epoch=account_epoch):
+                    warn("Xbox Live pre-auth: account changed while upgrading "
+                         "the cached WineGDK credentials; refusing the old "
+                         "online payload.")
+                    return False
+                cached.clear()
+                cached.update(upgraded)
+                info("Xbox Live pre-auth: upgraded cached token expirations "
+                     "for WineGDK.")
             info("Xbox Live pre-auth: keeping the complete unexpired cached "
                  "online tokens.")
             return True
@@ -647,8 +715,7 @@ def xbl_preauth(msa_access_token, expected_account_epoch=None):
     except Exception as e:
         return _fallback(f"xbl_preauth: device.auth POST failed: {e}")
     if r.status_code != 200:
-        return _fallback(f"xbl_preauth: device.auth HTTP {r.status_code} — "
-                         f"{r.text[:200]}")
+        return _fallback(f"xbl_preauth: device.auth HTTP {r.status_code}")
     j = r.json()
     device_token = j["Token"]
 
@@ -670,7 +737,7 @@ def xbl_preauth(msa_access_token, expected_account_epoch=None):
                 user_token = uj["Token"]
                 user_token_expiry = uj.get("NotAfter", "")
             else:
-                warn(f"xbl_preauth: user.auth HTTP {ru.status_code} — {ru.text[:200]}")
+                warn(f"xbl_preauth: user.auth HTTP {ru.status_code}")
         except Exception as e:
             warn(f"xbl_preauth: user.auth POST failed: {e}")
 
@@ -693,7 +760,7 @@ def xbl_preauth(msa_access_token, expected_account_epoch=None):
                 "ProofKey": proof_key,
             })
             if r.status_code != 200:
-                warn(f"xbl_preauth: sisu({rp}) HTTP {r.status_code} — {r.text[:200]}")
+                warn(f"xbl_preauth: sisu({rp}) HTTP {r.status_code}")
                 return None
             return r.json()
         except Exception as e:
@@ -709,6 +776,7 @@ def xbl_preauth(msa_access_token, expected_account_epoch=None):
         xbl_claims = xbl_auth["DisplayClaims"]["xui"][0]
     except (KeyError, IndexError, TypeError):
         pass
+    xbl_privileges_present, xbl_privileges = _xbl_privilege_claim(xbl_claims)
 
     pf_sisu = _sisu("https://b980a380.minecraft.playfabapi.com/") or {}
     pf_auth = pf_sisu.get("AuthorizationToken", {}) if pf_sisu else {}
@@ -735,7 +803,25 @@ def xbl_preauth(msa_access_token, expected_account_epoch=None):
     except (KeyError, IndexError, TypeError):
         pass
 
-    # ---- 3d. sisu /authorize for the licensing RP, used by the in-game
+    # ---- 3d. sisu /authorize for the Bedrock Realms RP.  The current game
+    # reaches Realms through *.realms.minecraft-services.net, but that service
+    # still validates an XSTS token whose audience is the canonical legacy
+    # Bedrock RP.  A generic http://xboxlive.com token reaches the edge but is
+    # rejected with HTTP 401.
+    realms_relying_party = "https://pocket.realms.minecraft.net/"
+    realms_sisu = _sisu(realms_relying_party) or {}
+    realms_auth = (realms_sisu.get("AuthorizationToken", {})
+                   if realms_sisu else {})
+    realms_rp = realms_relying_party if realms_auth.get("Token") else None
+    realms_token = realms_auth.get("Token")
+    realms_expiry = realms_auth.get("NotAfter", "")
+    realms_uhs = None
+    try:
+        realms_uhs = realms_auth["DisplayClaims"]["xui"][0].get("uhs")
+    except (KeyError, IndexError, TypeError):
+        pass
+
+    # ---- 3e. sisu /authorize for the licensing RP, used by the in-game
     # Marketplace — its catalog/entitlement edges (collections/purchase.
     # mp.microsoft.com, inventory/licensing.xboxlive.com) only accept an XSTS
     # token minted for http://licensing.xboxlive.com. Pre-mint it here so the
@@ -791,12 +877,25 @@ def xbl_preauth(msa_access_token, expected_account_epoch=None):
         "mp_token": mp_token,
         "mp_uhs": mp_uhs,
         "mp_expiry": mp_expiry,
+        "realms_rp": realms_rp,
+        "realms_token": realms_token,
+        "realms_uhs": realms_uhs,
+        "realms_expiry": realms_expiry,
         "lic_rp": lic_rp,
         "lic_token": lic_token,
         "lic_uhs": lic_uhs,
         "lic_expiry": lic_expiry,
         "obtained": int(_time.time()),
     }
+    # Modern gamertag components are optional SISU claims.  Keep them
+    # separate because GDK callers provide component-specific buffer sizes;
+    # returning the classic tag for ModernSuffix can fail XblContext setup.
+    out.update(_xbl_gamertag_claims(xbl_claims))
+    # Optional for backwards compatibility: old, otherwise complete caches do
+    # not carry this claim and remain valid.  New caches expose it to WineGDK
+    # without storing or logging the full DisplayClaims object.
+    if xbl_privileges_present:
+        out["xbl_privileges"] = xbl_privileges
     problems = _online_preauth_problems(out)
     if problems:
         return _fallback("xbl_preauth: incomplete online chain ("
@@ -813,10 +912,11 @@ def xbl_preauth(msa_access_token, expected_account_epoch=None):
                          "refusing to store or reuse the old online payload.")
     bits = ["device"]
     if user_token: bits.append("user")
-    if xbl_token: bits.append(f"XBL(xuid={xbl_claims.get('xid')},gtg={xbl_claims.get('gtg')})")
-    if sisu_token: bits.append(f"SISU-pf(uhs={sisu_uhs})")
-    if mp_token: bits.append(f"SISU-mp(uhs={mp_uhs})")
-    if lic_token: bits.append(f"SISU-lic(uhs={lic_uhs})")
+    if xbl_token: bits.append("XBL")
+    if sisu_token: bits.append("SISU-pf")
+    if mp_token: bits.append("SISU-mp")
+    if realms_token: bits.append("SISU-realms")
+    if lic_token: bits.append("SISU-lic")
     ok(f"Xbox Live pre-auth: {', '.join(bits)}")
     return True
 
@@ -853,14 +953,6 @@ def wine_apply_winegdk_prereqs():
         reg_dword(r"Software\Microsoft\Windows NT\CurrentVersion\OEM",
                   "ConsoleMode", 8),
     ]
-    # Force the in-game "signed in with Microsoft" facet (unlocks the Servers
-    # tab). The engine reads this and applies the patch only when 1 (default);
-    # users whose game crashes on launch (the XSAPI account object never
-    # populates under Wine — issue #17/#18) set it 0 to fall back to the
-    # pre-patch behaviour (Servers greyed, but the game runs).
-    facet_enabled = force_msa_facet_enabled()
-    machine.append(reg_dword(WINEGDK_REG, "ForceMsaFacet",
-                             1 if facet_enabled else 0))
     # Azure rejects Wine GnuTLS' TLS 1.3 handshake (7-byte fatal Alert →
     # 0x80090304); forcing TLS 1.2 via DefaultSecureProtocols lets the
     # SISU/XSTS and PlayFab POSTs through.

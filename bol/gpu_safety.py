@@ -20,13 +20,14 @@ import time
 from pathlib import Path
 from typing import Mapping, Optional
 
-from .config import APP, DATA
+from .config import APP, DATA, WINEGDK_BUILD_REV
 from .log import BolError, die, warn
 
 
 GPU_LAUNCH_MARKER = DATA / ".gpu-launch-in-progress.json"
 GPU_SAFETY_ACK = DATA / ".gpu-safety-ack.json"
-_STATE_VERSION = 1
+_STATE_VERSION = 2
+_LEGACY_MARKER_VERSION = 1
 
 
 def _truthy(value: Optional[str]) -> bool:
@@ -153,9 +154,33 @@ def interrupted_launch_problem(path: Optional[Path] = None) -> Optional[str]:
             f"repair the data-directory permissions, then run '{command}'"
         )
     state = _read_state(marker)
-    if not state or state.get("version") != _STATE_VERSION:
+    if not state:
         return (
             "an interrupted Minecraft launch marker exists but is unreadable; "
+            f"after repairing the graphics driver and rebooting, run '{command}'"
+        )
+    if state.get("version") == _LEGACY_MARKER_VERSION:
+        # Schema 1 predates the durable wrapper-return phase. It cannot prove
+        # whether Wine merely crashed in userspace (as in issue #31) or the GPU
+        # session contributed to a hard lock, so never delete it implicitly.
+        same_boot = bool(_boot_id() and state.get("boot_id") == _boot_id())
+        if same_boot and _pid_alive(state.get("launcher_pid")):
+            return (
+                "a legacy Minecraft GPU session is still marked active in "
+                "this launcher; close or force-stop it instead of starting a "
+                "second session"
+            )
+        when = ("during this boot" if same_boot
+                else "before the last reboot/power loss")
+        return (
+            f"a legacy Minecraft GPU session did not return cleanly {when}; "
+            "the old marker cannot distinguish a Wine crash from a graphics-"
+            "driver failure, so after checking the driver and rebooting run "
+            f"'{command}' once to acknowledge it"
+        )
+    if state.get("version") != _STATE_VERSION:
+        return (
+            "an interrupted Minecraft launch marker has an unsupported format; "
             f"after repairing the graphics driver and rebooting, run '{command}'"
         )
     same_boot = bool(_boot_id() and state.get("boot_id") == _boot_id())
@@ -180,6 +205,8 @@ def arm_gpu_launch(path: Optional[Path] = None) -> str:
     token = secrets.token_hex(16)
     payload = {
         "version": _STATE_VERSION,
+        "engine_rev": WINEGDK_BUILD_REV,
+        "phase": "running",
         "token": token,
         "boot_id": _boot_id(),
         "launcher_pid": os.getpid(),
@@ -220,6 +247,77 @@ def disarm_gpu_launch(token: str, path: Optional[Path] = None) -> bool:
     except OSError:
         return False
     _sync_parent(marker)
+    return True
+
+
+def mark_gpu_wrapper_returned(
+        token: str, path: Optional[Path] = None) -> bool:
+    """Persist that UMU returned before checking Wine's final teardown."""
+
+    marker = Path(path) if path is not None else GPU_LAUNCH_MARKER
+    state = _read_state(marker)
+    if (not state or state.get("version") != _STATE_VERSION
+            or state.get("phase") != "running"
+            or not secrets.compare_digest(str(state.get("token", "")), token)):
+        return False
+    payload = dict(state)
+    payload["phase"] = "wrapper_returned"
+    payload["wrapper_returned"] = int(time.time())
+    try:
+        _write_state_atomic(marker, payload)
+    except OSError:
+        return False
+    return True
+
+
+def retire_idle_current_boot_marker(path: Optional[Path] = None) -> bool:
+    """Clear an orphan marker only after the caller proved the prefix idle.
+
+    UMU can return just before Wine's last helper or wineserver finishes its
+    normal shutdown.  If that exceeds the launcher's grace period, retaining
+    the marker is correct while those processes are live but must not turn
+    into a permanent same-boot block after the prefix has stopped. The launch
+    lock and idle-prefix check are owned by the caller. Only a marker which
+    durably records that the wrapper returned is eligible; a marker left while
+    Minecraft was running, an old-boot marker, malformed state, and token
+    races remain untouched. Kernel, journal, and display-provider checks still
+    run immediately after this recovery.
+    """
+
+    marker = Path(path) if path is not None else GPU_LAUNCH_MARKER
+    state = _read_state(marker)
+    expected_fields = {
+        "version", "engine_rev", "phase", "token", "boot_id",
+        "launcher_pid", "created", "wrapper_returned",
+    }
+    if (not state or state.get("version") != _STATE_VERSION
+            or state.get("phase") != "wrapper_returned"
+            or set(state) != expected_fields):
+        return False
+    boot = _boot_id()
+    if not boot or state.get("boot_id") != boot:
+        return False
+    pid = state.get("launcher_pid")
+    created = state.get("created")
+    wrapper_returned = state.get("wrapper_returned")
+    engine_rev = state.get("engine_rev")
+    token = state.get("token")
+    if (isinstance(pid, bool) or not isinstance(pid, int) or pid <= 1
+            or isinstance(created, bool) or not isinstance(created, int)
+            or created < 0 or not isinstance(engine_rev, str)
+            or isinstance(wrapper_returned, bool)
+            or not isinstance(wrapper_returned, int)
+            or wrapper_returned < created
+            or not engine_rev or not isinstance(token, str)
+            or not re.fullmatch(r"[0-9a-f]{32}", token)):
+        return False
+    if not disarm_gpu_launch(token, marker):
+        return False
+    warn(
+        "Removed an orphaned current-boot GPU marker after confirming the "
+        "Wine prefix is idle; kernel and display-server safety checks still "
+        "apply."
+    )
     return True
 
 

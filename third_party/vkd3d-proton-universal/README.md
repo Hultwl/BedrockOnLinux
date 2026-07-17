@@ -1,9 +1,10 @@
-# Universal vkd3d-proton payload for engine r11
+# Universal vkd3d-proton payload for engines r11, r12 and native5
 
-BedrockOnLinux engine revision `wow64-archs-r11` uses a reviewed
-vkd3d-proton 3.0.1 build containing both Vulkan device-generated-command
-implementations. vkd3d-proton itself selects `VK_EXT_device_generated_commands`
-when the selected device fully supports it and falls back to
+BedrockOnLinux engine revisions `wow64-archs-r11`, `wow64-archs-r12` and
+`wow64-archs-native5` use a reviewed vkd3d-proton 3.0.1 build containing both
+Vulkan device-generated-command implementations.
+vkd3d-proton itself selects `VK_EXT_device_generated_commands` when the
+selected device fully supports it and falls back to
 `VK_NV_device_generated_commands` on older NVIDIA drivers.
 
 This directory is the auditable provenance and rebuild bundle for that binary
@@ -64,7 +65,9 @@ packager:
 ```bash
 scripts/package-engine.sh /path/to/GDK-Proton-xuser \
   /tmp/bol-vkd3d-r11/vkd3d-build-output/vkd3d-proton-3.0.1-nv-dgc \
-  670eda2864dcb22d11c7f2c28973214d4755ad2f
+  75637b674e1f191e65753663c4c0c32bea05ba6e \
+  /path/to/GDK-Proton10-32.tar.gz \
+  /path/to/winegdk-native5-work/prefix
 ```
 
 ## Licence and distribution

@@ -2,255 +2,295 @@
 
 # 🟩 BedrockOnLinux
 
-**Minecraft Bedrock (Windows / GDK edition) on Linux, with native in-game
-Microsoft sign-in and multiplayer. Install it, pick a version, play.**
+**Run Minecraft Bedrock for Windows (GDK edition) on Linux with native
+Microsoft/Xbox identity, multiplayer, friends and Realms.**
+
+[Latest release](https://github.com/Wyze3306/BedrockOnLinux/releases/latest) ·
+[Report a bug](https://github.com/Wyze3306/BedrockOnLinux/issues) ·
+[MIT license](LICENSE)
 
 `Ubuntu` · `Debian` · `Linux Mint / LMDE` · `Fedora` · `Arch` · `openSUSE`
 
-![BedrockOnLinux](screenshot.png)
+![BedrockOnLinux launcher](screenshot.png)
 
 </div>
 
 ---
 
-## What it does
+## What 2.0 provides
 
-One app, everything automatic:
+BedrockOnLinux installs the Minecraft version you select, prepares a managed
+Wine prefix and runs the game through a reviewed WineGDK-based GDK-Proton
+engine. No compiler or Windows installation is required on the player’s
+machine.
 
-- downloads the Minecraft version you pick;
-- downloads and runs a reviewed **GDK-Proton** engine built from a **WineGDK**
-  fork that implements
-  `XUser` + request signing, so you sign in to **Microsoft inside the game**
-  — no relay, no proxy;
-- applies the binary patches the game needs to start and to join online
-  Bedrock servers;
-- fixes curl/SSL and `options.txt`, then launches the game.
+- **Native Xbox identity:** XGame configuration, XUser, request signatures,
+  gamertags, privileges and the XSAPI context are implemented by WineGDK.
+- **Online play:** the Friends list, invitations, joining friends, public
+  servers and Realms use that native identity. Realms receives a dedicated
+  XSTS token for the Bedrock Realms audience instead of a generic Xbox token.
+- **No Minecraft memory patcher:** the managed engine contains no code that
+  scans or rewrites the running Minecraft process. Packaging rejects remnants
+  of the former process-memory implementation. Static, fingerprinted game and
+  Proton compatibility fixups are still applied before launch.
+- **Working native file chooser:** the WinAppSDK file picker used by Minecraft
+  is implemented in Wine for both Windows architectures, including single and
+  multiple selection. In-game world and skin selection opens the desktop file
+  dialog instead of terminating the game.
+- **Graphics safety:** the launcher checks the existing display state and text
+  kernel logs without opening Vulkan or OpenGL. A known unsafe session is
+  blocked before Wine starts.
+- **Verified updates:** engine archives, critical runtime files and dependency
+  payloads are SHA-256 pinned. A rejected update does not replace a working
+  engine.
 
-You then play like on any platform: sign in, open **Play ▸ Servers**, and
-join native Bedrock servers (Hive, CubeCraft, …) or crossplay/Geyser servers.
+The Microsoft sign-in flow runs locally between the launcher, Microsoft and
+Xbox services. BedrockOnLinux does not use an account relay or multiplayer
+proxy.
 
 ## Install
 
-**Debian / Ubuntu / Mint** — `.deb`
+Download application files from the
+[latest release](https://github.com/Wyze3306/BedrockOnLinux/releases/latest).
+All currently supported builds target x86-64 Linux.
+
+| Format | Best for | Start command |
+|---|---|---|
+| AppImage | Most glibc-based desktop distributions | `./BedrockOnLinux-*-x86_64.AppImage` |
+| `.deb` | Debian, Ubuntu, Mint and LMDE | `sudo apt install ./bedrock-on-linux_*_amd64.deb` |
+| Portable `.pyz` | A host with Python 3.9+ and Tk | `./bedrock-on-linux-*.pyz gui` |
+| Flatpak bundle | Sandboxed local installation, when provided | `flatpak install --user ./BedrockOnLinux-*-x86_64.flatpak` |
+
+### AppImage quick start
 
 ```bash
-sudo apt install ./bedrock-on-linux_*_amd64.deb
+chmod +x BedrockOnLinux-2.0.0-x86_64.AppImage
+./BedrockOnLinux-2.0.0-x86_64.AppImage
 ```
 
-**Current x86-64 desktop distros** — AppImage (glibc 2.31+ baseline)
+The first **PLAY** needs the matching engine archive:
+
+```text
+GDK-Proton-xuser-<engine-revision>.tar.gz
+```
+
+With an internet connection, the launcher downloads the exact archive from
+the BedrockOnLinux release automatically. You can instead keep that engine
+asset beside the AppImage or `.pyz`; a matching local sidecar is preferred and
+verified before extraction. This is required when testing an unpublished
+candidate and is useful for an offline first install.
+
+An existing installation is upgraded in the same way on its next **PLAY**.
+The launcher validates the new engine before an atomic replacement and keeps
+the previous tree if download, disk space, extraction or verification fails.
+The fix is therefore distributed to existing users as well as fresh installs.
+
+If FUSE is unavailable, AppImage can extract itself at runtime:
 
 ```bash
-chmod +x BedrockOnLinux-*-x86_64.AppImage && ./BedrockOnLinux-*-x86_64.AppImage
+APPIMAGE_EXTRACT_AND_RUN=1 ./BedrockOnLinux-2.0.0-x86_64.AppImage
 ```
 
-**Portable** — single-file `.pyz` (any x86-64 distro with Python 3.9+)
+The AppImage bundles Python, Tk, the GUI toolkit, `cryptography` and CA
+certificates. It still uses the host graphics driver and common X11, Xft and
+fontconfig libraries. The `.deb` declares its host dependencies; the portable
+`.pyz` uses the host Python environment and can install its pinned Python GUI
+and sign-in dependencies on first use.
 
-```bash
-chmod +x bedrock-on-linux-*.pyz && ./bedrock-on-linux-*.pyz gui
-```
+Flatpak is built separately when a builder is available. See
+[`flatpak/README.md`](flatpak/README.md) for local build and permission details;
+the presence of a manifest does not imply that a particular release is already
+published on Flathub.
 
-The installed `.deb` and Flatpak appear in the application menu and launch
-normally with one click. A downloaded AppImage or `.pyz` may lose its
-executable bit; run the matching `chmod +x` command above once, or enable
-“Allow executing file as program” in the file manager, before double-clicking.
-AppImage also needs FUSE; on a system without it, use:
+## Requirements and limitations
 
-```bash
-APPIMAGE_EXTRACT_AND_RUN=1 ./BedrockOnLinux-*-x86_64.AppImage
-```
+- An **x86-64 glibc desktop**. The AppImage and managed engine are audited
+  against a glibc 2.31 baseline. ARM and musl-only systems such as stock Alpine
+  are not supported.
+- **X11 or XWayland for the launcher GUI.** The game normally uses X11/XWayland.
+  Native Wine Wayland can be tried with `BOL_INPUT=wayland`, but remains an
+  experimental game backend; it does not remove the launcher’s XWayland
+  requirement.
+- A working **Vulkan 1.3** driver exposing
+  `VK_EXT_device_generated_commands`, or the older NVIDIA
+  `VK_NV_device_generated_commands`. The managed vkd3d-proton 3.0.1 payload
+  contains both implementations and chooses inside the game process.
+- Enough free storage for the game, compressed engine and temporary
+  extraction. A `No space left on device` error is non-destructive: free space
+  and retry **PLAY**.
+- A Microsoft account entitled to Minecraft. Friends, multiplayer and Realms
+  also depend on the account’s privacy settings, any required Realms
+  subscription or invitation, and the availability of Microsoft/Xbox/Minecraft
+  services.
 
-The supported target is an x86-64 glibc desktop with X11 or XWayland. The
-AppImage bundles Python, Tk, `cryptography`, and CA certificates, but still
-uses the host's common X11/Xft/fontconfig libraries and graphics driver. ARM,
-musl-only distributions (such as stock Alpine), pure Wayland without XWayland,
-and GPUs which do not meet the Vulkan requirements below are not supported.
-
-The game path needs a Vulkan-capable GPU/driver exposing either
-`VK_EXT_device_generated_commands` or the older NVIDIA
-`VK_NV_device_generated_commands`. The managed 1.3 engine contains both paths,
-requires Vulkan 1.3, and honours explicit vkd3d overrides
-(`VKD3D_VULKAN_DEVICE` and `VKD3D_FILTER_DEVICE_NAME`). The launcher never
-opens Vulkan to guess an adapter: the universal DLL validates the real device
-and selects EXT/NV inside the one game process. This matters on broken kernel
-drivers, where a supposedly harmless launcher-side Vulkan probe can itself
-freeze the whole machine.
-
-**Flatpak**
-
-```bash
-flatpak install --user ./BedrockOnLinux-*-x86_64.flatpak
-flatpak run io.github.wyze3306.BedrockOnLinux
-```
-
-> Build it yourself with `scripts/build-flatpak.sh` (see
-> [`flatpak/README.md`](flatpak/README.md)).
-
-> The `.deb` and Flatpak declare their runtime dependencies. The AppImage
-> bundles its Python GUI and authentication stack. The `.pyz` uses the host's
-> Python 3.9+, Tk, archive tools, and installs Python `cryptography` on first
-> login when needed. `bedrock-on-linux doctor` reports anything missing.
+The launcher is an independent compatibility project and is not affiliated
+with or supported by Mojang or Microsoft. Minecraft updates can change private
+game interfaces; select a known-working version or attach diagnostics when a
+new version regresses.
 
 ## Play
 
 1. Open **BedrockOnLinux**.
-2. Top-right **Sign in** — open the shown link, enter the code, and sign in
-   with the account that owns Minecraft.
-3. Pick a **version** (bottom-left), then hit **▶ PLAY**.
-4. In game: **Play ▸ Servers** (or *Discover*) and join.
+2. Select **Sign in**, open the Microsoft device-code page shown by the
+   launcher and enter its code.
+3. Select a Minecraft version, then choose **▶ PLAY**.
+4. Use Minecraft’s **Friends**, **Servers** and **Realms** tabs normally.
 
-The first **PLAY** downloads the version and the engine (once); after that it
-just starts. Everything else is handled for you — **no build tools needed**.
+The first run downloads and prepares Minecraft, then downloads and verifies
+the managed engine and its online/TLS compatibility payload. Later runs reuse
+them. Account credentials are stored in the private BedrockOnLinux data
+directory and seeded into the stopped Wine prefix before launch.
 
-Before starting any Wine or Vulkan process, 1.3 performs a GPU-safe preflight
-using only the existing display server and text system logs. A degraded X11
-session with zero hardware providers, FBDEV/llvmpipe fallback, or a fatal GPU
-kernel fault is refused with an actionable message. Run
-`bedrock-on-linux doctor` after repairing the host driver and rebooting. The
-advanced `BOL_ALLOW_UNSAFE_GPU=1` bypass exists for false positives, but can
-re-expose a kernel hard-lock and is not a normal compatibility setting.
-
-Microsoft/Xbox server access is enabled by default. When a guarded engine is
-upgraded, the launcher retries online access once instead of silently keeping
-an old compatibility toggle disabled. For emergency troubleshooting only,
-`BOL_DISABLE_SERVER_PATCHES=1 bedrock-on-linux play` disables the memory
-patches for that single launch without changing the saved preference.
-
-## The engine (first run)
-
-The game runs on a WineGDK-based GDK-Proton ("the engine"). On first launch
-the launcher **downloads a prebuilt engine** from the releases and unpacks it —
-just like the game itself. You do **not** need a compiler or any `-dev`
-packages.
-
-The 1.3 engine contains one reviewed vkd3d-proton 3.0.1 compatibility build
-with both DGC implementations. vkd3d uses
-`VK_EXT_device_generated_commands` when the selected GPU and driver support
-it, and falls back internally to the restored
-`VK_NV_device_generated_commands` path on older NVIDIA drivers. The launcher
-also enables the raw-VA root-CBV mode required by Minecraft's indirect menu
-commands. Together these changes prevent the live-game process from freezing
-in the menu while audio keeps playing (#27, #29, #30).
-
-On an existing prefix, PLAY starts no Wine helper before Minecraft. Microsoft,
-Xbox, TLS, and GameInput registry values are written directly to the stopped
-prefix under a lock, atomically and with private permissions; this replaces the
-old sequence of `umu reg` processes which unnecessarily started Explorer and
-the graphics stack. A brand-new prefix still needs one headless `wineboot`,
-with Vulkan/D3D/display drivers disabled for that setup-only step. A second
-PLAY is refused while the prefix is active, and automatic repair/relaunch loops
-are disabled: recovery is always an explicit user action.
-
-Managed installs accept only the exact prebuilt archive hash carried by the
-launcher. If that candidate is unavailable or invalid, an existing engine is
-kept and a first install stops with an actionable error; it never substitutes
-an unreproducible source build.
-
-**Maintainers — building a prebuilt engine candidate:** build the pinned
-WineGDK source on the Debian 11/glibc 2.31 baseline, combine that prefix with a
-clean GDK-Proton base and the reviewed vkd3d 3.0.1 universal DGC compatibility
-build, then package it:
+Minecraft’s **Import World** and skin-selection actions use the WineGDK native
+file picker. For direct launcher-side content installation while Minecraft is
+closed, use:
 
 ```bash
+bedrock-on-linux import world.mcworld addon.mcaddon pack.mcpack template.mctemplate
+```
+
+The launcher imports `.mcworld`, `.mcaddon`, `.mcpack` and `.mctemplate`
+archives into the appropriate `com.mojang` directory. It does not overwrite an
+existing item with the same folder name.
+
+## GPU safety
+
+BedrockOnLinux deliberately does not open a Vulkan or OpenGL device to guess
+whether the driver is healthy. Before launch it can detect, from already
+available state, conditions such as:
+
+- an X11 session with no hardware RandR provider;
+- FBDEV or software-rendering fallback;
+- a fatal graphics-driver event in the kernel journal;
+- a Minecraft GPU session that did not return before a reboot or power loss.
+
+The last case is recorded by a durable launch marker. A normal completed
+shutdown retires it only after the Wine prefix is idle. Version 2.0 records a
+separate durable wrapper-return phase, so a delayed normal Wine teardown no
+longer becomes a permanent same-boot block. Older markers cannot distinguish
+the userspace crash reported in issue
+[#31](https://github.com/Wyze3306/BedrockOnLinux/issues/31) from a real driver
+failure and therefore still require the explicit one-time acknowledgement
+below.
+
+If the desktop freezes or the machine requires a forced power-off, do not
+blindly retry. Repair or reinstall the host GPU driver, reboot, then run:
+
+```bash
+bedrock-on-linux doctor
+bedrock-on-linux doctor --acknowledge-gpu-crash
+```
+
+Acknowledgement clears only an old interrupted-session block. A current
+kernel fault or unsafe display state remains blocked. The advanced override
+below is intended only for a confirmed false positive and can re-expose a
+kernel hard lock:
+
+```bash
+BOL_ALLOW_UNSAFE_GPU=1 bedrock-on-linux play
+```
+
+## Diagnostics and recovery
+
+Open **Settings ▸ Open logs folder**, or inspect:
+
+```text
+~/.local/share/bedrock-on-linux/logs/
+```
+
+The GUI’s **Details** panel contains the live launcher log. Useful commands:
+
+```bash
+bedrock-on-linux doctor                 # host dependencies and GPU safety
+bedrock-on-linux repair                 # rebuild the managed Wine prefix
+bedrock-on-linux versions               # available stable versions
+bedrock-on-linux versions --beta        # include beta versions
+bedrock-on-linux setup --mc <version>   # download and prepare one version
+bedrock-on-linux login                  # link a Microsoft account
+bedrock-on-linux play                   # launch the selected version
+bedrock-on-linux update                 # check for a launcher update
+```
+
+`repair` resets compatibility state, not the host graphics driver. Back up any
+important game data before manual changes under
+`~/.local/share/bedrock-on-linux`. When reporting a bug, include the launcher
+version, engine revision, Minecraft version, distribution, GPU/driver and the
+relevant log files; never publish account tokens or the private authentication
+directory.
+
+## Engine integrity and source provenance
+
+The managed engine is not built on the user’s computer. Release maintainers
+produce it from pinned inputs and the launcher accepts only the revision and
+archive SHA-256 recorded in [`bol/config.py`](bol/config.py).
+
+- WineGDK is built in an unprivileged Debian 11 (Bullseye) chroot. Every
+  resulting ELF is rejected if it requires a glibc symbol newer than 2.31.
+- The exact WineGDK source commit, reviewed patches and changed-file hashes are
+  stored under [`third_party/`](third_party/).
+- The universal vkd3d-proton build contains reviewed EXT-DGC and restored
+  NV-DGC variants for x86-64 and i386. Its inputs and output hashes are
+  documented in
+  [`third_party/vkd3d-proton-universal/README.md`](third_party/vkd3d-proton-universal/README.md).
+- `scripts/package-engine.sh` embeds licences, build records, source
+  provenance and an `engine-manifest.json` that hashes critical runtime files.
+  The completed archive is extracted and rechecked before it is accepted as a
+  candidate.
+- Engine installation uses a lock and transactional rename. An interrupted or
+  invalid update cannot silently become the active managed engine.
+
+The native Xbox and WinAppSDK work is built for both PE architectures. The
+packager verifies native XGame/XUser markers, file-picker registration and the
+absence of the former memory-patcher code before creating the archive.
+
+## Build from source
+
+Application builds require the matching engine and OpenSSL XCurl assets to
+already be present in `dist/`; release scripts do not download or publish
+unreviewed substitutes.
+
+```bash
+# Build the pinned WineGDK source in a clean Bullseye work directory.
 scripts/build-winegdk-bullseye.sh /path/to/empty-workdir /path/to/WineGDK
+
+# Build the reviewed universal vkd3d-proton payload when it is not available.
+scripts/build-vkd3d-universal.sh /path/to/empty-vkd3d-workdir
+
+# Package the engine from reviewed inputs and the WineGDK build prefix.
 scripts/package-engine.sh \
   /path/to/staged/GDK-Proton-xuser \
   /path/to/vkd3d-proton-3.0.1-universal-dgc \
-  670eda2864dcb22d11c7f2c28973214d4755ad2f \
-  /path/to/GDK-Proton10-32.tar.gz
-scripts/run-candidate.sh gui         # force-installs that exact archive, then runs
+  "$(python3 -c 'from bol.config import WINEGDK_SOURCE_COMMIT; print(WINEGDK_SOURCE_COMMIT)')" \
+  /path/to/GDK-Proton10-32.tar.gz \
+  /path/to/empty-workdir/prefix
+
+# Build and verify .deb, AppImage, portable .pyz and local/dev Flatpak candidates.
+scripts/build-release.sh
+scripts/verify-release-candidate.sh
+
+# Force-install the exact local sidecar and run it; never publishes anything.
+scripts/run-candidate.sh gui
+
+# Optional standalone local/dev Flatpak rebuild. For publication, pin the
+# release tag and commit in the manifest, then add --release.
+scripts/build-flatpak.sh
 ```
 
-The Wine build script uses an unprivileged Bullseye chroot and rejects every
-ELF that imports a symbol newer than `GLIBC_2.31`. The second argument to
-`package-engine.sh` is a staging tree containing the
-reviewed universal EXT+NV DGC DLLs for both Windows architectures. It validates
-the 3.0.1 payload and restores the exact hash-pinned native XThreading delegate
-from Weather-OS GDK-Proton 10-32 (required by WineGDK for XAsync/XTaskQueue).
-It writes a hash-pinned `engine-manifest.json` before
-creating a deterministic archive. Pin the printed archive SHA-256 in
-`bol/config.py`; the launcher verifies both that archive and its manifest before
-it replaces a working engine.
+`scripts/build-release.sh` only creates local candidate files and checksums in
+`dist/`; its Flatpak is intentionally a working-tree development bundle. It
+does not tag, push or upload a release. Bump the engine revision
+whenever engine contents or packaging change, update the reviewed archive hash
+in `bol/config.py`, run the complete test suite and smoke-test the exact
+candidate before publication.
 
-The launcher finds the asset by name (`GDK-Proton-xuser-<rev>.tar.gz`) across
-the app's releases. Bump `WINEGDK_BUILD_REV` in `bol/config.py` whenever the
-engine contents or packaging changes, then build and test a fresh asset before
-publishing it.
+## Legal and license
 
-## Command line
+BedrockOnLinux ships **no Minecraft game files**. By default, game packages
+are obtained from the community-maintained
+[`bubbles-wow/mcbe-gdk-unpack-archive`](https://github.com/bubbles-wow/mcbe-gdk-unpack-archive),
+or from a local source selected by the user. You must own Minecraft and comply
+with the terms that apply to it.
 
-```bash
-bedrock-on-linux              # open the launcher (same as 'gui')
-bedrock-on-linux versions     # list available Minecraft versions
-bedrock-on-linux setup --mc 1.26.21.1   # download + prepare a version
-bedrock-on-linux login        # sign in to a Microsoft account
-bedrock-on-linux play         # launch
-bedrock-on-linux repair       # reset a broken Wine prefix
-bedrock-on-linux doctor       # check host requirements
-bedrock-on-linux doctor --acknowledge-gpu-crash  # after driver repair + reboot
-bedrock-on-linux update       # check for and install a launcher update
-```
-
-The launcher also checks for updates on its own: when a newer version is
-released, a banner appears at the top of the window with an **Update now**
-button (one click downloads and installs it, then offers to restart). Git
-checkouts are left alone — `git pull` there — and packaged installs (`.deb`,
-Flatpak) point you at your package manager instead.
-
-## If something fails
-
-Use **⚙ Settings ▸ Open logs folder**
-(`~/.local/share/bedrock-on-linux/logs/`), or **⚙ Settings ▸ Repair** to
-rebuild a broken Wine prefix. The live step-by-step log is also under
-**Details** in the launcher.
-
-If the whole desktop freezes or the machine needs the physical power button,
-do not retry. After reboot, run `bedrock-on-linux doctor`. The launcher checks
-the current and previous kernel boots without opening Vulkan/OpenGL and keeps a
-durable marker for a Minecraft session interrupted by a power loss. A report
-such as “zero RandR GPU providers”, “FBDEV/software rendering”, “fatal kernel
-fault”, or “previous session did not return cleanly” means the host
-Mesa/NVIDIA/AMD/Intel driver installation must be fixed before Minecraft can be
-tested safely; resetting Wine cannot repair a kernel graphics driver.
-
-After repairing/updating the driver and rebooting, run
-`bedrock-on-linux doctor --acknowledge-gpu-crash`. This clears only the old
-interrupted-session/previous-boot block; a current kernel fault or an unsafe
-X11 RandR state remains blocked. On X11, install the distribution package that
-provides `xrandr` if Doctor cannot verify a hardware provider. Wayland and
-sandboxed Flatpak sessions cannot always expose the system journal, so a first
-unknown driver failure cannot be predicted; the durable marker prevents a
-blind second attempt.
-
-## Legal
-
-BedrockOnLinux ships **no Minecraft files** — it is a compatibility launcher.
-Game files come from a source you choose (default: the community archive
-[`bubbles-wow/mcbe-gdk-unpack-archive`](https://github.com/bubbles-wow/mcbe-gdk-unpack-archive))
-or your own folder; **you must own Minecraft**. GDK-Proton and WineGDK are
-free software under their own licenses. Realms is not supported.
-
-## Build
-
-```bash
-scripts/build-release.sh        # .deb + AppImage + portable .pyz → dist/
-scripts/build-flatpak.sh        # Flatpak bundle → dist/ (needs flatpak-builder)
-scripts/run-candidate.sh gui    # run the local candidate; never publishes
-```
-
-For an **unreleased local candidate**, keep
-`GDK-Proton-xuser-<rev>.tar.gz` in the same `dist/` directory as the AppImage
-or `.pyz`. The launcher detects that exact sibling archive and installs it
-before Wine can start; moving only the application file would instead require
-the matching engine asset to already exist online. `scripts/run-candidate.sh`
-is the safest checkout-level smoke-test because it refuses to fall back to an
-older installed engine.
-
-The launcher is a small Python package, [`bol/`](bol/) — one module per
-concern (`config`, `auth`, `prefix`, `fixups`, `launch`, `gui`, …) behind the
-thin `bedrock-on-linux` entry point. The portable artifact is that package
-zipped into a single executable `.pyz`; the `.deb`/Flatpak/AppImage ship the
-package alongside the entry point.
-
-## License
-
-MIT — see [`LICENSE`](LICENSE).
+WineGDK, GDK-Proton, vkd3d-proton and bundled dependencies remain under their
+respective licences; the engine includes their relevant notices and
+provenance. BedrockOnLinux itself is MIT-licensed — see [`LICENSE`](LICENSE).

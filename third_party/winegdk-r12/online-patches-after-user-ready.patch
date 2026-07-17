@@ -1,0 +1,1612 @@
+From 432f414b251cc6d668404825a1d0f05eca807a70 Mon Sep 17 00:00:00 2001
+From: Wyze3306 <remy.grisollet@gmail.com>
+Date: Tue, 14 Jul 2026 19:33:55 +0200
+Subject: [PATCH] xgameruntime: defer guarded online patches until XUser is
+ ready
+
+---
+ .../GDKComponent/System/User/XUser.c          | 264 ++++--
+ .../GDKComponent/System/User/XUser.h          |   5 +-
+ dlls/xgameruntime/main.c                      | 814 +++++++-----------
+ dlls/xgameruntime/private.h                   |   3 +-
+ dlls/xgameruntime/tests/xgameruntime.c        |  80 +-
+ 5 files changed, 566 insertions(+), 600 deletions(-)
+
+diff --git a/dlls/xgameruntime/GDKComponent/System/User/XUser.c b/dlls/xgameruntime/GDKComponent/System/User/XUser.c
+index 09958317d8d..5c6bb013bc0 100644
+--- a/dlls/xgameruntime/GDKComponent/System/User/XUser.c
++++ b/dlls/xgameruntime/GDKComponent/System/User/XUser.c
+@@ -38,17 +38,67 @@ static inline HRESULT GetJsonStringValue( IJsonObject *object, LPCWSTR key, HSTR
+     return IJsonObject_GetNamedString( object, key_hstr, value );
+ }
+ 
++static time_t HSTRINGToEpoch( HSTRING value )
++{
++    unsigned long long seconds;
++    UINT32 length;
++    LPSTR text, end;
++
++    if (!value || !WindowsGetStringLen( value ) ||
++        FAILED( HSTRINGToMultiByte( value, &text, &length ) ))
++        return 0;
++    seconds = strtoull( text, &end, 10 );
++    if (end == text || *end || !seconds || seconds > 0x7fffffffffffffffULL)
++        seconds = 0;
++    free( text );
++    return (time_t)seconds;
++}
++
++static BOOLEAN HSTRINGIsReady( HSTRING value )
++{
++    return value && WindowsGetStringLen( value );
++}
++
+ static const struct IXUserImplVtbl x_user_vtbl;
+ static const struct IXUserGamertagVtbl x_user_gt_vtbl;
+ 
+-/* Change event callback storage */
+-static XUserChangeEventCallback g_change_callback;
+-static PVOID g_change_context;
+-static XTaskQueueHandle g_change_queue;
++struct change_registration
++{
++    struct change_registration *next;
++    UINT64 token;
++};
++
++static SRWLOCK change_registration_lock = SRWLOCK_INIT;
++static struct change_registration *change_registrations;
++static LONG64 next_change_token;
+ 
+ /* Track last signed-in user for FindUserByLocalId/ById */
+ static struct x_user *g_signed_in_user;
+ 
++static struct x_user *signed_in_user_snapshot( void )
++{
++    return InterlockedCompareExchangePointer(
++        (void *volatile *)&g_signed_in_user, NULL, NULL );
++}
++
++static BOOLEAN online_user_ready( const struct x_user *user )
++{
++    time_t now = time( NULL );
++
++    return user->xuid && user->local_id.value &&
++           HSTRINGIsReady( user->refresh_token ) &&
++           HSTRINGIsReady( user->oauth_token ) &&
++           HSTRINGIsReady( user->user_token ) &&
++           HSTRINGIsReady( user->xsts_token ) &&
++           HSTRINGIsReady( user->mp_token ) && user->mp_uhs &&
++           user->mp_rp[0] &&
++           !strcmp( user->mp_rp, "https://multiplayer.minecraft.net/" ) &&
++           user->oauth_token_expiry > now + 60 &&
++           user->user_token_expiry > now + 60 &&
++           user->xsts_token_expiry > now + 60 &&
++           user->mp_expiry > now + 60;
++}
++
+ static HRESULT LoadDefaultUser( XUserHandle *user, LPCSTR client_id )
+ {
+     struct x_user *impl;
+@@ -56,6 +106,7 @@ static HRESULT LoadDefaultUser( XUserHandle *user, LPCSTR client_id )
+     LPSTR buffer;
+     HRESULT hr;
+     DWORD size;
++    BOOLEAN preauth_done = FALSE;
+ 
+     if (!user || !client_id) return E_POINTER;
+ 
+@@ -125,7 +176,6 @@ static HRESULT LoadDefaultUser( XUserHandle *user, LPCSTR client_id )
+      * $WINEGDK_PREAUTH_DEVICE. If the file has those fields we use them
+      * straight and skip RequestUserToken + RequestXstsToken entirely. The
+      * Wine path still runs as a fallback for completeness. */
+-    BOOLEAN preauth_done = FALSE;
+     {
+         const char *preauth_path = getenv( "WINEGDK_PREAUTH_DEVICE" );
+         if (preauth_path && *preauth_path)
+@@ -146,6 +196,9 @@ static HRESULT LoadDefaultUser( XUserHandle *user, LPCSTR client_id )
+                         HSTRING uhs_s = NULL, sisu_uhs_s = NULL, sisu_rp_s = NULL;
+                         HSTRING mptok = NULL, mp_uhs_s = NULL, mp_rp_s = NULL;
+                         HSTRING lictok = NULL, lic_uhs_s = NULL, lic_rp_s = NULL;
++                        HSTRING user_expiry_s = NULL, xbl_expiry_s = NULL;
++                        HSTRING sisu_expiry_s = NULL, mp_expiry_s = NULL;
++                        HSTRING lic_expiry_s = NULL;
+                         (void)GetJsonStringValue( root, L"user_token", &utok );
+                         (void)GetJsonStringValue( root, L"xbl_token", &xtok );
+                         (void)GetJsonStringValue( root, L"sisu_token", &stok );
+@@ -161,11 +214,18 @@ static HRESULT LoadDefaultUser( XUserHandle *user, LPCSTR client_id )
+                         (void)GetJsonStringValue( root, L"lic_token", &lictok );
+                         (void)GetJsonStringValue( root, L"lic_uhs", &lic_uhs_s );
+                         (void)GetJsonStringValue( root, L"lic_rp", &lic_rp_s );
++                        (void)GetJsonStringValue( root, L"user_token_expiry_epoch", &user_expiry_s );
++                        (void)GetJsonStringValue( root, L"xbl_token_expiry_epoch", &xbl_expiry_s );
++                        (void)GetJsonStringValue( root, L"sisu_expiry_epoch", &sisu_expiry_s );
++                        (void)GetJsonStringValue( root, L"mp_expiry_epoch", &mp_expiry_s );
++                        (void)GetJsonStringValue( root, L"lic_expiry_epoch", &lic_expiry_s );
+                         if (utok && xtok && xuid_s)
+                         {
+                             LPSTR mb = NULL; UINT32 ml = 0;
+                             WindowsDuplicateString( utok, &impl->user_token );
+                             WindowsDuplicateString( xtok, &impl->xsts_token );
++                            impl->user_token_expiry = HSTRINGToEpoch( user_expiry_s );
++                            impl->xsts_token_expiry = HSTRINGToEpoch( xbl_expiry_s );
+                             /* xuid */
+                             if (SUCCEEDED( HSTRINGToMultiByte( xuid_s, &mb, &ml ) ) && mb)
+                             { impl->xuid = strtoull( mb, NULL, 10 ); free( mb ); mb = NULL; }
+@@ -192,7 +252,7 @@ static HRESULT LoadDefaultUser( XUserHandle *user, LPCSTR client_id )
+                                 { impl->sisu_uhs = strtoull( mb, NULL, 10 ); free( mb ); mb = NULL; }
+                                 if (SUCCEEDED( HSTRINGToMultiByte( sisu_rp_s, &mb, &ml ) ) && mb)
+                                 { lstrcpynA( impl->sisu_rp, mb, sizeof(impl->sisu_rp) ); free( mb ); mb = NULL; }
+-                                impl->sisu_expiry = time( NULL ) + 4 * 3600;
++                                impl->sisu_expiry = HSTRINGToEpoch( sisu_expiry_s );
+                             }
+                             /* SISU cache for the multiplayer RP (external-server join) */
+                             if (mptok && mp_uhs_s && mp_rp_s)
+@@ -202,7 +262,7 @@ static HRESULT LoadDefaultUser( XUserHandle *user, LPCSTR client_id )
+                                 { impl->mp_uhs = strtoull( mb, NULL, 10 ); free( mb ); mb = NULL; }
+                                 if (SUCCEEDED( HSTRINGToMultiByte( mp_rp_s, &mb, &ml ) ) && mb)
+                                 { lstrcpynA( impl->mp_rp, mb, sizeof(impl->mp_rp) ); free( mb ); mb = NULL; }
+-                                impl->mp_expiry = time( NULL ) + 4 * 3600;
++                                impl->mp_expiry = HSTRINGToEpoch( mp_expiry_s );
+                             }
+                             /* SISU cache for the marketplace/licensing RP (in-game Store) */
+                             if (lictok && lic_uhs_s && lic_rp_s)
+@@ -212,7 +272,7 @@ static HRESULT LoadDefaultUser( XUserHandle *user, LPCSTR client_id )
+                                 { impl->lic_uhs = strtoull( mb, NULL, 10 ); free( mb ); mb = NULL; }
+                                 if (SUCCEEDED( HSTRINGToMultiByte( lic_rp_s, &mb, &ml ) ) && mb)
+                                 { lstrcpynA( impl->lic_rp, mb, sizeof(impl->lic_rp) ); free( mb ); mb = NULL; }
+-                                impl->lic_expiry = time( NULL ) + 4 * 3600;
++                                impl->lic_expiry = HSTRINGToEpoch( lic_expiry_s );
+                             }
+                             preauth_done = TRUE;
+                             ERR( "preauth: loaded user/XSTS tokens for xuid=%llu gtg=%s — skipping Wine HTTP\n",
+@@ -233,6 +293,11 @@ static HRESULT LoadDefaultUser( XUserHandle *user, LPCSTR client_id )
+                         if (lictok) WindowsDeleteString( lictok );
+                         if (lic_uhs_s) WindowsDeleteString( lic_uhs_s );
+                         if (lic_rp_s) WindowsDeleteString( lic_rp_s );
++                        if (user_expiry_s) WindowsDeleteString( user_expiry_s );
++                        if (xbl_expiry_s) WindowsDeleteString( xbl_expiry_s );
++                        if (sisu_expiry_s) WindowsDeleteString( sisu_expiry_s );
++                        if (mp_expiry_s) WindowsDeleteString( mp_expiry_s );
++                        if (lic_expiry_s) WindowsDeleteString( lic_expiry_s );
+                         IJsonObject_Release( root );
+                     }
+                 }
+@@ -305,7 +370,10 @@ static HRESULT WINAPI x_user_QueryInterface( IXUserImpl *iface, REFIID iid, void
+ static ULONG WINAPI x_user_AddRef( IXUserImpl *iface )
+ {
+     struct x_user *impl = impl_from_IXUserImpl( iface );
+-    ULONG ref = InterlockedIncrement( &impl->ref );
++    ULONG ref;
++
++    if (impl->is_provider) return 2;
++    ref = InterlockedIncrement( &impl->ref );
+     TRACE( "iface %p increasing refcount to %lu\n", iface, ref );
+     return ref;
+ }
+@@ -313,7 +381,10 @@ static ULONG WINAPI x_user_AddRef( IXUserImpl *iface )
+ static ULONG WINAPI x_user_Release( IXUserImpl *iface )
+ {
+     struct x_user *impl = impl_from_IXUserImpl( iface );
+-    ULONG ref = InterlockedDecrement( &impl->ref );
++    ULONG ref;
++
++    if (impl->is_provider) return 1;
++    ref = InterlockedDecrement( &impl->ref );
+     TRACE( "iface %p decreasing refcount to %lu\n", iface, ref );
+     if (!ref)
+     {
+@@ -331,16 +402,18 @@ static ULONG WINAPI x_user_Release( IXUserImpl *iface )
+ 
+ static HRESULT WINAPI x_user_XUserDuplicateHandle( IXUserImpl *iface, XUserHandle user, XUserHandle *duplicated )
+ {
++    struct x_user *signed_in = signed_in_user_snapshot();
++
+     TRACE( "iface %p, user %p, duplicated %p\n", iface, user, duplicated );
+     if (!duplicated) return E_POINTER;
+     if (!user)
+     {
+         /* Game may pass NULL when getting user from composite interface */
+-        if (g_signed_in_user)
++        if (signed_in)
+         {
+-            TRACE( "NULL user, returning g_signed_in_user %p\n", g_signed_in_user );
+-            IXUserImpl_AddRef( &g_signed_in_user->IXUserImpl_iface );
+-            *duplicated = (XUserHandle)g_signed_in_user;
++            TRACE( "NULL user, returning signed-in user %p\n", signed_in );
++            IXUserImpl_AddRef( &signed_in->IXUserImpl_iface );
++            *duplicated = (XUserHandle)signed_in;
+             return S_OK;
+         }
+         return E_POINTER;
+@@ -380,7 +453,7 @@ static HRESULT CALLBACK XUserAddProvider( XAsyncOp operation, const XAsyncProvid
+ {
+     struct XUserAddContext *context;
+     IXThreadingImpl *impl;
+-    HRESULT hr;
++    HRESULT hr, result = S_OK;
+ 
+     TRACE( "operation %d, providerData %p\n", operation, providerData );
+ 
+@@ -391,7 +464,8 @@ static HRESULT CALLBACK XUserAddProvider( XAsyncOp operation, const XAsyncProvid
+     switch (operation)
+     {
+         case Begin:
+-            return impl->lpVtbl->XAsyncSchedule( impl, providerData->async, 0 );
++            result = impl->lpVtbl->XAsyncSchedule( impl, providerData->async, 0 );
++            break;
+ 
+         case GetResult:
+             memcpy( providerData->buffer, &context->user, sizeof( XUserHandle ) );
+@@ -415,7 +489,8 @@ static HRESULT CALLBACK XUserAddProvider( XAsyncOp operation, const XAsyncProvid
+             break;
+     }
+ 
+-    return S_OK;
++    impl->lpVtbl->Release( impl );
++    return result;
+ }
+ 
+ static HRESULT WINAPI x_user_XUserAddAsync( IXUserImpl *iface, XUserAddOptions options, XAsyncBlock *asyncBlock )
+@@ -451,17 +526,18 @@ static HRESULT WINAPI x_user_XUserAddResult( IXUserImpl *iface, XAsyncBlock *asy
+     if (!asyncBlock || !user) return E_POINTER;
+     if (FAILED( QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl, (void**)&impl ) )) return E_NOTIMPL;
+     hr = impl->lpVtbl->XAsyncGetResult( impl, asyncBlock, x_user_XUserAddAsync, sizeof( XUserHandle ), user, NULL );
++    impl->lpVtbl->Release( impl );
+     TRACE( "XUserAddResult returning hr=0x%08lx, user=%p\n", hr, user ? *user : NULL );
+ 
+-    /* Track the signed-in user */
+     if (SUCCEEDED( hr ) && *user)
+     {
+         struct x_user *u = (struct x_user *)*user;
+-        if (!g_signed_in_user)
+-        {
+-            g_signed_in_user = u;
+-            IXUserImpl_AddRef( &u->IXUserImpl_iface );
+-        }
++
++        WineGDKApplyOnlinePatches( online_user_ready( u ) );
++        IXUserImpl_AddRef( &u->IXUserImpl_iface );
++        if (InterlockedCompareExchangePointer(
++                (void *volatile *)&g_signed_in_user, u, NULL ))
++            IXUserImpl_Release( &u->IXUserImpl_iface );
+     }
+ 
+     return hr;
+@@ -477,12 +553,14 @@ static HRESULT WINAPI x_user_XUserGetLocalId( IXUserImpl *iface, XUserHandle use
+ 
+ static HRESULT WINAPI x_user_XUserFindUserByLocalId( IXUserImpl *iface, XUserLocalId localId, XUserHandle *user )
+ {
++    struct x_user *signed_in = signed_in_user_snapshot();
++
+     TRACE( "iface %p, localId %llu, user %p\n", iface, (unsigned long long)localId.value, user );
+     if (!user) return E_POINTER;
+-    if (g_signed_in_user && g_signed_in_user->local_id.value == localId.value)
++    if (signed_in && signed_in->local_id.value == localId.value)
+     {
+-        IXUserImpl_AddRef( &g_signed_in_user->IXUserImpl_iface );
+-        *user = (XUserHandle)g_signed_in_user;
++        IXUserImpl_AddRef( &signed_in->IXUserImpl_iface );
++        *user = (XUserHandle)signed_in;
+         return S_OK;
+     }
+     return E_GAMEUSER_NO_DEFAULT_USER;
+@@ -499,12 +577,14 @@ static HRESULT WINAPI x_user_XUserGetId( IXUserImpl *iface, XUserHandle user, UI
+ 
+ static HRESULT WINAPI x_user_XUserFindUserById( IXUserImpl *iface, UINT64 userId, XUserHandle *user )
+ {
++    struct x_user *signed_in = signed_in_user_snapshot();
++
+     TRACE( "iface %p, userId %llu, user %p\n", iface, (unsigned long long)userId, user );
+     if (!user) return E_POINTER;
+-    if (g_signed_in_user && g_signed_in_user->xuid == userId)
++    if (signed_in && signed_in->xuid == userId)
+     {
+-        IXUserImpl_AddRef( &g_signed_in_user->IXUserImpl_iface );
+-        *user = (XUserHandle)g_signed_in_user;
++        IXUserImpl_AddRef( &signed_in->IXUserImpl_iface );
++        *user = (XUserHandle)signed_in;
+         return S_OK;
+     }
+     return E_GAMEUSER_NO_DEFAULT_USER;
+@@ -546,7 +626,8 @@ static HRESULT WINAPI x_user_XUserGetGamerPictureResultSize( IXUserImpl *iface,
+ 
+ static HRESULT WINAPI x_user_XUserGetGamerPictureResult( IXUserImpl *iface, XAsyncBlock *asyncBlock, SIZE_T size, PVOID buffer, SIZE_T *used )
+ {
+-    FIXME( "iface %p, asyncBlock %p, size %llu, buffer %p, used %p stub!\n", iface, asyncBlock, size, buffer, used );
++    FIXME( "iface %p, asyncBlock %p, size %llu, buffer %p, used %p stub!\n",
++           iface, asyncBlock, (unsigned long long)size, buffer, used );
+     return E_NOTIMPL;
+ }
+ 
+@@ -638,6 +719,7 @@ static HRESULT CALLBACK XUserGetTokenAndSignatureProvider( XAsyncOp operation, c
+ {
+     struct XUserGetTokenAndSignatureContext *context;
+     IXThreadingImpl *impl;
++    HRESULT result = S_OK;
+ 
+     TRACE( "operation %d, providerData %p\n", operation, providerData );
+ 
+@@ -648,7 +730,8 @@ static HRESULT CALLBACK XUserGetTokenAndSignatureProvider( XAsyncOp operation, c
+     switch (operation)
+     {
+         case Begin:
+-            return impl->lpVtbl->XAsyncSchedule( impl, providerData->async, 0 );
++            result = impl->lpVtbl->XAsyncSchedule( impl, providerData->async, 0 );
++            break;
+ 
+         case GetResult:
+         {
+@@ -688,6 +771,8 @@ static HRESULT CALLBACK XUserGetTokenAndSignatureProvider( XAsyncOp operation, c
+             HRESULT dowork_hr;
+             LPCSTR url = context->utf16 ? NULL : context->url;
+             LPCSTR rp = "http://xboxlive.com";
++            UINT64 token_uhs;
++            time_t now;
+ 
+             if (!user_impl || !user_impl->user_token)
+             {
+@@ -715,7 +800,7 @@ static HRESULT CALLBACK XUserGetTokenAndSignatureProvider( XAsyncOp operation, c
+              * different uhs than the user-only RequestUserToken flow,
+              * so when SISU is what minted the token the header must use
+              * the SISU one or PlayFab silently rejects → sign-in loops. */
+-            UINT64 token_uhs = user_impl->local_id.value;
++            token_uhs = user_impl->local_id.value;
+             xsts_token = NULL;
+ 
+             if (DeviceAuth_IsInitialized() && user_impl->oauth_token)
+@@ -726,8 +811,10 @@ static HRESULT CALLBACK XUserGetTokenAndSignatureProvider( XAsyncOp operation, c
+                  * token IS a SISU AuthorizationToken for that exact RP
+                  * with the matching uhs in impl->local_id.value. Hitting
+                  * SISU from Wine would just TCP-RST against GnuTLS. */
+-                time_t now = time( NULL );
+-                if (user_impl->xsts_token && !strcmp( rp, "http://xboxlive.com" ))
++                now = time( NULL );
++                if (user_impl->xsts_token &&
++                    user_impl->xsts_token_expiry > now + 30 &&
++                    !strcmp( rp, "http://xboxlive.com" ))
+                 {
+                     HSTRING dup = NULL;
+                     if (SUCCEEDED( WindowsDuplicateString( user_impl->xsts_token, &dup ) ))
+@@ -929,7 +1016,8 @@ static HRESULT CALLBACK XUserGetTokenAndSignatureProvider( XAsyncOp operation, c
+             break;
+     }
+ 
+-    return S_OK;
++    impl->lpVtbl->Release( impl );
++    return result;
+ }
+ 
+ static HRESULT WINAPI x_user_XUserGetTokenAndSignatureAsync( IXUserImpl *iface, XUserHandle user, XUserGetTokenAndSignatureOptions options, LPCSTR method, LPCSTR url, SIZE_T count, const XUserGetTokenAndSignatureHttpHeader *headers, SIZE_T size, const void *buffer, XAsyncBlock *asyncBlock )
+@@ -938,7 +1026,9 @@ static HRESULT WINAPI x_user_XUserGetTokenAndSignatureAsync( IXUserImpl *iface,
+     IXThreadingImpl *impl;
+     HRESULT hr;
+ 
+-    TRACE( "iface %p, user %p, options %d, method %s, url %s, count %llu, headers %p, size %llu, buffer %p, asyncBlock %p\n", iface, user, options, method, url, count, headers, size, buffer, asyncBlock );
++    TRACE( "iface %p, user %p, options %d, method %s, url %s, count %llu, headers %p, size %llu, buffer %p, asyncBlock %p\n",
++           iface, user, options, method, url, (unsigned long long)count,
++           headers, (unsigned long long)size, buffer, asyncBlock );
+ 
+     if (!user || !method || !url || !asyncBlock) return E_POINTER;
+     if (FAILED( hr = QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl, (void**)&impl ) )) return hr;
+@@ -974,10 +1064,14 @@ static HRESULT WINAPI x_user_XUserGetTokenAndSignatureAsync( IXUserImpl *iface,
+ static HRESULT WINAPI x_user_XUserGetTokenAndSignatureResultSize( IXUserImpl *iface, XAsyncBlock *asyncBlock, SIZE_T *size )
+ {
+     IXThreadingImpl *impl;
++    HRESULT hr;
++
+     TRACE( "iface %p, asyncBlock %p, size %p\n", iface, asyncBlock, size );
+     if (!asyncBlock || !size) return E_POINTER;
+     if (FAILED( QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl, (void**)&impl ) )) return E_FAIL;
+-    return impl->lpVtbl->XAsyncGetResultSize( impl, asyncBlock, size );
++    hr = impl->lpVtbl->XAsyncGetResultSize( impl, asyncBlock, size );
++    impl->lpVtbl->Release( impl );
++    return hr;
+ }
+ 
+ static HRESULT WINAPI x_user_XUserGetTokenAndSignatureResult( IXUserImpl *iface, XAsyncBlock *asyncBlock, SIZE_T size, PVOID buffer, XUserGetTokenAndSignatureData **ptr, SIZE_T *used )
+@@ -988,6 +1082,7 @@ static HRESULT WINAPI x_user_XUserGetTokenAndSignatureResult( IXUserImpl *iface,
+     if (!asyncBlock || !buffer || !ptr) return E_POINTER;
+     if (FAILED( QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl, (void**)&impl ) )) return E_FAIL;
+     hr = impl->lpVtbl->XAsyncGetResult( impl, asyncBlock, x_user_XUserGetTokenAndSignatureAsync, size, buffer, used );
++    impl->lpVtbl->Release( impl );
+     if (SUCCEEDED( hr )) *ptr = (XUserGetTokenAndSignatureData *)buffer;
+     return hr;
+ }
+@@ -998,7 +1093,9 @@ static HRESULT WINAPI x_user_XUserGetTokenAndSignatureUtf16Async( IXUserImpl *if
+     IXThreadingImpl *impl;
+     HRESULT hr;
+ 
+-    TRACE( "iface %p, user %p, options %d, method %hs, url %hs, count %llu, headers %p, size %llu, buffer %p, asyncBlock %p\n", iface, user, options, method, url, count, headers, size, buffer, asyncBlock );
++    TRACE( "iface %p, user %p, options %d, method %hs, url %hs, count %llu, headers %p, size %llu, buffer %p, asyncBlock %p\n",
++           iface, user, options, method, url, (unsigned long long)count,
++           headers, (unsigned long long)size, buffer, asyncBlock );
+ 
+     if (!user || !method || !url || !asyncBlock) return E_POINTER;
+     if (FAILED( hr = QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl, (void**)&impl ) )) return hr;
+@@ -1034,10 +1131,14 @@ static HRESULT WINAPI x_user_XUserGetTokenAndSignatureUtf16Async( IXUserImpl *if
+ static HRESULT WINAPI x_user_XUserGetTokenAndSignatureUtf16ResultSize( IXUserImpl *iface, XAsyncBlock *asyncBlock, SIZE_T *size )
+ {
+     IXThreadingImpl *impl;
++    HRESULT hr;
++
+     TRACE( "iface %p, asyncBlock %p, size %p\n", iface, asyncBlock, size );
+     if (!asyncBlock || !size) return E_POINTER;
+     if (FAILED( QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl, (void**)&impl ) )) return E_FAIL;
+-    return impl->lpVtbl->XAsyncGetResultSize( impl, asyncBlock, size );
++    hr = impl->lpVtbl->XAsyncGetResultSize( impl, asyncBlock, size );
++    impl->lpVtbl->Release( impl );
++    return hr;
+ }
+ 
+ static HRESULT WINAPI x_user_XUserGetTokenAndSignatureUtf16Result( IXUserImpl *iface, XAsyncBlock *asyncBlock, SIZE_T size, PVOID buffer, XUserGetTokenAndSignatureUtf16Data **ptr, SIZE_T *used )
+@@ -1048,6 +1149,7 @@ static HRESULT WINAPI x_user_XUserGetTokenAndSignatureUtf16Result( IXUserImpl *i
+     if (!asyncBlock || !buffer || !ptr) return E_POINTER;
+     if (FAILED( QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl, (void**)&impl ) )) return E_FAIL;
+     hr = impl->lpVtbl->XAsyncGetResult( impl, asyncBlock, x_user_XUserGetTokenAndSignatureUtf16Async, size, buffer, used );
++    impl->lpVtbl->Release( impl );
+     if (SUCCEEDED( hr )) *ptr = (XUserGetTokenAndSignatureUtf16Data *)buffer;
+     return hr;
+ }
+@@ -1076,49 +1178,51 @@ static HRESULT WINAPI x_user_XUserResolveIssueWithUiUtf16Result( IXUserImpl *ifa
+     return E_NOTIMPL;
+ }
+ 
+-static void CALLBACK change_event_taskqueue_cb( void *context, BOOL canceled )
+-{
+-    if (canceled || !g_signed_in_user || !g_change_callback) return;
+-
+-    TRACE( "firing XUserChangeEvent_SignedInAgain via task queue for local_id=%llu\n",
+-           (unsigned long long)g_signed_in_user->local_id.value );
+-    g_change_callback( g_change_context, g_signed_in_user->local_id, XUserChangeEvent_SignedInAgain );
+-    TRACE( "change event callback returned\n" );
+-}
+-
+ static HRESULT WINAPI x_user_XUserRegisterForChangeEvent( IXUserImpl *iface, XTaskQueueHandle queue, PVOID context, XUserChangeEventCallback *callback, XTaskQueueRegistrationToken *token )
+ {
+-    IXThreadingImpl *impl;
++    struct change_registration *registration;
+ 
+     TRACE( "iface %p, queue %p, context %p, callback %p, token %p\n", iface, queue, context, callback, token );
+-    g_change_callback = (XUserChangeEventCallback)(void*)callback;
+-    g_change_context = context;
+-    g_change_queue = queue;
+-    if (token) token->token = 1;
++    /* XUserAddResult reports the initial sign-in. SignedInAgain is only valid
++     * after a retained signed-out handle signs in again. */
++    if (!callback || !token) return E_POINTER;
++    if (!(registration = calloc( 1, sizeof(*registration) )))
++        return E_OUTOFMEMORY;
+ 
+-    /* Fire the change event to notify the game of sign-in */
+-    if (g_signed_in_user)
+-    {
+-        if (queue && SUCCEEDED( QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl, (void**)&impl ) ))
+-        {
+-            TRACE( "submitting change event to task queue %p\n", queue );
+-            impl->lpVtbl->XTaskQueueSubmitCallback( impl, queue, Completion, NULL, (XTaskQueueCallback*)change_event_taskqueue_cb );
+-            impl->lpVtbl->Release( impl );
+-        }
+-        else
+-        {
+-            TRACE( "firing change event directly (no queue)\n" );
+-            change_event_taskqueue_cb( NULL, FALSE );
+-        }
+-    }
++    registration->token = InterlockedIncrement64( &next_change_token );
++    if (!registration->token)
++        registration->token = InterlockedIncrement64( &next_change_token );
++    AcquireSRWLockExclusive( &change_registration_lock );
++    registration->next = change_registrations;
++    change_registrations = registration;
++    ReleaseSRWLockExclusive( &change_registration_lock );
++    token->token = registration->token;
+ 
+     return S_OK;
+ }
+ 
+ static BOOLEAN WINAPI x_user_XUserUnregisterForChangeEvent( IXUserImpl *iface, XTaskQueueRegistrationToken token, BOOLEAN wait )
+ {
+-    FIXME( "iface %p, token %p, wait %d stub!\n", iface, &token, wait );
+-    return FALSE;
++    struct change_registration **cursor, *registration = NULL;
++    BOOLEAN found;
++
++    TRACE( "iface %p, token %llu, wait %d\n", iface,
++           (unsigned long long)token.token, wait );
++    if (!token.token) return FALSE;
++
++    AcquireSRWLockExclusive( &change_registration_lock );
++    for (cursor = &change_registrations; *cursor; cursor = &(*cursor)->next)
++    {
++        if ((*cursor)->token != token.token)
++            continue;
++        registration = *cursor;
++        *cursor = registration->next;
++        break;
++    }
++    ReleaseSRWLockExclusive( &change_registration_lock );
++    found = registration != NULL;
++    free( registration );
++    return found;
+ }
+ 
+ static HRESULT WINAPI x_user_XUserGetSignOutDeferral( IXUserImpl *iface, XUserSignOutDeferralHandle *deferral )
+@@ -1152,7 +1256,8 @@ static HRESULT WINAPI x_user_XUserGetMsaTokenSilentlyAsync( IXUserImpl *iface, X
+ 
+ static HRESULT WINAPI x_user_XUserGetMsaTokenSilentlyResult( IXUserImpl *iface, XAsyncBlock *asyncBlock, SIZE_T size, LPSTR token, SIZE_T *used )
+ {
+-    FIXME( "iface %p, size %llu, token %p, used %p stub!\n", iface, size, token, used );
++    FIXME( "iface %p, size %llu, token %p, used %p stub!\n", iface,
++           (unsigned long long)size, token, used );
+     return E_NOTIMPL;
+ }
+ 
+@@ -1312,7 +1417,10 @@ static HRESULT WINAPI x_user_gt_QueryInterface( IXUserGamertag *iface, REFIID ii
+ static ULONG WINAPI x_user_gt_AddRef( IXUserGamertag *iface )
+ {
+     struct x_user *impl = impl_from_IXUserGamertag( iface );
+-    ULONG ref = InterlockedIncrement( &impl->ref );
++    ULONG ref;
++
++    if (impl->is_provider) return 2;
++    ref = InterlockedIncrement( &impl->ref );
+     TRACE( "iface %p increasing refcount to %lu\n", iface, ref );
+     return ref;
+ }
+@@ -1320,7 +1428,10 @@ static ULONG WINAPI x_user_gt_AddRef( IXUserGamertag *iface )
+ static ULONG WINAPI x_user_gt_Release( IXUserGamertag *iface )
+ {
+     struct x_user *impl = impl_from_IXUserGamertag( iface );
+-    ULONG ref = InterlockedDecrement( &impl->ref );
++    ULONG ref;
++
++    if (impl->is_provider) return 1;
++    ref = InterlockedDecrement( &impl->ref );
+     TRACE( "iface %p decreasing refcount to %lu\n", iface, ref );
+     if (!ref)
+     {
+@@ -1368,7 +1479,8 @@ static const struct IXUserGamertagVtbl x_user_gt_vtbl =
+ static struct x_user x_user = {
+     {&x_user_vtbl},
+     {&x_user_gt_vtbl},
+-    0,
++    1,
++    TRUE,
+ };
+ 
+-IXUserImpl *x_user_impl = &x_user.IXUserImpl_iface;
+\ No newline at end of file
++IXUserImpl *x_user_impl = &x_user.IXUserImpl_iface;
+diff --git a/dlls/xgameruntime/GDKComponent/System/User/XUser.h b/dlls/xgameruntime/GDKComponent/System/User/XUser.h
+index e095e5c54ed..d4e41ebd894 100644
+--- a/dlls/xgameruntime/GDKComponent/System/User/XUser.h
++++ b/dlls/xgameruntime/GDKComponent/System/User/XUser.h
+@@ -32,12 +32,15 @@ struct x_user
+     IXUserImpl IXUserImpl_iface;
+     IXUserGamertag IXUserGamertag_iface;
+     LONG ref;
++    BOOLEAN is_provider;
+ 
+     UINT64 xuid;
+     XUserLocalId local_id;
+     XUserAgeGroup age_group;
+ 
+     time_t oauth_token_expiry;
++    time_t user_token_expiry;
++    time_t xsts_token_expiry;
+     HSTRING refresh_token;
+     HSTRING oauth_token;
+     HSTRING user_token;
+@@ -73,4 +76,4 @@ struct x_user
+     CHAR lic_rp[256];
+ };
+ 
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/dlls/xgameruntime/main.c b/dlls/xgameruntime/main.c
+index 1005f776ddc..86f542c62bd 100644
+--- a/dlls/xgameruntime/main.c
++++ b/dlls/xgameruntime/main.c
+@@ -29,75 +29,6 @@ WINE_DEFAULT_DEBUG_CHANNEL(xgameruntime);
+ static HMODULE xgameruntime;
+ static HMODULE xgameruntime_threading;
+ 
+-static VOID LoadOtherRuntime( DWORD *asked )
+-{
+-    HKEY hKey;
+-    LPCSTR subKey = "Software\\Wine\\WineGDK";
+-    LPCSTR valueName = "LoadOtherRuntimeAsked";
+-    DWORD value;
+-    DWORD dataSize = sizeof(DWORD);
+-    LONG result;
+-
+-    *asked = 0;
+-
+-    result = RegCreateKeyExA(
+-        HKEY_LOCAL_MACHINE,
+-        subKey,
+-        0,
+-        NULL,
+-        REG_OPTION_NON_VOLATILE,
+-        KEY_READ | KEY_WRITE,
+-        NULL,
+-        &hKey,
+-        NULL
+-    );
+-
+-    if (result != ERROR_SUCCESS) {
+-        return;
+-    }
+-
+-    // Try to read the value
+-    result = RegQueryValueExA(
+-        hKey,
+-        valueName,
+-        NULL,
+-        NULL,
+-        (LPBYTE)&value,
+-        &dataSize
+-    );
+-
+-    if ( result == ERROR_FILE_NOT_FOUND ) 
+-    {
+-        value = 1;
+-
+-        result = RegSetValueExA(
+-            hKey,
+-            valueName,
+-            0,
+-            REG_DWORD,
+-            (const BYTE*)&value,
+-            sizeof(DWORD)
+-        );
+-    } else if ( result == ERROR_SUCCESS ) 
+-    {
+-        *asked = value;
+-
+-        value = 1;
+-
+-        result = RegSetValueExA(
+-            hKey,
+-            valueName,
+-            0,
+-            REG_DWORD,
+-            (const BYTE*)&value,
+-            sizeof(DWORD)
+-        );
+-    }
+-
+-    RegCloseKey( hKey );
+-    return;
+-}
+-
+ HRESULT WINAPI DllCanUnloadNow(void)
+ {
+     return xgameruntime != NULL ? S_FALSE : S_OK;
+@@ -124,26 +55,307 @@ BOOL WINAPI DllMain( HINSTANCE hinst, DWORD reason, void *reserved )
+     return TRUE;
+ }
+ 
+-/* Whether to apply the in-game sign-in patches that force the signed-in state:
+- * the XblInitialize gate, the isLoggedInWithMicrosoftAccount facet, and the
+- * online-server join gate. Default ON. The launcher writes
+- * HKLM\Software\Wine\WineGDK\ForceMsaFacet=0
+- * to turn it OFF for users whose game crashes: forcing that state sends the game
+- * down code paths that deref XSAPI account/session objects which never populate
+- * under Wine on some setups (issue #17/#18).
+- *
+- * The passive sign-in lookup null guard remains enabled regardless. */
+-static BOOLEAN msa_force_enabled( void )
++static BOOLEAN online_patches_enabled( void )
+ {
+     HKEY key;
+-    DWORD val = 1, sz = sizeof(val), type = REG_DWORD;
++    DWORD val = 0, sz = sizeof(val), type = 0;
+     LONG r = RegOpenKeyExA( HKEY_LOCAL_MACHINE, "Software\\Wine\\WineGDK", 0,
+                             KEY_READ, &key );
+     if (r != ERROR_SUCCESS)
+-        return TRUE;                         /* key absent → default ON */
++        return FALSE;
+     r = RegQueryValueExA( key, "ForceMsaFacet", NULL, &type, (BYTE *)&val, &sz );
+     RegCloseKey( key );
+-    return !(r == ERROR_SUCCESS && type == REG_DWORD && val == 0);
++    return r == ERROR_SUCCESS && type == REG_DWORD && val != 0;
++}
++
++struct online_patch_sites
++{
++    BYTE *xbl_gate;
++    BYTE *join_gate;
++    SIZE_T xbl_rva;
++    SIZE_T join_rva;
++    INT32 xbl_jump;
++    signed char xbl_local;
++};
++
++struct online_patch_layout
++{
++    DWORD timestamp;
++    SIZE_T image_size;
++    SIZE_T xbl_rva;
++    SIZE_T join_rva;
++};
++
++static const struct online_patch_layout online_patch_layouts[] =
++{
++    {0x6a2af2e1, 0x11a13000, 0x0d7a8d18, 0x0017070c}, /* 1.26.30.5 */
++    {0x6a3c31a7, 0x11a13000, 0x0d7a8b48, 0x0017070c}, /* 1.26.32.2 */
++    {0x6a4e8d9a, 0x11a13000, 0x0d7a9168, 0x0017070c}, /* 1.26.33.1 */
++};
++
++static BOOLEAN executable_image_range( BYTE *base, SIZE_T image_size,
++                                        IMAGE_NT_HEADERS64 *nt, SIZE_T rva,
++                                        SIZE_T length )
++{
++    IMAGE_SECTION_HEADER *section;
++    MEMORY_BASIC_INFORMATION memory;
++    SIZE_T section_table, section_end, region_end;
++    WORD i;
++
++    if (!length || rva >= image_size || length > image_size - rva)
++        return FALSE;
++    section_table = (BYTE *)&nt->OptionalHeader - base +
++                    nt->FileHeader.SizeOfOptionalHeader;
++    if (!nt->FileHeader.NumberOfSections ||
++        nt->FileHeader.NumberOfSections > 96 ||
++        section_table > image_size ||
++        nt->FileHeader.NumberOfSections >
++            (image_size - section_table) / sizeof(*section))
++        return FALSE;
++    section = (IMAGE_SECTION_HEADER *)(base + section_table);
++
++    for (i = 0; i < nt->FileHeader.NumberOfSections; ++i)
++    {
++        SIZE_T span = max( section[i].Misc.VirtualSize,
++                           section[i].SizeOfRawData );
++        SIZE_T start = section[i].VirtualAddress;
++
++        if (!(section[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) ||
++            start >= image_size || span > image_size - start)
++            continue;
++        section_end = start + span;
++        if (rva < start || rva + length > section_end)
++            continue;
++        if (!VirtualQuery( base + rva, &memory, sizeof(memory) ) ||
++            memory.State != MEM_COMMIT ||
++            memory.AllocationBase != base ||
++            (memory.Protect & (PAGE_GUARD | PAGE_NOACCESS)))
++            return FALSE;
++        region_end = (BYTE *)memory.BaseAddress - base + memory.RegionSize;
++        return region_end >= rva + length;
++    }
++    return FALSE;
++}
++
++static BOOLEAN locate_online_patch_sites( BYTE *base, SIZE_T size,
++                                           struct online_patch_sites *sites )
++{
++    static const BYTE xbl_prefix[] = {0x83, 0x7d, 0xff, 0x00, 0x0f, 0x8c};
++    static const BYTE xbl_suffix[] = {0x0f, 0x57, 0xc0, 0xf3, 0x0f, 0x7f, 0x45};
++    static const BYTE xbl_target[] = {0x48, 0x8d, 0x4d};
++    static const BYTE join_target[] = {0x31, 0xf6, 0x40, 0xb7, 0x01};
++    const struct online_patch_layout *layout = NULL;
++    IMAGE_DOS_HEADER *dos;
++    IMAGE_NT_HEADERS64 *nt;
++    BYTE *xbl_start, *xbl_destination, *join_start, *join_destination;
++    SIZE_T nt_offset, i;
++    INT32 xbl_jump;
++    signed char join_jump;
++    BOOLEAN has_edx_one = FALSE;
++
++    memset( sites, 0, sizeof(*sites) );
++    if (size < sizeof(*dos) || (dos = (IMAGE_DOS_HEADER *)base)->e_magic !=
++        IMAGE_DOS_SIGNATURE)
++        goto unsupported;
++    nt_offset = dos->e_lfanew;
++    if (nt_offset > size || sizeof(*nt) > size - nt_offset)
++        goto unsupported;
++    nt = (IMAGE_NT_HEADERS64 *)(base + nt_offset);
++    if (nt->Signature != IMAGE_NT_SIGNATURE ||
++        nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64 ||
++        nt->FileHeader.SizeOfOptionalHeader !=
++            sizeof(IMAGE_OPTIONAL_HEADER64) ||
++        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
++        nt->OptionalHeader.SizeOfImage != size)
++        goto unsupported;
++    for (i = 0; i < ARRAY_SIZE(online_patch_layouts); ++i)
++    {
++        if (online_patch_layouts[i].timestamp == nt->FileHeader.TimeDateStamp &&
++            online_patch_layouts[i].image_size == size)
++        {
++            layout = &online_patch_layouts[i];
++            break;
++        }
++    }
++    if (!layout)
++        goto unsupported;
++    if (layout->xbl_rva < 4 || layout->join_rva < 7 ||
++        !executable_image_range( base, size, nt, layout->xbl_rva - 4, 18 ) ||
++        !executable_image_range( base, size, nt, layout->join_rva - 7, 0x50 ))
++        goto fingerprint_rejected;
++
++    xbl_start = base + layout->xbl_rva - 4;
++    if (memcmp( xbl_start, xbl_prefix, sizeof(xbl_prefix) ) ||
++        memcmp( xbl_start + 10, xbl_suffix, sizeof(xbl_suffix) ) ||
++        xbl_start[17] != 0xd7)
++        goto fingerprint_rejected;
++    memcpy( &xbl_jump, xbl_start + 6, sizeof(xbl_jump) );
++    if (xbl_jump < 30 || xbl_jump > 0x10000 ||
++        layout->xbl_rva + 6 + xbl_jump > size - 14)
++        goto fingerprint_rejected;
++    xbl_destination = base + layout->xbl_rva + 6 + xbl_jump;
++    if (!executable_image_range( base, size, nt,
++                                 xbl_destination - base, 14 ) ||
++        memcmp( xbl_destination, xbl_target, sizeof(xbl_target) ) ||
++        xbl_destination[4] != 0xe8 || xbl_destination[9] != 0x90 ||
++        xbl_destination[10] != 0x48 || xbl_destination[11] != 0x8b ||
++        xbl_destination[12] != 0xce || xbl_destination[13] != 0xe8)
++        goto fingerprint_rejected;
++
++    join_start = base + layout->join_rva - 7;
++    if (join_start[0] != 0x80 || join_start[1] < 0xb8 ||
++        join_start[1] > 0xbf || join_start[6] != 0x00 ||
++        join_start[7] != 0x75 ||
++        (join_start[9] != 0x48 && join_start[9] != 0x49) ||
++        join_start[10] != 0x8b ||
++        !(join_start[11] <= 0x03 || join_start[11] == 0x06 ||
++          join_start[11] == 0x07) ||
++        memcmp( join_start + 12, "\x48\x8b\x80", 3 ))
++        goto fingerprint_rejected;
++    for (i = 19; i + 5 <= 0x30; ++i)
++    {
++        if (!memcmp( join_start + i, "\xba\x01\x00\x00\x00", 5 ))
++        {
++            has_edx_one = TRUE;
++            break;
++        }
++    }
++    join_jump = (signed char)join_start[8];
++    join_destination = join_start + 9 + join_jump;
++    if (!has_edx_one || join_destination < join_start + 19 ||
++        join_destination > join_start + 0x4b ||
++        memcmp( join_destination, join_target, sizeof(join_target) ) ||
++        !executable_image_range( base, size, nt,
++                                 join_destination - base,
++                                 sizeof(join_target) ))
++        goto fingerprint_rejected;
++    if ((layout->xbl_rva & 7) || (layout->join_rva & 3))
++        goto fingerprint_rejected;
++
++    sites->xbl_gate = base + layout->xbl_rva;
++    sites->join_gate = base + layout->join_rva;
++    sites->xbl_rva = layout->xbl_rva;
++    sites->join_rva = layout->join_rva;
++    sites->xbl_jump = xbl_jump;
++    sites->xbl_local = (signed char)xbl_start[2];
++    return TRUE;
++
++unsupported:
++    ERR( "unsupported Minecraft PE layout for guarded online patches\n" );
++    return FALSE;
++fingerprint_rejected:
++    ERR( "known Minecraft online-patch fingerprint rejected\n" );
++    return FALSE;
++}
++
++void WineGDKApplyOnlinePatches( BOOLEAN user_ready )
++{
++    static const BYTE xbl_replacement[] = {0x66, 0x0f, 0x1f, 0x44, 0x00, 0x00};
++    static SRWLOCK lock = SRWLOCK_INIT;
++    static BOOLEAN applied;
++    struct online_patch_sites sites;
++    MODULEINFO module;
++    HMODULE game;
++    DWORD xbl_protection, join_protection, ignored;
++    LONG expected_join, replacement_join, previous_join;
++    LONG64 expected_xbl, replacement_xbl, previous_xbl;
++    BOOLEAN xbl_writable = FALSE;
++
++    if (!online_patches_enabled())
++        return;
++    if (!user_ready)
++    {
++        ERR( "online patches skipped: XUser multiplayer credentials are incomplete\n" );
++        return;
++    }
++
++    AcquireSRWLockExclusive( &lock );
++    if (applied)
++        goto done;
++
++    game = GetModuleHandleA( NULL );
++    if (!game || !GetModuleInformation( GetCurrentProcess(), game, &module,
++                                         sizeof(module) ) ||
++        !locate_online_patch_sites( module.lpBaseOfDll, module.SizeOfImage,
++                                    &sites ))
++        goto done;
++
++    if (!VirtualProtect( sites.xbl_gate, 8, PAGE_EXECUTE_READWRITE,
++                         &xbl_protection ))
++    {
++        ERR( "could not make XblInitialize gate writable, error %lu\n",
++             GetLastError() );
++        goto done;
++    }
++    xbl_writable = TRUE;
++    if (!VirtualProtect( sites.join_gate, 4, PAGE_EXECUTE_READWRITE,
++                         &join_protection ))
++    {
++        ERR( "could not make online-server gate writable, error %lu\n",
++             GetLastError() );
++        VirtualProtect( sites.xbl_gate, 8, xbl_protection, &ignored );
++        goto done;
++    }
++
++    memcpy( &expected_join, sites.join_gate, sizeof(expected_join) );
++    memcpy( &expected_xbl, sites.xbl_gate, sizeof(expected_xbl) );
++    replacement_join = expected_join;
++    replacement_xbl = expected_xbl;
++    ((BYTE *)&replacement_join)[0] = 0xeb;
++    memcpy( &replacement_xbl, xbl_replacement, sizeof(xbl_replacement) );
++    if (((BYTE *)&expected_join)[0] != 0x75 ||
++        ((BYTE *)&expected_join)[2] != 0x48 ||
++        ((BYTE *)&expected_join)[3] != 0x8b ||
++        ((BYTE *)&expected_xbl)[0] != 0x0f ||
++        ((BYTE *)&expected_xbl)[1] != 0x8c)
++    {
++        ERR( "online patch sites changed before commit\n" );
++        goto restore;
++    }
++
++    previous_join = InterlockedCompareExchange(
++        (LONG volatile *)sites.join_gate, replacement_join, expected_join );
++    if (previous_join != expected_join)
++    {
++        ERR( "online-server gate changed during atomic commit\n" );
++        goto restore;
++    }
++    previous_xbl = InterlockedCompareExchange64(
++        (LONG64 volatile *)sites.xbl_gate, replacement_xbl, expected_xbl );
++    if (previous_xbl != expected_xbl)
++    {
++        ERR( "XblInitialize gate changed during atomic commit\n" );
++        previous_join = InterlockedCompareExchange(
++            (LONG volatile *)sites.join_gate, expected_join, replacement_join );
++        if (previous_join != replacement_join)
++            ERR( "online-server gate rollback failed\n" );
++        goto restore;
++    }
++    if (!FlushInstructionCache( GetCurrentProcess(), sites.join_gate, 4 ) ||
++        !FlushInstructionCache( GetCurrentProcess(), sites.xbl_gate, 8 ))
++    {
++        ERR( "could not flush committed online patch instructions, error %lu\n",
++             GetLastError() );
++    }
++    applied = TRUE;
++
++restore:
++    if (!VirtualProtect( sites.join_gate, 4, join_protection, &ignored ))
++        ERR( "could not restore online-server gate protection, error %lu\n",
++             GetLastError() );
++    if (xbl_writable &&
++        !VirtualProtect( sites.xbl_gate, 8, xbl_protection, &ignored ))
++        ERR( "could not restore XblInitialize gate protection, error %lu\n",
++             GetLastError() );
++    if (applied)
++        ERR( "user ready: committed XblInitialize gate at RVA 0x%llx and "
++             "online-server gate at RVA 0x%llx (local=%d, jump=+%d)\n",
++             (unsigned long long)sites.xbl_rva,
++             (unsigned long long)sites.join_rva,
++             sites.xbl_local, sites.xbl_jump );
++
++done:
++    ReleaseSRWLockExclusive( &lock );
+ }
+ 
+ typedef HRESULT (WINAPI *InitializeApiImplEx2_ext)( ULONG gdkVer, ULONG gsVer, CHAR mode, INITIALIZE_OPTIONS *options );
+@@ -152,9 +364,6 @@ HRESULT WINAPI InitializeApiImplEx2( ULONG gdkVer, ULONG gsVer, CHAR mode, INITI
+ {
+     HRESULT hr;
+     static BOOLEAN com_initialized = FALSE;
+-    /* Read once: master gate for the state-forcing sign-in patches. */
+-    BOOLEAN force = msa_force_enabled();
+-
+     TRACE("gdkVer %ld, gsVer %ld, mode %d, options %p\n", gdkVer, gsVer, mode, options);
+ 
+     /* Initialize COM for the GDK runtime - needed for DllGetClassObject / CoCreateInstance.
+@@ -214,439 +423,6 @@ HRESULT WINAPI InitializeApiImplEx2( ULONG gdkVer, ULONG gsVer, CHAR mode, INITI
+         }
+     }
+ 
+-    /* NOP the credential check gate that blocks XblInitialize.
+-     * The game's XboxLiveServices::signIn checks a credential provider
+-     * (call returns into a local at [rbp+disp8]); a JL on that result skips
+-     * the entire "user is signed in" success path including XblInitialize.
+-     *
+-     * Shape we look for: a 4-byte `cmp DWORD PTR [rbp+disp8], 0` (83 7D
+-     * disp8 00) followed by the 6-byte long-form JL (0F 8C off32) followed
+-     * (after the 6-byte JL) by `xorps xmm0, xmm0` (0F 57 C0).  Three
+-     * suffixes after xorps are accepted because compiler output varies
+-     * across MC versions:
+-     *   - `33 C0`           (xor eax, eax)         ≤ 1.26.12
+-     *   - `F3 0F 7F 45 ??`  (movdqu [rbp+disp8], xmm0)  1.26.20+
+-     *   - `F3 0F 7F 85 ?? ?? ?? ??` (movdqu [rbp+disp32], xmm0) wide form
+-     *
+-     * The disp8 of the cmp also changed between versions (was 0xE8 / rbp-24,
+-     * now 0xFF / rbp-1), so we no longer pin it.  To stay precise we still
+-     * require the JL to target a forward offset of at least +30 (typical
+-     * for the failure-skip branch — backward-jumping JLs are loop tails). */
+-    {
+-        static BOOLEAN patched2 = FALSE;
+-        if (force && !patched2)
+-        {
+-            HMODULE game2 = GetModuleHandleA( NULL );
+-            if (game2)
+-            {
+-                MODULEINFO mi2;
+-                if (GetModuleInformation( GetCurrentProcess(), game2, &mi2, sizeof(mi2) ))
+-                {
+-                    BYTE *base = (BYTE *)mi2.lpBaseOfDll;
+-                    SIZE_T size = mi2.SizeOfImage;
+-                    static const BYTE xorps[] = { 0x0F, 0x57, 0xC0 };
+-                    SIZE_T i;
+-                    DWORD op;
+-
+-                    for (i = 0; i + 16 < size; i++)
+-                    {
+-                        /* cmp DWORD PTR [rbp+disp8], 0  (83 7D ?? 00) */
+-                        if (base[i] != 0x83 || base[i+1] != 0x7D || base[i+3] != 0x00) continue;
+-                        /* 6-byte JL long form right after */
+-                        if (base[i+4] != 0x0F || base[i+5] != 0x8C) continue;
+-                        /* JL must jump forward by >=30 (real gates always
+-                         * skip a real chunk of success-path code) */
+-                        INT32 jdisp = *(INT32 *)(base + i + 6);
+-                        if (jdisp < 30 || jdisp > 0x10000) continue;
+-                        /* After the 6-byte JL: xorps xmm0, xmm0 */
+-                        if (memcmp( base + i + 10, xorps, sizeof(xorps) ) != 0) continue;
+-                        /* And one of the accepted "zero-the-local" suffixes */
+-                        BYTE *s = base + i + 13;
+-                        BOOLEAN suffix_ok = (s[0] == 0x33 && s[1] == 0xC0) ||                       /* xor eax,eax */
+-                                            (s[0] == 0xF3 && s[1] == 0x0F && s[2] == 0x7F && s[3] == 0x45) || /* movdqu [rbp+d8],xmm0 */
+-                                            (s[0] == 0xF3 && s[1] == 0x0F && s[2] == 0x7F && s[3] == 0x85);   /* movdqu [rbp+d32],xmm0 */
+-                        if (!suffix_ok) continue;
+-
+-                        /* NOP the JL: 0F 8C xx xx xx xx → 66 0F 1F 44 00 00 */
+-                        if (VirtualProtect( base + i + 4, 6, PAGE_EXECUTE_READWRITE, &op ))
+-                        {
+-                            base[i+4] = 0x66; base[i+5] = 0x0F; base[i+6] = 0x1F;
+-                            base[i+7] = 0x44; base[i+8] = 0x00; base[i+9] = 0x00;
+-                            VirtualProtect( base + i + 4, 6, op, &op );
+-                            ERR( "patched XblInitialize gate at %p (RVA 0x%lx, disp8=%d, jdisp=+%d)\n",
+-                                 base + i + 4, (ULONG_PTR)(i + 4),
+-                                 (signed char)base[i+2], jdisp );
+-                            patched2 = TRUE;
+-                        }
+-                        break;
+-                    }
+-                    if (!patched2)
+-                        ERR( "XblInitialize gate pattern not found\n" );
+-                }
+-            }
+-        }
+-    }
+-
+-    /* Force the game's isLoggedInWithMicrosoftAccount getter to TRUE.
+-     * The UI ("userAccount" facet) reads this bool to decide whether the player
+-     * is signed in with an MSA; on Win32/Wine XSAPI's social manager never
+-     * finishes so it stays false, which keeps the home-screen "Sign in" button
+-     * up and greys the Servers tab's join buttons. The getter is a tiny
+-     * `movzx eax, byte ptr [rcx+disp8] ; ret` whose address is the 2nd `lea`
+-     * (the value-getter) emitted right after the field-name string in the facet
+-     * serializer. We anchor on the immutable string "isLoggedInWithMicrosoftAccount":
+-     *   1. find the string in .rdata,
+-     *   2. scan .text for the `lea rXX,[rip+d]` that points at it (the name lea),
+-     *   3. the getter `lea rax,[rip+d]` sits 0x13 bytes after that name lea,
+-     *   4. resolve its target and overwrite the getter with `mov eax,1; ret`.
+-     * Version-robust: the string + serializer shape are stable; disp8/offsets
+-     * are read at runtime, never hard-coded. Gated by ForceMsaFacet (default
+-     * ON) so users it crashes (issue #17/#18) can turn it off. */
+-    if (force)
+-    {
+-        static BOOLEAN patched3 = FALSE;
+-        if (!patched3)
+-        {
+-            HMODULE game3 = GetModuleHandleA( NULL );
+-            if (game3)
+-            {
+-                MODULEINFO mi3;
+-                if (GetModuleInformation( GetCurrentProcess(), game3, &mi3, sizeof(mi3) ))
+-                {
+-                    BYTE *base = (BYTE *)mi3.lpBaseOfDll;
+-                    SIZE_T size = mi3.SizeOfImage;
+-                    static const char needle[] = "isLoggedInWithMicrosoftAccount";
+-                    SIZE_T nlen = sizeof(needle) - 1;
+-                    BYTE *str = NULL;
+-                    SIZE_T i;
+-                    DWORD oldprot;
+-
+-                    /* 1. locate the field-name string (must be NUL-terminated to
+-                     *    avoid matching a longer superset). */
+-                    for (i = 0; i + nlen + 1 < size; i++)
+-                    {
+-                        if (base[i] == 'i' &&
+-                            memcmp( base + i, needle, nlen ) == 0 &&
+-                            base[i + nlen] == 0)
+-                        { str = base + i; break; }
+-                    }
+-
+-                    if (str)
+-                    {
+-                        ULONG_PTR str_rva = (ULONG_PTR)(str - base);
+-                        BYTE *name_lea = NULL;
+-
+-                        /* 2. find the `lea reg,[rip+disp32]` whose target == str.
+-                         *    encoding: (48|4C) 8D modrm(rm=101) disp32, len 7. */
+-                        for (i = 0; i + 7 < size; i++)
+-                        {
+-                            if ((base[i] == 0x48 || base[i] == 0x4C) &&
+-                                base[i+1] == 0x8D &&
+-                                (base[i+2] & 0xC7) == 0x05)
+-                            {
+-                                INT32 disp = *(INT32 *)(base + i + 3);
+-                                ULONG_PTR tgt = (ULONG_PTR)(i + 7) + disp;
+-                                if (tgt == str_rva) { name_lea = base + i; break; }
+-                            }
+-                        }
+-
+-                        if (name_lea)
+-                        {
+-                            /* 3. the value-getter lea sits a short distance
+-                             *    after the name lea — 0x13 in 1.26.20/.21 but
+-                             *    0x14 in 1.26.30 (the serializer shape shifts
+-                             *    between versions). Scan a small window for the
+-                             *    `(48|4C) 8D 05 disp32` whose target is the bool
+-                             *    getter `movzx eax,byte[rcx+disp8]; ret`
+-                             *    (0F B6 41 disp8 C3) and overwrite its exact
+-                             *    five-byte body with `xor eax,eax; inc eax; ret`.
+-                             *    Scanning by shape (not a
+-                             *    hard-coded offset) keeps this version-robust. */
+-                            int off;
+-                            for (off = 0x10; off <= 0x20 && !patched3; off++)
+-                            {
+-                                BYTE *gl = name_lea + off;
+-                                INT32 gdisp;
+-                                ULONG_PTR getter_rva;
+-                                BYTE *getter;
+-                                if (!((gl[0] == 0x48 || gl[0] == 0x4C) &&
+-                                      gl[1] == 0x8D && (gl[2] & 0xC7) == 0x05))
+-                                    continue;
+-                                gdisp = *(INT32 *)(gl + 3);
+-                                getter_rva = (ULONG_PTR)(gl + 7 - base) + gdisp;
+-                                if (getter_rva + 5 > size) continue;
+-                                getter = base + getter_rva;
+-                                if (getter[0] == 0x0F && getter[1] == 0xB6 &&
+-                                    getter[2] == 0x41 && getter[4] == 0xC3)
+-                                {
+-                                    if (VirtualProtect( getter, 5, PAGE_EXECUTE_READWRITE, &oldprot ))
+-                                    {
+-                                        getter[0] = 0x31; getter[1] = 0xC0;
+-                                        getter[2] = 0xFF; getter[3] = 0xC0;
+-                                        getter[4] = 0xC3;
+-                                        FlushInstructionCache( GetCurrentProcess(), getter, 5 );
+-                                        VirtualProtect( getter, 5, oldprot, &oldprot );
+-                                        ERR( "patched isLoggedInWithMicrosoftAccount getter at RVA 0x%lx (name_lea+0x%x)\n",
+-                                             (ULONG_PTR)getter_rva, off );
+-                                        patched3 = TRUE;
+-                                    }
+-                                }
+-                            }
+-                            if (!patched3)
+-                                ERR( "MSA value-getter not found in window after name_lea\n" );
+-                        }
+-                        else
+-                            ERR( "MSA name-lea xref not found\n" );
+-                    }
+-                    else
+-                        ERR( "isLoggedInWithMicrosoftAccount string not found\n" );
+-                }
+-            }
+-        }
+-    }
+-
+-    /* Unlock joining online Bedrock servers.
+-     * The connect dispatcher gates the join on an "online Xbox Live sign-in"
+-     * check that wrongly fails for our native login (returns
+-     * UserNeedsToBeSignedIn before any packet is sent); flip that branch.
+-     *
+-     * The gate's exact bytes drift between versions — both the field register
+-     * and the first vtable offset change (1.26.20-30: cmp byte[rsi+0x98],0 /
+-     * mov rax,[rax+0x278]; 1.26.40: cmp byte[r13+0x98],0 / +0x270). What stays
+-     * constant is the SHAPE:
+-     *     cmp byte[reg+disp32], 0   ; 80 [B8-BF] dd dd dd dd 00
+-     *     jne  <fail>               ; 75 rel8                 <- flip to EB
+-     *     mov  rax, [reg]           ; (48|49) 8B (rm 0..3,6,7)
+-     *     mov  rax, [rax+disp32]    ; 48 8B 80 dd dd dd dd     (1st vtable call)
+-     *     ... mov edx, 1 ...        ; BA 01 00 00 00           (2nd vtable call)
+-     * Match that structure with the offsets/registers wildcarded, confirm with
+-     * the `mov edx,1` tail, and patch only when EXACTLY ONE such site exists
+-     * (never flip an ambiguous match). Covers the whole 1.26.x line (20->40). */
+-    {
+-        static BOOLEAN patched4 = FALSE;
+-        if (force && !patched4)
+-        {
+-            HMODULE game = GetModuleHandleA( NULL );
+-            MODULEINFO modinfo;
+-            if (game && GetModuleInformation( GetCurrentProcess(), game, &modinfo, sizeof(modinfo) ))
+-            {
+-                BYTE *base = (BYTE *)modinfo.lpBaseOfDll;
+-                SIZE_T size = modinfo.SizeOfImage, i, j;
+-                BYTE *gate = NULL;
+-                int n = 0;
+-                for (i = 0; i + 19 < size; i++)
+-                {
+-                    BYTE rm;
+-                    BOOLEAN edx1 = FALSE;
+-                    if (base[i] != 0x80) continue;                       /* cmp byte */
+-                    if (base[i+1] < 0xB8 || base[i+1] > 0xBF) continue;  /* [reg+disp32] */
+-                    if (base[i+6] != 0x00) continue;                     /* ,0 */
+-                    if (base[i+7] != 0x75) continue;                     /* jne rel8 */
+-                    if (!(base[i+9] == 0x48 || base[i+9] == 0x49) ||
+-                        base[i+10] != 0x8B) continue;                    /* mov rax,[reg] */
+-                    rm = base[i+11];
+-                    if (!(rm <= 0x03 || rm == 0x06 || rm == 0x07)) continue;
+-                    if (!(base[i+12] == 0x48 && base[i+13] == 0x8B &&
+-                          base[i+14] == 0x80)) continue;                 /* mov rax,[rax+disp32] */
+-                    for (j = i + 19; j + 5 <= size && j < i + 0x30; j++)
+-                        if (base[j] == 0xBA && base[j+1] == 0x01 && base[j+2] == 0x00 &&
+-                            base[j+3] == 0x00 && base[j+4] == 0x00) { edx1 = TRUE; break; }
+-                    if (!edx1) continue;                                 /* connect-gate tail */
+-                    gate = base + i + 7;                                 /* the jne */
+-                    if (++n > 1) break;                                  /* ambiguous -> bail */
+-                }
+-                if (n == 1)
+-                {
+-                    DWORD oldprot;
+-                    if (VirtualProtect( gate, 1, PAGE_EXECUTE_READWRITE, &oldprot ))
+-                    {
+-                        *gate = 0xEB;          /* jne -> jmp */
+-                        VirtualProtect( gate, 1, oldprot, &oldprot );
+-                        ERR( "patched online-server join gate at RVA 0x%lx\n", (ULONG_PTR)(gate - base) );
+-                        patched4 = TRUE;
+-                    }
+-                }
+-                else
+-                    ERR( "online-server join gate: %d candidate(s) (need exactly 1) - not patched\n", n );
+-            }
+-        }
+-    }
+-
+-    /* Null-guard the sign-in-state lookup used by MSA facet forcing.
+-     * Where the MSA
+-     * account object is populated (most installs) that's all the game needs
+-     * and the Servers tab unlocks. But on some installs (a fresh Steam Deck
+-     * prefix, issue #17) the backing collection pointer is still NULL when an
+-     * early lookup runs, so this routine derefs NULL and page-faults seconds
+-     * after boot:
+-     *     mov rax,[rax+rdi+0x58]   ; selected collection (NULL there)
+-     *     mov rdx,[rax+8]          ; <-- #PF read [NULL+8]
+-     *     cmp byte[rdx+0x19],0 ; mov rcx,rax ; jne ...
+-     * The routine just looks a key up in one of two collections and returns a
+-     * byte; an empty (NULL) collection means "not found" = 0. We splice a
+-     * trampoline in after the collection load: it returns 0 when the pointer
+-     * is NULL and otherwise runs unchanged - so facet forcing keeps working where
+-     * the object exists (no behaviour change) and never crashes where it
+-     * doesn't. Version-robust: the body + `push rsi;push rdi;sub rsp,0x28`
+-     * prologue are byte-identical across 1.26.20..40 (verified static). We
+-     * anchor on the unique body signature, confirm the prologue, and patch
+-     * only when EXACTLY ONE site matches. */
+-    {
+-        static BOOLEAN patched5 = FALSE;
+-        if (!patched5)
+-        {
+-            HMODULE game = GetModuleHandleA( NULL );
+-            MODULEINFO modinfo;
+-            if (game && GetModuleInformation( GetCurrentProcess(), game, &modinfo, sizeof(modinfo) ))
+-            {
+-                BYTE *base = (BYTE *)modinfo.lpBaseOfDll;
+-                SIZE_T size = modinfo.SizeOfImage, i;
+-                /* body: mov rax,[rax+rdi+0x58]; mov rdx,[rax+8];
+-                 *       cmp byte[rdx+0x19],0; mov rcx,rax; jne */
+-                static const BYTE sig[] = {
+-                    0x48,0x8b,0x44,0x38,0x58, 0x48,0x8b,0x50,0x08,
+-                    0x80,0x7a,0x19,0x00, 0x48,0x89,0xc1, 0x75 };
+-                /* prologue 0x20 earlier: push rsi; push rdi; sub rsp,0x28 */
+-                static const BYTE prologue[] = { 0x56,0x57,0x48,0x83,0xec,0x28 };
+-                BYTE *match = NULL;
+-                int n = 0;
+-                for (i = 0; i + sizeof(sig) < size; i++)
+-                {
+-                    if (base[i] == 0x48 && memcmp( base + i, sig, sizeof(sig) ) == 0)
+-                    { match = base + i; if (++n > 1) break; }
+-                }
+-                if (n == 1 && (ULONG_PTR)(match - base) >= 0x20 &&
+-                    memcmp( match - 0x20, prologue, sizeof(prologue) ) == 0)
+-                {
+-                    /* locate the executable section holding the match, then a
+-                     * >=28-byte run of 0xCC (inter-function padding) inside it
+-                     * for the trampoline. */
+-                    IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)base;
+-                    IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(base + dos->e_lfanew);
+-                    BYTE *cave = NULL, *sec_base = NULL;
+-                    SIZE_T sec_size = 0, s, run = 0, cstart = 0, best = 0, bstart = 0;
+-                    ULONG_PTR mrva = (ULONG_PTR)(match - base);
+-
+-                    if (dos->e_magic == IMAGE_DOS_SIGNATURE &&
+-                        nt->Signature == IMAGE_NT_SIGNATURE &&
+-                        nt->FileHeader.NumberOfSections > 0 &&
+-                        nt->FileHeader.NumberOfSections <= 96)
+-                    {
+-                        IMAGE_SECTION_HEADER *sec = IMAGE_FIRST_SECTION( nt );
+-                        WORD k;
+-                        for (k = 0; k < nt->FileHeader.NumberOfSections; k++)
+-                        {
+-                            ULONG_PTR va = sec[k].VirtualAddress;
+-                            ULONG_PTR vsz = sec[k].Misc.VirtualSize;
+-                            if (mrva >= va && mrva < va + vsz &&
+-                                (sec[k].Characteristics & IMAGE_SCN_MEM_EXECUTE))
+-                            { sec_base = base + va; sec_size = vsz; break; }
+-                        }
+-                    }
+-                    for (s = 0; sec_base && s < sec_size; s++)
+-                    {
+-                        if (sec_base[s] == 0xCC)
+-                        {
+-                            if (run == 0) cstart = s;
+-                            if (++run > best) { best = run; bstart = cstart; }
+-                            if (best >= 42) break;       /* enough for the full guard */
+-                        }
+-                        else run = 0;
+-                    }
+-                    if (best >= 24) cave = sec_base + bstart;
+-
+-                    if (cave)
+-                    {
+-                        ULONG_PTR crva = (ULONG_PTR)(cave - base);
+-                        INT32 to_cave = (INT32)(crva - (mrva + 5));
+-                        BOOLEAN full = (best >= 42);
+-                        DWORD oldprot;
+-                        /* The lookup walks a CHAIN of pointers:
+-                         *   mov rax,[rax+rdi+0x58]   ; the collection
+-                         *   mov rdx,[rax+8]          ; its backing data pointer
+-                         *   cmp byte[rdx+0x19],0     ; the byte it returns
+-                         * On a slow Steam Deck it runs before the collection is
+-                         * populated, so any link can be NULL or a garbage /
+-                         * non-canonical pointer and the routine page-faults
+-                         * (issue #21 rdx==NULL, issue #22 rax non-canonical,
+-                         * issue #25 rdx==-1/non-canonical — the backing data
+-                         * pointer was -1, which passed the old rdx!=NULL test
+-                         * and faulted on cmp byte[rdx+0x19]).
+-                         * "Empty/absent" is just a 0 return, so guard the WHOLE
+-                         * chain: return 0 unless every link is a sane pointer,
+-                         * else run the real lookup unchanged.
+-                         *
+-                         * Full guard (42 B — needs a big enough cave):
+-                         *   48 8b 44 38 58  mov rax,[rax+rdi+0x58]  (relocated)
+-                         *   48 89 c2        mov rdx,rax
+-                         *   48 c1 ea 2f     shr rdx,47          ; canonical?
+-                         *   75 13           jnz null_exit       ; non-canonical rax (#22)
+-                         *   48 85 c0        test rax,rax
+-                         *   74 0e           jz  null_exit       ; NULL rax
+-                         *   48 8b 50 08     mov rdx,[rax+8]     (relocated)
+-                         *   48 85 d2        test rdx,rdx
+-                         *   7e 05           jle null_exit       ; NULL or -1/non-canonical data ptr (#21,#25)
+-                         *   e9 rel32        jmp match+9 (the cmp)
+-                         * null_exit: 31 c0 / 48 83 c4 28 / 5f / 5e / c3
+-                         * Fallback (no >=42 B cave): the original 24-byte guard
+-                         * (rax!=NULL only) so a stingy binary never regresses. */
+-                        if (full && VirtualProtect( cave, 42, PAGE_EXECUTE_READWRITE, &oldprot ))
+-                        {
+-                            INT32 back = (INT32)((mrva + 9) - (crva + 33));
+-                            cave[0]=0x48; cave[1]=0x8b; cave[2]=0x44; cave[3]=0x38; cave[4]=0x58;
+-                            cave[5]=0x48; cave[6]=0x89; cave[7]=0xc2;
+-                            cave[8]=0x48; cave[9]=0xc1; cave[10]=0xea; cave[11]=0x2f;
+-                            cave[12]=0x75; cave[13]=0x13;
+-                            cave[14]=0x48; cave[15]=0x85; cave[16]=0xc0;
+-                            cave[17]=0x74; cave[18]=0x0e;
+-                            cave[19]=0x48; cave[20]=0x8b; cave[21]=0x50; cave[22]=0x08;
+-                            cave[23]=0x48; cave[24]=0x85; cave[25]=0xd2;  /* test rdx,rdx */
+-                            cave[26]=0x7e; cave[27]=0x05;  /* jle (was jz): also reject -1/non-canonical rdx (#25) */
+-                            cave[28]=0xe9;
+-                            cave[29]=(BYTE)back; cave[30]=(BYTE)(back>>8);
+-                            cave[31]=(BYTE)(back>>16); cave[32]=(BYTE)(back>>24);
+-                            cave[33]=0x31; cave[34]=0xc0;
+-                            cave[35]=0x48; cave[36]=0x83; cave[37]=0xc4; cave[38]=0x28;
+-                            cave[39]=0x5f; cave[40]=0x5e; cave[41]=0xc3;
+-                            VirtualProtect( cave, 42, oldprot, &oldprot );
+-                        }
+-                        else if (VirtualProtect( cave, 24, PAGE_EXECUTE_READWRITE, &oldprot ))
+-                        {
+-                            INT32 back = (INT32)((mrva + 5) - (crva + 0x0f));
+-                            full = FALSE;
+-                            cave[0]=0x48; cave[1]=0x8b; cave[2]=0x44; cave[3]=0x38; cave[4]=0x58;
+-                            cave[5]=0x48; cave[6]=0x85; cave[7]=0xc0;
+-                            cave[8]=0x74; cave[9]=0x05;
+-                            cave[10]=0xe9;
+-                            cave[11]=(BYTE)back; cave[12]=(BYTE)(back>>8);
+-                            cave[13]=(BYTE)(back>>16); cave[14]=(BYTE)(back>>24);
+-                            cave[15]=0x31; cave[16]=0xc0;
+-                            cave[17]=0x48; cave[18]=0x83; cave[19]=0xc4; cave[20]=0x28;
+-                            cave[21]=0x5f; cave[22]=0x5e; cave[23]=0xc3;
+-                            VirtualProtect( cave, 24, oldprot, &oldprot );
+-                        }
+-                        else cave = NULL;
+-
+-                        if (cave && VirtualProtect( match, 5, PAGE_EXECUTE_READWRITE, &oldprot ))
+-                        {
+-                            match[0]=0xe9;
+-                            match[1]=(BYTE)to_cave; match[2]=(BYTE)(to_cave>>8);
+-                            match[3]=(BYTE)(to_cave>>16); match[4]=(BYTE)(to_cave>>24);
+-                            VirtualProtect( match, 5, oldprot, &oldprot );
+-                            ERR( "patched sign-in lookup null-guard at RVA 0x%lx (cave 0x%lx, %s)\n",
+-                                 (ULONG_PTR)mrva, (ULONG_PTR)crva, full ? "full chain" : "rax-only" );
+-                            patched5 = TRUE;
+-                        }
+-                    }
+-                    else
+-                        ERR( "sign-in lookup null-guard: no code cave found\n" );
+-                }
+-                else
+-                    ERR( "sign-in lookup null-guard: %d site(s) (need 1) or prologue mismatch - not patched\n", n );
+-            }
+-        }
+-    }
+-
+     return GDKC_InitAPI( gdkVer, gsVer, mode, options );
+ }
+ 
+@@ -690,8 +466,6 @@ HRESULT WINAPI QueryApiImpl( const GUID *runtimeClassId, REFIID interfaceId, voi
+     //
+ 
+     QueryApiImpl_ext func = (QueryApiImpl_ext)GetProcAddress( xgameruntime_threading, "QueryApiImpl" );
+-    DWORD asked;
+-
+     TRACE("runtimeClassId %s, interfaceId %s, out %p\n", debugstr_guid(runtimeClassId), debugstr_guid(interfaceId), out);
+ 
+     if ( IsEqualGUID( runtimeClassId, &CLSID_XSystemImpl ) )
+diff --git a/dlls/xgameruntime/private.h b/dlls/xgameruntime/private.h
+index a8ab1ddd300..a7d0ed05a9b 100644
+--- a/dlls/xgameruntime/private.h
++++ b/dlls/xgameruntime/private.h
+@@ -64,6 +64,7 @@ typedef struct _INITIALIZE_OPTIONS
+ 
+ // Deference is for other modules to communicate with eachother through the same binary.
+ HRESULT WINAPI QueryApiImpl( const GUID *runtimeClassId, REFIID interfaceId, void **out );
++void WineGDKApplyOnlinePatches( BOOLEAN user_ready );
+ 
+ // a85c3901-18ae-48c9-b066-d368f4523420
+ DEFINE_GUID(IID_IXTaskQueue, 0xa85c3901, 0x18ae, 0x48c9, 0xb0, 0x66, 0xd3, 0x68, 0xf4, 0x52, 0x34, 0x20);
+@@ -95,4 +96,4 @@ DEFINE_GUID(IID_IAsyncState, 0xb617596e, 0xfcf5, 0x42c8, 0xbb, 0xa4, 0x5a, 0x91,
+ // 93134919-80eb-472b-861c-e6c4871e2762
+ DEFINE_GUID(IID_IXAsyncBlockInternalGuard, 0x93134919, 0x80eb, 0x472b, 0x86, 0x1c, 0xe6, 0xc4, 0x87, 0x1e, 0x27, 0x62);
+ 
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/dlls/xgameruntime/tests/xgameruntime.c b/dlls/xgameruntime/tests/xgameruntime.c
+index a865258c0db..50a440a965c 100644
+--- a/dlls/xgameruntime/tests/xgameruntime.c
++++ b/dlls/xgameruntime/tests/xgameruntime.c
+@@ -21,7 +21,6 @@
+ #include <stdlib.h>
+ #include <stdarg.h>
+ #define COBJMACROS
+-#include <initguid.h>
+ #include <windef.h>
+ #include <winbase.h>
+ #include <winternl.h>
+@@ -30,7 +29,7 @@
+ #include <unknwn.h>
+ #include <xgameerr.h>
+ 
+-#include "provider.h"
++#include "../provider.h"
+ #include "wine/test.h"
+ #include "xthread.h"
+ 
+@@ -65,6 +64,14 @@ static LONG async_get_result_count;
+ static LONG async_cleanup_count;
+ static LONG async_cleanup_before_result;
+ static LONG async_completion_count;
++static LONG user_change_count;
++
++static const GUID test_clsid_xuser_impl =
++    {0x01acd177, 0x91f9, 0x4763, {0xa3, 0x8e, 0xcc, 0xbb, 0x55, 0xce, 0x32, 0xe0}};
++static const GUID test_iid_xuser_base =
++    {0x01acd177, 0x91f9, 0x4763, {0xa3, 0x8e, 0xcc, 0xbb, 0x55, 0xce, 0x32, 0xe0}};
++static const GUID test_iid_xuser_gamertag =
++    {0xcef4fac0, 0x7676, 0x4a94, {0xa1, 0x19, 0x4c, 0x43, 0xf9, 0xeb, 0x5b, 0x74}};
+ 
+ static void CALLBACK XAsyncCompletion_testCallback( XAsyncBlock *asyncBlock )
+ {
+@@ -72,6 +79,15 @@ static void CALLBACK XAsyncCompletion_testCallback( XAsyncBlock *asyncBlock )
+     InterlockedIncrement( &async_completion_count );
+ }
+ 
++static void CALLBACK user_change_callback( PVOID context, XUserLocalId local_id,
++                                           XUserChangeEvent event )
++{
++    (void)context;
++    (void)local_id;
++    (void)event;
++    InterlockedIncrement( &user_change_count );
++}
++
+ #define check_interface(obj, iid, supported) _check_interface(__LINE__, obj, iid, supported)
+ static void _check_interface(unsigned int line, void *obj, const IID *iid, BOOL supported)
+ {
+@@ -231,6 +247,65 @@ static void test_XSystem(void)
+     free( sandboxId );
+ }
+ 
++static void test_XUserChangeRegistration(void)
++{
++    XTaskQueueRegistrationToken first = {0}, second = {0}, unknown = {0xdeadbeef};
++    XUserChangeEventCallback callback = user_change_callback;
++    IXUserBase *user, *again;
++    IXUserGamertag *gamertag;
++    HRESULT hr;
++
++    hr = QueryApiImpl_fun( &test_clsid_xuser_impl, &test_iid_xuser_base, (void **)&user );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    if (FAILED( hr )) return;
++
++    hr = IXUserBase_XUserRegisterForChangeEvent( user, NULL, NULL, NULL, &first );
++    ok( hr == E_POINTER, "NULL callback returned %#lx.\n", hr );
++    hr = IXUserBase_XUserRegisterForChangeEvent( user, NULL, NULL, &callback, NULL );
++    ok( hr == E_POINTER, "NULL token returned %#lx.\n", hr );
++
++    user_change_count = 0;
++    hr = IXUserBase_XUserRegisterForChangeEvent( user, NULL, NULL, &callback, &first );
++    ok( hr == S_OK && first.token, "first registration returned %#lx, token %llu.\n",
++            hr, (unsigned long long)first.token );
++    hr = IXUserBase_XUserRegisterForChangeEvent( user, NULL, NULL, &callback, &second );
++    ok( hr == S_OK && second.token && second.token != first.token,
++            "second registration returned %#lx, tokens %llu/%llu.\n", hr,
++            (unsigned long long)first.token, (unsigned long long)second.token );
++    ok( !user_change_count, "registration emitted %ld synthetic events.\n",
++            user_change_count );
++
++    ok( IXUserBase_XUserUnregisterForChangeEvent( user, first, FALSE ),
++            "first unregister failed.\n" );
++    ok( !IXUserBase_XUserUnregisterForChangeEvent( user, first, FALSE ),
++            "duplicate unregister succeeded.\n" );
++    ok( IXUserBase_XUserUnregisterForChangeEvent( user, second, TRUE ),
++            "second unregister failed.\n" );
++    ok( !IXUserBase_XUserUnregisterForChangeEvent( user, unknown, TRUE ),
++            "unknown unregister succeeded.\n" );
++
++    hr = IXUserBase_QueryInterface( user, &test_iid_xuser_gamertag,
++                                    (void **)&gamertag );
++    ok( hr == S_OK, "gamertag QueryInterface returned %#lx.\n", hr );
++    if (SUCCEEDED( hr ))
++    {
++        ok( IXUserGamertag_AddRef( gamertag ) == 2,
++                "provider gamertag AddRef is not stable.\n" );
++        ok( IXUserGamertag_Release( gamertag ) == 1,
++                "provider gamertag Release is not stable.\n" );
++        IXUserGamertag_Release( gamertag );
++    }
++    ok( IXUserBase_AddRef( user ) == 2,
++            "provider user AddRef is not stable.\n" );
++    ok( IXUserBase_Release( user ) == 1,
++            "provider user Release is not stable.\n" );
++
++    IXUserBase_Release( user );
++    hr = QueryApiImpl_fun( &test_clsid_xuser_impl, &test_iid_xuser_base, (void **)&again );
++    ok( hr == S_OK, "provider was not reusable after Release, hr %#lx.\n", hr );
++    if (SUCCEEDED( hr )) IXUserBase_Release( again );
++}
++
+ static void test_XSystemAnalytics(void)
+ {
+     IXSystemAnalyticsImpl *xsystem_analytics;
+@@ -423,6 +498,7 @@ START_TEST(xgameruntime)
+     test_XSystemAnalytics();
+     test_XGameRuntimeFeature();
+     test_XThreading();
++    test_XUserChangeRegistration();
+ 
+     RoUninitialize();
+ }

@@ -62,7 +62,7 @@ _DIAG_RULES = [
      r"d3d12_command_signature_create: Device generated commands is not "
      r"supported by implementation",
      "The installed engine cannot run Minecraft's ExecuteIndirect menu path "
-     "on this Vulkan driver — install the 1.3.0 compatibility engine "
+     "on this Vulkan driver — install the current compatibility engine "
      "('bedrock-on-linux setup --force')."),
     (r"Unimplemented function combase\.dll\.RoOriginateError|"
      r"RoOriginateErrorW",
@@ -100,8 +100,9 @@ _DIAG_RULES = [
     # ("Bootstrapper initialization failed looking for version 1.8"), and the
     # diagnose() guard below also drops this hit when the engine's own XUser
     # patches are in the log.
-    (r"XUserAddAsync|QueryApiImpl.*unimpl|"
-     r"xgameruntime:.*(?:unimpl|stub|not implemented|E_NOTIMPL|0x80004001)",
+    (r"(?:XUserAddAsync|xgameruntime:.*XUser\w*).*"
+     r"(?:unimpl|stub|not implemented|E_NOTIMPL|0x80004001)|"
+     r"QueryApiImpl.*(?:unimpl|stub|not implemented|E_NOTIMPL|0x80004001)",
      "The GDK-Proton in use has no WineGDK XUser — reinstall the engine: "
      "'bedrock-on-linux setup --force'."),
 ]
@@ -114,7 +115,21 @@ def diagnose():
               LOGS / "winegdk-build.log"):
         if p.exists():
             try:
-                blobs.append(p.read_text(errors="ignore")[-200000:])
+                # Initialisation proof is near the beginning of Proton's log,
+                # while a crash is near the end. Diagnostic tracing can make
+                # the file hundreds of MiB, so retain both edges without
+                # loading the entire file merely to discard its middle.
+                edge = 200000
+                size = p.stat().st_size
+                with p.open("rb") as stream:
+                    if size <= edge * 2:
+                        raw = stream.read()
+                    else:
+                        raw = stream.read(edge)
+                        stream.seek(-edge, 2)
+                        raw += b"\n[... log middle omitted ...]\n"
+                        raw += stream.read(edge)
+                blobs.append(raw.decode("utf-8", "ignore"))
             except Exception:
                 pass
     text = "\n".join(blobs)
@@ -125,16 +140,11 @@ def diagnose():
     # engine.
     if re.search(r"InitializeApiImplEx2 patched|preauth: loaded user/XSTS", text):
         hits = [h for h in hits if "no WineGDK XUser" not in h]
-    settings = load_settings()
-    server_patches = settings.get("force_msa_facet", True)
-    if not server_patches:
-        hits.append("Microsoft/Xbox server access is disabled in Settings — "
-                    "enable it before PLAY to unlock the Servers tab.")
-    elif re.search(r"preauth: loaded user/XSTS", text, re.I) and not re.search(
-            r"patched online-server join gate", text, re.I):
-        hits.append("Xbox tokens loaded, but the WineGDK online-server memory "
-                    "patch did not activate — reinstall/update the managed "
-                    "compatibility engine before trying Servers again.")
+    if re.search(r"preauth: loaded user/XSTS", text, re.I) and not re.search(
+            r"native XGame identity loaded", text, re.I):
+        hits.append("Xbox credentials loaded, but the native XGame identity "
+                    "did not initialize. Reinstall/update the managed engine "
+                    "and attach the diagnostics log if online tabs stay locked.")
     # Software-rendering fallback: if DXVK/vkd3d only found llvmpipe (Mesa's CPU
     # rasteriser) and no real GPU Vulkan device, the GPU driver isn't active in
     # the container. The game then runs on the CPU — slow, and the OreUI Play

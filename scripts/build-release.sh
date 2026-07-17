@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Build unreleased Linux candidate artifacts: .deb, AppImage, portable .pyz.
+# Build unreleased Linux candidate artifacts: .deb, AppImage, portable .pyz,
+# and a local/dev Flatpak bundle.
 set -euo pipefail
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -187,26 +188,29 @@ else
   required_failures+=("AppImage")
 fi
 
-if (( ${#required_failures[@]} )) \
-    && [[ "${BOL_ALLOW_PARTIAL_ARTIFACTS:-0}" != 1 ]]; then
-  echo "!! incomplete candidate: required formats failed: ${required_failures[*]}" >&2
-  echo "   Set BOL_ALLOW_PARTIAL_ARTIFACTS=1 only for targeted packaging tests." >&2
-  exit 1
-fi
-
 FLATPAK="$OUT/BedrockOnLinux-${VER}-x86_64.flatpak"
 rm -f -- "$FLATPAK"
-if command -v flatpak-builder >/dev/null; then
+if command -v flatpak-builder >/dev/null \
+    || { command -v flatpak >/dev/null \
+         && flatpak info org.flatpak.Builder >/dev/null 2>&1; }; then
   if bash "$SRC/scripts/build-flatpak.sh" >/dev/null 2>&1 \
       && [[ -s "$FLATPAK" ]]; then
     echo "  ✓ dist/$(basename "$FLATPAK")"
     built_artifacts+=("$FLATPAK")
   else
     rm -f -- "$FLATPAK"
-    echo "  – Flatpak skipped (build failed) — run scripts/build-flatpak.sh to see why"
+    echo "  !! Flatpak build failed — run scripts/build-flatpak.sh to see why"
+    required_failures+=("Flatpak")
   fi
 else
-  echo "  – Flatpak skipped (flatpak-builder absent) — see flatpak/README.md"
+  echo "  – Flatpak skipped (no host or org.flatpak.Builder builder) — see flatpak/README.md"
+fi
+
+if (( ${#required_failures[@]} )) \
+    && [[ "${BOL_ALLOW_PARTIAL_ARTIFACTS:-0}" != 1 ]]; then
+  echo "!! incomplete candidate: required formats failed: ${required_failures[*]}" >&2
+  echo "   Set BOL_ALLOW_PARTIAL_ARTIFACTS=1 only for targeted packaging tests." >&2
+  exit 1
 fi
 
 # Read VERSION and WINEGDK_BUILD_REV back from every supported artifact.  A

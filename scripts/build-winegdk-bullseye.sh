@@ -18,12 +18,15 @@ export TZ=UTC
 
 readonly SCRIPT_PATH="$(readlink -f -- "${BASH_SOURCE[0]}")"
 readonly PROJECT_ROOT="$(cd -- "$(dirname -- "$SCRIPT_PATH")/.." && pwd -P)"
-readonly EXPECTED_COMMIT="670eda2864dcb22d11c7f2c28973214d4755ad2f"
-readonly PUBLIC_BASE_COMMIT="6b01dd37f55aeb0385bab4b58f7405b3bf2ae386"
-readonly EXPECTED_SOURCE_DATE_EPOCH="1782250551"
-readonly VENDORED_PATCH="$PROJECT_ROOT/third_party/winegdk-r11/signin-rdx-guard.patch"
-readonly VENDORED_PATCH_SHA256="dd6d28648328c0e88b65832207b3ee66b5e62de8d93b8be5ecfc6d1873e21be3"
-readonly PATCHED_MAIN_SHA256="a73797903beb8105fbffb59225656231cb499db0a10a18a80490887ebb182ab0"
+readonly EXPECTED_COMMIT="75637b674e1f191e65753663c4c0c32bea05ba6e"
+readonly PUBLIC_BASE_COMMIT="e75ddb5f5d8874eecf8e8c1742e6aaa4db9cd4a3"
+readonly EXPECTED_SOURCE_DATE_EPOCH="1784308597"
+readonly VENDORED_BASE_PATCH="$PROJECT_ROOT/third_party/winegdk-r12/online-patches-after-user-ready.patch"
+readonly VENDORED_BASE_PATCH_SHA256="ee0543f11737a11f5edec389967bb41482c7f5eda3807c24d171dd6bf6301274"
+readonly VENDORED_PATCH="$PROJECT_ROOT/third_party/winegdk-native5/0001-winegdk-native5-Xbox-and-file-picker-runtime.patch"
+readonly VENDORED_PATCH_SHA256="d5630af845064b50780665e8ba335d4484a4c0b68eb396f195f840f0d2689a8b"
+readonly SOURCE_SHA256SUMS="$PROJECT_ROOT/third_party/winegdk-native5/SOURCE-SHA256SUMS"
+readonly SOURCE_SHA256SUMS_SHA256="80a3d59d35ab642ec1f2546aa6ad2c180785f0e577f30d8eccdda2066d80c72e"
 readonly GLIBC_CEILING="2.31"
 readonly DEBIAN_SUITE="bullseye"
 readonly DEBIAN_MIRROR="https://deb.debian.org/debian"
@@ -245,7 +248,8 @@ version_is_greater() {
 }
 
 scan_glibc_requirements() {
-  local work_root="$1" prefix="$work_root/prefix"
+  local work_root="$1"
+  local prefix="$work_root/prefix"
   local report="$work_root/glibc-requirements.tsv"
   local file versions maximum relative
   local elf_count=0 failures=0
@@ -281,6 +285,33 @@ scan_glibc_requirements() {
     die "$failures ELF file(s) exceed the GLIBC_$GLIBC_CEILING ceiling"
 }
 
+finalize_build() {
+  local work_root="$1"
+  local package_versions_sha256
+
+  [[ "${BOL_WINEGDK_INTERNAL:-}" == 1 ]] || die "internal mode is private"
+  [[ -f "$work_root/package-versions.tsv" ]] ||
+    die "package version record is missing below $work_root"
+
+  printf '==> Enforcing GLIBC_%s ABI ceiling\n' "$GLIBC_CEILING"
+  scan_glibc_requirements "$work_root"
+
+  # Bind the installed bytes to the reviewed source/build inputs.  The engine
+  # packager requires this machine-readable record; a caller-supplied commit
+  # string alone is not accepted as provenance.
+  package_versions_sha256="$(sha256sum "$work_root/package-versions.tsv" | cut -d' ' -f1)"
+  install -m 0644 "$work_root/package-versions.tsv" \
+    "$work_root/prefix/.bol-winegdk-package-versions.tsv"
+  cat >"$work_root/prefix/.bol-winegdk-build.env" <<EOF
+schema=1
+winegdk_commit=$EXPECTED_COMMIT
+source_date_epoch=$EXPECTED_SOURCE_DATE_EPOCH
+debian_suite=$DEBIAN_SUITE
+glibc_ceiling=$GLIBC_CEILING
+package_versions_sha256=$package_versions_sha256
+EOF
+}
+
 case "${1:-}" in
   --internal-foreign)
     [[ $# == 2 ]] || die "invalid internal foreign-stage arguments"
@@ -295,6 +326,11 @@ case "${1:-}" in
   --internal-build)
     [[ $# == 4 ]] || die "invalid internal build-stage arguments"
     internal_build_stage "$2" "$3" "$4"
+    exit 0
+    ;;
+  --internal-finalize)
+    [[ $# == 2 ]] || die "invalid internal finalize-stage arguments"
+    finalize_build "$2"
     exit 0
     ;;
   -h|--help)
@@ -354,10 +390,9 @@ if GIT_OPTIONAL_LOCKS=0 git -C "$SOURCE_REPO" cat-file -e \
   SOURCE_DATE_EPOCH="$(GIT_OPTIONAL_LOCKS=0 git -C "$SOURCE_REPO" show \
     -s --format=%ct "$EXPECTED_COMMIT")"
 else
-  # The one-commit r11 guard delta was initially local.  A public clone can
-  # still reproduce the exact target tree from its reviewed public parent plus
-  # the vendored, hash-pinned patch without mutating or committing to the
-  # caller's repository.
+  # The local native-auth commit may not be available from every public clone.
+  # Reproduce the exact target tree from its reviewed public parent plus the
+  # hash-pinned r12 and native deltas without mutating the caller's repository.
   GIT_OPTIONAL_LOCKS=0 git -C "$SOURCE_REPO" cat-file -e \
     "$PUBLIC_BASE_COMMIT^{commit}" ||
     die "source repository contains neither target $EXPECTED_COMMIT nor "\
@@ -366,11 +401,16 @@ else
     "$PUBLIC_BASE_COMMIT^{commit}")"
   [[ "$ACTUAL_BASE" == "$PUBLIC_BASE_COMMIT" ]] ||
     die "base commit resolution changed unexpectedly: $ACTUAL_BASE"
-  [[ -f "$VENDORED_PATCH" ]] || die "vendored WineGDK patch is missing"
+  [[ -f "$VENDORED_BASE_PATCH" ]] ||
+    die "vendored WineGDK r12 base patch is missing"
+  [[ "$(sha256sum "$VENDORED_BASE_PATCH" | cut -d' ' -f1)" == \
+      "$VENDORED_BASE_PATCH_SHA256" ]] ||
+    die "vendored WineGDK r12 base patch SHA-256 mismatch"
+  [[ -f "$VENDORED_PATCH" ]] || die "vendored WineGDK native patch is missing"
   [[ "$(sha256sum "$VENDORED_PATCH" | cut -d' ' -f1)" == \
       "$VENDORED_PATCH_SHA256" ]] ||
-    die "vendored WineGDK patch SHA-256 mismatch"
-  SOURCE_MODE="public-base+vendored-patch"
+    die "vendored WineGDK native patch SHA-256 mismatch"
+  SOURCE_MODE="public-base+vendored-patches"
   SOURCE_EXPORT_COMMIT="$PUBLIC_BASE_COMMIT"
   SOURCE_DATE_EPOCH="$EXPECTED_SOURCE_DATE_EPOCH"
 fi
@@ -413,8 +453,9 @@ winegdk_commit=$EXPECTED_COMMIT
 source_mode=$SOURCE_MODE
 source_export_commit=$SOURCE_EXPORT_COMMIT
 public_base_commit=$PUBLIC_BASE_COMMIT
+vendored_base_patch_sha256=$VENDORED_BASE_PATCH_SHA256
 vendored_patch_sha256=$VENDORED_PATCH_SHA256
-patched_main_sha256=$PATCHED_MAIN_SHA256
+source_sha256sums_sha256=$SOURCE_SHA256SUMS_SHA256
 source_date_epoch=$SOURCE_DATE_EPOCH
 debian_suite=$DEBIAN_SUITE
 debian_mirror=$DEBIAN_MIRROR
@@ -439,15 +480,24 @@ BOL_WINEGDK_INTERNAL=1 unshare "${USER_NAMESPACE_ARGS[@]}" \
 printf '==> Exporting pinned WineGDK source without modifying its repository\n'
 GIT_OPTIONAL_LOCKS=0 git -C "$SOURCE_REPO" archive --format=tar \
   "$SOURCE_EXPORT_COMMIT" | tar -xf - -C "$WORK_ROOT/source"
-if [[ "$SOURCE_MODE" == "public-base+vendored-patch" ]]; then
+if [[ "$SOURCE_MODE" == "public-base+vendored-patches" ]]; then
+  git -C "$WORK_ROOT/source" apply --check "$VENDORED_BASE_PATCH" ||
+    die "vendored WineGDK r12 patch does not apply to the public base"
+  git -C "$WORK_ROOT/source" apply "$VENDORED_BASE_PATCH" ||
+    die "could not apply vendored WineGDK r12 patch"
   git -C "$WORK_ROOT/source" apply --check "$VENDORED_PATCH" ||
-    die "vendored WineGDK patch does not apply to the public base"
+    die "vendored WineGDK native patch does not apply after the r12 delta"
   git -C "$WORK_ROOT/source" apply "$VENDORED_PATCH" ||
-    die "could not apply vendored WineGDK patch"
+    die "could not apply vendored WineGDK native patch"
 fi
-[[ "$(sha256sum "$WORK_ROOT/source/dlls/xgameruntime/main.c" | cut -d' ' -f1)" \
-    == "$PATCHED_MAIN_SHA256" ]] ||
-  die "exported WineGDK source does not match the reviewed r11 guard"
+[[ -f "$SOURCE_SHA256SUMS" ]] || die "WineGDK source hash manifest is missing"
+[[ "$(sha256sum "$SOURCE_SHA256SUMS" | cut -d' ' -f1)" == \
+    "$SOURCE_SHA256SUMS_SHA256" ]] ||
+  die "WineGDK source hash manifest SHA-256 mismatch"
+(
+  cd "$WORK_ROOT/source"
+  sha256sum --strict -c "$SOURCE_SHA256SUMS" >/dev/null
+) || die "exported WineGDK source does not match the reviewed native delta"
 
 printf '==> Building WineGDK in Bullseye\n'
 BOL_WINEGDK_INTERNAL=1 unshare "${USER_NAMESPACE_ARGS[@]}" \
@@ -455,23 +505,7 @@ BOL_WINEGDK_INTERNAL=1 unshare "${USER_NAMESPACE_ARGS[@]}" \
   "$SCRIPT_PATH" --internal-build "$WORK_ROOT" \
   "$SOURCE_DATE_EPOCH" "$MAKE_JOBS"
 
-printf '==> Enforcing GLIBC_%s ABI ceiling\n' "$GLIBC_CEILING"
-scan_glibc_requirements "$WORK_ROOT"
-
-# Bind the installed bytes to the reviewed source/build inputs.  The engine
-# packager requires this machine-readable record; a caller-supplied commit
-# string alone is not accepted as provenance.
-PACKAGE_VERSIONS_SHA256="$(sha256sum "$WORK_ROOT/package-versions.tsv" | cut -d' ' -f1)"
-install -m 0644 "$WORK_ROOT/package-versions.tsv" \
-  "$WORK_ROOT/prefix/.bol-winegdk-package-versions.tsv"
-cat >"$WORK_ROOT/prefix/.bol-winegdk-build.env" <<EOF
-schema=1
-winegdk_commit=$EXPECTED_COMMIT
-source_date_epoch=$SOURCE_DATE_EPOCH
-debian_suite=$DEBIAN_SUITE
-glibc_ceiling=$GLIBC_CEILING
-package_versions_sha256=$PACKAGE_VERSIONS_SHA256
-EOF
+BOL_WINEGDK_INTERNAL=1 "$SCRIPT_PATH" --internal-finalize "$WORK_ROOT"
 
 printf '\nBuild complete (not packaged or published).\n'
 printf 'Install prefix: %s\n' "$WORK_ROOT/prefix"

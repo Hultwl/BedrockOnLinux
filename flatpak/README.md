@@ -34,8 +34,8 @@ Per <https://docs.flathub.org/docs/for-app-authors/submission>:
 1. **Tag the release** this manifest pins, then fill in the commit:
 
    ```bash
-   git tag -a v1.0.9 -m 'BedrockOnLinux v1.0.9' && git push origin v1.0.9
-   git rev-parse 'v1.0.9^{commit}'   # → add as `commit:` under the git source
+   git tag -a vX.Y.Z -m 'BedrockOnLinux vX.Y.Z' && git push origin vX.Y.Z
+   git rev-parse 'vX.Y.Z^{commit}'   # → add as `commit:` under the git source
    ```
 
 2. **Verify locally** what Flathub CI will run:

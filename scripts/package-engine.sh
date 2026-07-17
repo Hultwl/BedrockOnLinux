@@ -8,17 +8,20 @@
 #
 # Usage:
 #   scripts/package-engine.sh ENGINE_DIR UNIVERSAL_DGC_BUILD_DIR \
-#     WINEGDK_COMMIT GDK_PROTON_BASE_ARCHIVE
+#     WINEGDK_COMMIT GDK_PROTON_BASE_ARCHIVE [WINEGDK_PREFIX]
 #
 # ENGINE_DIR defaults to:
 #   $BOL_HOME/proton/GDK-Proton-xuser
 #
 # UNIVERSAL_DGC_BUILD_DIR is the output of vkd3d-proton's package-release.sh and must
 # contain x64/{d3d12,d3d12core}.dll and x86/{d3d12,d3d12core}.dll.  The build
-# used for r11 is v3.0.1 with removal commit 76c11d2 reverted.
+# used for native5 is the reviewed r11/r12 v3.0.1 payload with removal commit
+# 76c11d2 reverted; only WineGDK changes in this experimental revision.
 # GDK_PROTON_BASE_ARCHIVE must be the reviewed Weather-OS release10-32
 # archive. It supplies the native XThreading runtime which WineGDK delegates
 # XAsync/XTaskQueue calls to; the WineGDK wrapper cannot replace that DLL.
+# WINEGDK_PREFIX, when supplied, is the output of build-winegdk-bullseye.sh.
+# It is overlaid only in the isolated staging snapshot, never into ENGINE_DIR.
 #
 # Output:
 #   dist/GDK-Proton-xuser-<WINEGDK_BUILD_REV>.tar.gz
@@ -37,6 +40,7 @@ ENGINE_DIR="${1:-$BOL_HOME/proton/GDK-Proton-xuser}"
 UNIVERSAL_DGC_BUILD_DIR="${2:-${BOL_VKD3D_UNIVERSAL_BUILD:-}}"
 WINEGDK_COMMIT="${3:-${BOL_WINEGDK_SOURCE_COMMIT:-}}"
 GDK_PROTON_BASE_ARCHIVE="${4:-${BOL_GDK_PROTON_BASE_ARCHIVE:-}}"
+WINEGDK_PREFIX="${5:-${BOL_WINEGDK_PREFIX:-}}"
 PINNED_WINEGDK_COMMIT="$(grep -m1 '^WINEGDK_SOURCE_COMMIT = ' \
   "$SRC/bol/config.py" | cut -d'"' -f2)"
 GDK_PROTON_BASE_REPOSITORY="Weather-OS/GDK-Proton"
@@ -68,8 +72,22 @@ if [[ -z "$GDK_PROTON_BASE_ARCHIVE" || ! -f "$GDK_PROTON_BASE_ARCHIVE" \
   echo "!! pass the reviewed $GDK_PROTON_BASE_NAME as the fourth argument." >&2
   exit 1
 fi
+if [[ -n "$WINEGDK_PREFIX" ]]; then
+  if [[ ! -d "$WINEGDK_PREFIX" || -L "$WINEGDK_PREFIX" \
+        || ! -x "$WINEGDK_PREFIX/bin/wine" \
+        || ! -x "$WINEGDK_PREFIX/bin/wineserver" \
+        || ! -f "$WINEGDK_PREFIX/lib/wine/x86_64-windows/xgameruntime.dll" \
+        || ! -f "$WINEGDK_PREFIX/lib/wine/i386-windows/xgameruntime.dll" \
+        || ! -f "$WINEGDK_PREFIX/.bol-winegdk-build.env" \
+        || ! -f "$WINEGDK_PREFIX/.bol-winegdk-package-versions.tsv" ]]; then
+    echo "!! the fifth argument is not a complete WineGDK build prefix:" >&2
+    echo "   $WINEGDK_PREFIX" >&2
+    exit 1
+  fi
+  WINEGDK_PREFIX="$(cd "$WINEGDK_PREFIX" && pwd -P)"
+fi
 
-for tool in cmp cp find flock grep gzip install python3 readelf readlink \
+for tool in cmp cp find flock grep gzip install objdump python3 readelf readlink \
   sha256sum strings tar; do
   command -v "$tool" >/dev/null 2>&1 || {
     echo "!! required packaging tool is missing: $tool" >&2
@@ -101,6 +119,9 @@ echo "== Packaging unreleased hybrid engine candidate '$REV'"
 echo "   source: $ENGINE_DIR"
 echo "   universal DGC build: $UNIVERSAL_DGC_BUILD_DIR"
 echo "   WineGDK source: $WINEGDK_COMMIT"
+if [[ -n "$WINEGDK_PREFIX" ]]; then
+  echo "   WineGDK prefix overlay: $WINEGDK_PREFIX"
+fi
 echo "   source size: $(du -sh "$ENGINE_DIR" | cut -f1)"
 
 # The application uses this same stable parent lock when replacing the managed
@@ -134,6 +155,15 @@ else
     cp -a "$ENGINE_DIR/." "$STAGED_ENGINE/"
     echo "   staging: independent copy (links unavailable)"
   fi
+fi
+
+# A freshly built WineGDK prefix can be combined with a known-good Proton base
+# without modifying that base. --remove-destination is essential for the
+# low-space hard-link snapshot: replacing an existing inode prevents cp from
+# truncating a file that is still linked to ENGINE_DIR.
+if [[ -n "$WINEGDK_PREFIX" ]]; then
+  cp -a --remove-destination "$WINEGDK_PREFIX/." "$STAGED_ENGINE/files/"
+  echo "   staged reviewed WineGDK prefix overlay"
 fi
 
 # Wine's installed headers are build-time material, not part of the Proton
@@ -188,20 +218,37 @@ VKD3D_EXT_VERSION="3.0.1-bol-dgc"
 VKD3D_NV_VERSION="3.0.1-bol-dgc"
 VKD3D_NV_SOURCE="3b10bd7a7ec6a7347e616cf8bea59333afec2255"
 VKD3D_NV_REVERT="76c11d2e2b90b0a46dc894508e67e2aaacc2c04d"
-WINEGDK_SOURCE_DATE_EPOCH="1782250551"
+WINEGDK_SOURCE_DATE_EPOCH="1784308597"
 PROVENANCE_SOURCE="$SRC/third_party/vkd3d-proton-universal"
+WINEGDK_R12_PROVENANCE_SOURCE="$SRC/third_party/winegdk-r12"
+WINEGDK_NATIVE_PROVENANCE_SOURCE="$SRC/third_party/winegdk-native5"
 PROVENANCE_BASE_REL="files/share/bedrock-on-linux/licenses-and-provenance"
 VKD3D_PROVENANCE_REL="$PROVENANCE_BASE_REL/vkd3d-proton-universal"
 WINEGDK_PROVENANCE_REL="$PROVENANCE_BASE_REL/winegdk"
 GDK_PROTON_PROVENANCE_REL="$PROVENANCE_BASE_REL/gdk-proton-base"
-WINEGDK_BUILD_RECORD="$ENGINE_DIR/files/.bol-winegdk-build.env"
-WINEGDK_PACKAGE_VERSIONS="$ENGINE_DIR/files/.bol-winegdk-package-versions.tsv"
+if [[ -n "$WINEGDK_PREFIX" ]]; then
+  WINEGDK_BUILD_RECORD="$WINEGDK_PREFIX/.bol-winegdk-build.env"
+  WINEGDK_PACKAGE_VERSIONS="$WINEGDK_PREFIX/.bol-winegdk-package-versions.tsv"
+else
+  WINEGDK_BUILD_RECORD="$ENGINE_DIR/files/.bol-winegdk-build.env"
+  WINEGDK_PACKAGE_VERSIONS="$ENGINE_DIR/files/.bol-winegdk-package-versions.tsv"
+fi
 PROVENANCE_FILES=(
   COPYING.LGPL-2.1
   provenance.env
   submodules.lock
   OUTPUT-SHA256SUMS
   restore-nv-dgc.patch
+)
+WINEGDK_R12_PROVENANCE_FILES=(
+  README.md
+  SOURCE-SHA256SUMS
+  online-patches-after-user-ready.patch
+)
+WINEGDK_NATIVE_PROVENANCE_FILES=(
+  README.md
+  SOURCE-SHA256SUMS
+  0001-winegdk-native5-Xbox-and-file-picker-runtime.patch
 )
 
 verify_sha256() {
@@ -236,6 +283,29 @@ verify_reviewed_provenance() {
     "vkd3d-proton NV-DGC restoration patch"
 }
 
+verify_winegdk_source_provenance() {
+  local r12_root="$1" native_root="$2"
+  verify_sha256 "$r12_root/README.md" \
+    "754aca14f0622ba8e40f5572488e8b9a6408b5c1619d0a5d67800f7fddb0017b" \
+    "WineGDK r12 source-delta README"
+  verify_sha256 "$r12_root/SOURCE-SHA256SUMS" \
+    "2c70a6922132746a3de6cc282ac7cd96ac4a1c8bbd3c326f86696569e43a2da1" \
+    "WineGDK r12 source hash lock"
+  verify_sha256 "$r12_root/online-patches-after-user-ready.patch" \
+    "ee0543f11737a11f5edec389967bb41482c7f5eda3807c24d171dd6bf6301274" \
+    "WineGDK r12 source delta"
+  verify_sha256 "$native_root/README.md" \
+    "f1d97424b05c0ee13de585fea6f19793c094c7405c6dd318b5ad5353c064a665" \
+    "WineGDK native5 source-delta README"
+  verify_sha256 "$native_root/SOURCE-SHA256SUMS" \
+    "80a3d59d35ab642ec1f2546aa6ad2c180785f0e577f30d8eccdda2066d80c72e" \
+    "WineGDK native5 source hash lock"
+  verify_sha256 \
+    "$native_root/0001-winegdk-native5-Xbox-and-file-picker-runtime.patch" \
+    "d5630af845064b50780665e8ba335d4484a4c0b68eb396f195f840f0d2689a8b" \
+    "WineGDK native5 source delta"
+}
+
 has_marker() {
   local file="$1" marker="$2"
   # Do not use grep -q here: under pipefail its early exit can make strings(1)
@@ -246,6 +316,21 @@ has_marker() {
 has_text() {
   local file="$1" expected="$2"
   LC_ALL=C strings -a "$file" | grep -F -- "$expected" >/dev/null
+}
+
+has_file_picker_registration() {
+  python3 - "$1" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+data = Path(sys.argv[1]).read_bytes()
+registration = re.compile(
+    rb"ForceRemove Microsoft[.]Windows[.]Storage[.]Pickers[.]FileOpenPicker"
+    rb"\s*[{]\s*val 'DllPath' = s '%MODULE%'\s*[}]"
+)
+raise SystemExit(0 if registration.search(data) else 1)
+PY
 }
 
 version_file_has() {
@@ -286,6 +371,8 @@ version_file_has "$ENGINE_DIR/files/lib/wine/dxvk/version" \
 # binary payload. OUTPUT-SHA256SUMS is itself pinned above, then checks all four
 # reviewed universal DLLs relative to the supplied build directory.
 verify_reviewed_provenance "$PROVENANCE_SOURCE"
+verify_winegdk_source_provenance "$WINEGDK_R12_PROVENANCE_SOURCE" \
+  "$WINEGDK_NATIVE_PROVENANCE_SOURCE"
 (
   cd "$UNIVERSAL_DGC_BUILD_DIR"
   sha256sum --strict -c "$PROVENANCE_SOURCE/OUTPUT-SHA256SUMS"
@@ -370,7 +457,8 @@ WINEGDK_PROVENANCE_DEST="$STAGED_ENGINE/$WINEGDK_PROVENANCE_REL"
 GDK_PROTON_PROVENANCE_DEST="$STAGED_ENGINE/$GDK_PROTON_PROVENANCE_REL"
 rm -rf "$STAGED_ENGINE/$PROVENANCE_BASE_REL"
 mkdir -p "$VKD3D_PROVENANCE_DEST" "$WINEGDK_PROVENANCE_DEST" \
-  "$GDK_PROTON_PROVENANCE_DEST"
+  "$GDK_PROTON_PROVENANCE_DEST" "$WINEGDK_PROVENANCE_DEST/r12" \
+  "$WINEGDK_PROVENANCE_DEST/native5"
 for provenance_file in "${PROVENANCE_FILES[@]}"; do
   cp -a "$PROVENANCE_SOURCE/$provenance_file" \
     "$VKD3D_PROVENANCE_DEST/$provenance_file"
@@ -383,6 +471,16 @@ cp -a "$WINEGDK_PACKAGE_VERSIONS" \
 # own build records instead of relying on the vkd3d provenance directory.
 cp -a "$PROVENANCE_SOURCE/COPYING.LGPL-2.1" \
   "$WINEGDK_PROVENANCE_DEST/COPYING.LGPL-2.1"
+for provenance_file in "${WINEGDK_R12_PROVENANCE_FILES[@]}"; do
+  cp -a "$WINEGDK_R12_PROVENANCE_SOURCE/$provenance_file" \
+    "$WINEGDK_PROVENANCE_DEST/r12/$provenance_file"
+done
+for provenance_file in "${WINEGDK_NATIVE_PROVENANCE_FILES[@]}"; do
+  cp -a "$WINEGDK_NATIVE_PROVENANCE_SOURCE/$provenance_file" \
+    "$WINEGDK_PROVENANCE_DEST/native5/$provenance_file"
+done
+verify_winegdk_source_provenance "$WINEGDK_PROVENANCE_DEST/r12" \
+  "$WINEGDK_PROVENANCE_DEST/native5"
 cat >"$GDK_PROTON_PROVENANCE_DEST/provenance.env" <<EOF
 schema=1
 repository=$GDK_PROTON_BASE_REPOSITORY
@@ -467,18 +565,48 @@ for arch in "${ARCHES[@]}"; do
   echo "   verified $arch: EXT-DGC + NV-DGC"
 done
 
-# The r11 engine is built from the guarded WineGDK commit, not the older public
-# master snapshot. These stable diagnostic strings are compiled into both PE
-# architectures by that source and catch an accidental overlay from the wrong
-# build tree before provenance is asserted in the manifest.
+# The native engine must expose XGame identity and the completed XUser request
+# path, while containing no remnants or imports from the old Minecraft memory
+# patcher. These checks catch an accidental r12 overlay before provenance is
+# asserted.
 for arch in "${ARCHES[@]}"; do
   xgdk="$STAGED_ENGINE/files/lib/wine/$arch/xgameruntime.dll"
   [[ -f "$xgdk" ]] || {
     echo "!! WineGDK xgameruntime.dll missing for $arch" >&2; exit 1; }
-  has_text "$xgdk" "patched sign-in lookup null-guard" || {
-    echo "!! WineGDK sign-in guard missing for $arch" >&2; exit 1; }
-  has_text "$xgdk" "patched online-server join gate" || {
-    echo "!! WineGDK online-server guard missing for $arch" >&2; exit 1; }
+  has_text "$xgdk" "native XGame identity loaded: TitleId" || {
+    echo "!! WineGDK native XGame identity missing for $arch" >&2; exit 1; }
+  has_text "$xgdk" "native Xbox app configuration ready" || {
+    echo "!! WineGDK native Xbox app context missing for $arch" >&2; exit 1; }
+  has_text "$xgdk" "requesting token: method=" || {
+    echo "!! WineGDK native XUser request path missing for $arch" >&2; exit 1; }
+  has_text "$xgdk" "unsupported GDK QueryApiImpl class" || {
+    echo "!! WineGDK native interface diagnostics missing for $arch" >&2; exit 1; }
+  storage="$STAGED_ENGINE/files/lib/wine/$arch/windows.storage.dll"
+  [[ -f "$storage" ]] || {
+    echo "!! WineGDK windows.storage.dll missing for $arch" >&2; exit 1; }
+  has_text "$storage" "Microsoft.Windows.Storage.Pickers.FileOpenPicker" || {
+    echo "!! WineGDK native FileOpenPicker class missing for $arch" >&2; exit 1; }
+  has_text "$storage" "PickSingleFileAsync" || {
+    echo "!! WineGDK native single-file picker method missing for $arch" >&2; exit 1; }
+  has_text "$storage" "PickMultipleFilesAsync" || {
+    echo "!! WineGDK native multi-file picker method missing for $arch" >&2; exit 1; }
+  has_file_picker_registration "$storage" || {
+    echo "!! WineGDK native FileOpenPicker registration missing for $arch" >&2
+    exit 1
+  }
+  if has_text "$xgdk" "online patches skipped:" ||
+     has_text "$xgdk" "committed XblInitialize gate"; then
+    echo "!! legacy Minecraft memory-patch code remains in $arch" >&2
+    exit 1
+  fi
+  # Do not use grep -q here: with pipefail, an early grep exit can make
+  # objdump receive SIGPIPE and turn a positive match into status 141.
+  if objdump -p "$xgdk" | grep -E \
+       'K32GetModuleInformation|GetModuleInformation|VirtualProtect' \
+       >/dev/null; then
+    echo "!! Minecraft memory-patch imports remain in $arch" >&2
+    exit 1
+  fi
 done
 
 # Hash the exact bytes that users will run. _wire_winegdk() applies these
@@ -632,6 +760,12 @@ for relative_root, names in (
         "COPYING.LGPL-2.1",
         ".bol-winegdk-build.env",
         ".bol-winegdk-package-versions.tsv",
+        "r12/README.md",
+        "r12/SOURCE-SHA256SUMS",
+        "r12/online-patches-after-user-ready.patch",
+        "native5/README.md",
+        "native5/SOURCE-SHA256SUMS",
+        "native5/0001-winegdk-native5-Xbox-and-file-picker-runtime.patch",
     )),
     (gdk_proton_provenance_root, ("provenance.env",)),
 ):
@@ -769,7 +903,7 @@ if actual_hashes != required_hashes:
 PY
 chmod 0644 "$STAGED_ENGINE/engine-manifest.json"
 
-# Default to the pinned WineGDK commit timestamp used by the reviewed r11
+# Default to the pinned WineGDK commit timestamp used by the native5
 # candidate. Maintainers can still override it deliberately, but the documented
 # packaging command now reproduces the same tar metadata without hidden env.
 SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$WINEGDK_SOURCE_DATE_EPOCH}"
@@ -802,6 +936,14 @@ ARCHIVE_MEMBERS+=(
   "GDK-Proton-xuser/$WINEGDK_PROVENANCE_REL/.bol-winegdk-package-versions.tsv"
   "GDK-Proton-xuser/$GDK_PROTON_PROVENANCE_REL/provenance.env"
   "GDK-Proton-xuser/$GDK_PROTON_THREADING_REL")
+for provenance_file in "${WINEGDK_R12_PROVENANCE_FILES[@]}"; do
+  ARCHIVE_MEMBERS+=(
+    "GDK-Proton-xuser/$WINEGDK_PROVENANCE_REL/r12/$provenance_file")
+done
+for provenance_file in "${WINEGDK_NATIVE_PROVENANCE_FILES[@]}"; do
+  ARCHIVE_MEMBERS+=(
+    "GDK-Proton-xuser/$WINEGDK_PROVENANCE_REL/native5/$provenance_file")
+done
 tar -xzf "$PART" -C "$ARCHIVE_CHECK" -- "${ARCHIVE_MEMBERS[@]}"
 EXTRACTED_VKD3D_PROVENANCE="$ARCHIVE_CHECK/GDK-Proton-xuser/$VKD3D_PROVENANCE_REL"
 EXTRACTED_WINEGDK_PROVENANCE="$ARCHIVE_CHECK/GDK-Proton-xuser/$WINEGDK_PROVENANCE_REL"
@@ -822,6 +964,8 @@ verify_sha256 \
 verify_sha256 "$EXTRACTED_WINEGDK_PROVENANCE/COPYING.LGPL-2.1" \
   "dc626520dcd53a22f727af3ee42c770e56c97a64fe3adb063799d8ab032fe551" \
   "archived WineGDK LGPL notice"
+verify_winegdk_source_provenance "$EXTRACTED_WINEGDK_PROVENANCE/r12" \
+  "$EXTRACTED_WINEGDK_PROVENANCE/native5"
 read -r gdk_proton_record_sha _ < <(
   sha256sum "$GDK_PROTON_PROVENANCE_DEST/provenance.env")
 verify_sha256 "$EXTRACTED_GDK_PROTON_PROVENANCE/provenance.env" \

@@ -265,7 +265,11 @@ print("Flatpak payload verified byte-for-byte:", values["VERSION"],
       values["WINEGDK_BUILD_REV"], f"({len(actual_files)} bol/ files)")
 PY
 )"
-"${FB[@]}" --run "$WORK/builddir" "$BUILD_MANIFEST" \
+# Run the finished tree with the host Flatpak command.  The
+# org.flatpak.Builder wrapper can return status 1 after a successful --run
+# when the local development manifest intentionally has no AppStream export;
+# `flatpak build` reports the verifier's real exit status directly.
+flatpak build "$WORK/builddir" \
   /app/bin/python3 -c "$PAYLOAD_CHECK_CODE" \
   /app/lib/bedrock-on-linux/bol "$EXPECTED_BOL_HASHES" "$VER" "$REV"
 

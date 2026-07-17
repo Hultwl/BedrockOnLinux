@@ -37,6 +37,14 @@ def _flatpak_payload_check_code():
     return match.group(1)
 
 
+def test_payload_audit_uses_finished_tree_without_builder_wrapper():
+    script = (ROOT / "scripts/build-flatpak.sh").read_text(encoding="utf-8")
+    audit = script[script.index("flatpak build \"$WORK/builddir\""):
+                   script.index("flatpak build-bundle")]
+    assert "/app/bin/python3 -c \"$PAYLOAD_CHECK_CODE\"" in audit
+    assert '"${FB[@]}" --run' not in script
+
+
 def _regular_hashes(root):
     files = {}
     for path in sorted(root.rglob("*")):
@@ -203,8 +211,20 @@ class FlatpakLocalManifestTests(unittest.TestCase):
         self.assertIn("no build or release performed", result.stdout)
 
     def test_release_mode_refuses_old_tracked_tag_before_any_build(self):
+        manifest_path = self.checkout / f"flatpak/{APPID}.yml"
+        manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+        app = manifest["modules"][-1]
+        git_source = next(source for source in app["sources"]
+                          if source.get("type") == "git")
+        old_tag = "v0.0.0"
+        self.assertNotEqual(old_tag, f"v{VERSION}")
+        git_source["tag"] = old_tag
+        manifest_path.write_text(
+            yaml.safe_dump(manifest, sort_keys=False), encoding="utf-8")
+
         result = self._run("--release")
         self.assertNotEqual(result.returncode, 0)
+        self.assertIn(f"pins {old_tag!r}", result.stderr)
         self.assertIn(f"expected 'v{VERSION}'", result.stderr)
         self.assertIn("refusing a mislabeled release build", result.stderr)
         self.assertEqual(self.release_draft.read_text(encoding="utf-8"),

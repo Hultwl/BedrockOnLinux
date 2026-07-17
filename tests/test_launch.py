@@ -13,7 +13,7 @@ from bol import launch
 
 class GraphicsEngineLaunchTests(unittest.TestCase):
     def _exercise_ready_launch(self, root, popen, arm, disarm,
-                               prefix_idle=True):
+                               prefix_idle=True, mark=None):
         content = root / "content"
         logs = root / "logs"
         data = root / "data"
@@ -31,6 +31,7 @@ class GraphicsEngineLaunchTests(unittest.TestCase):
             mock.patch.object(launch, "proton_path",
                               return_value=Path("/tmp/fake-engine")),
             mock.patch.object(launch, "require_safe_graphics_session"),
+            mock.patch.object(launch, "retire_idle_current_boot_marker"),
             mock.patch.object(launch, "_prepare_launch_engine"),
             mock.patch.object(
                 launch, "msa_session_snapshot",
@@ -56,6 +57,9 @@ class GraphicsEngineLaunchTests(unittest.TestCase):
             mock.patch.object(launch, "_prefix_stably_idle_after_wrapper",
                               return_value=prefix_idle),
             mock.patch.object(launch, "arm_gpu_launch", side_effect=arm),
+            mock.patch.object(
+                launch, "mark_gpu_wrapper_returned",
+                side_effect=mark or (lambda _token: True)),
             mock.patch.object(launch, "disarm_gpu_launch", side_effect=disarm),
             mock.patch.object(launch.subprocess, "Popen", side_effect=popen),
             mock.patch.object(launch, "info"),
@@ -81,6 +85,35 @@ class GraphicsEngineLaunchTests(unittest.TestCase):
                                   side_effect=lambda: calls.append("graphics")):
             launch._prepare_launch_engine()
         self.assertEqual(calls, ["idle", "install", "graphics"])
+
+    def test_corrected_engine_is_installed_before_session_safety_check(self):
+        calls = []
+
+        def stop_after_safety():
+            calls.append("safety")
+            raise launch.BolError("stop after order check")
+
+        with tempfile.TemporaryDirectory() as directory:
+            content = Path(directory)
+            (content / "Minecraft.Windows.exe").write_bytes(b"MZ")
+            with mock.patch.object(
+                    launch, "load_settings",
+                    return_value={"game_dir": str(content)}), \
+                    mock.patch.object(launch, "CONTENT", content), \
+                    mock.patch.object(launch, "proton_path",
+                                      return_value=Path("/tmp/engine")), \
+                    mock.patch.object(
+                        launch, "_prepare_launch_engine",
+                        side_effect=lambda: calls.append("engine")), \
+                    mock.patch.object(
+                        launch, "retire_idle_current_boot_marker",
+                        side_effect=lambda: calls.append("retire")), \
+                    mock.patch.object(
+                        launch, "require_safe_graphics_session",
+                        side_effect=stop_after_safety):
+                with self.assertRaisesRegex(launch.BolError, "order check"):
+                    launch._launch_once()
+        self.assertEqual(calls, ["engine", "retire", "safety"])
 
     def test_rejected_managed_install_never_reaches_graphics_or_wine(self):
         with mock.patch.object(launch, "active_prefix",
@@ -151,7 +184,7 @@ class GraphicsEngineLaunchTests(unittest.TestCase):
         self.assertEqual(env["VKD3D_CONFIG"],
                          "force_raw_va_cbv,breadcrumbs")
 
-    def test_gpu_safety_failure_happens_before_engine_or_wine(self):
+    def test_gpu_safety_failure_allows_engine_update_but_blocks_wine(self):
         with tempfile.TemporaryDirectory() as td:
             game = Path(td)
             (game / "Minecraft.Windows.exe").write_bytes(b"MZ")
@@ -166,7 +199,7 @@ class GraphicsEngineLaunchTests(unittest.TestCase):
                     mock.patch.object(launch, "boot_prefix") as boot:
                 with self.assertRaisesRegex(launch.BolError, "unsafe GPU"):
                     launch._launch_once()
-            prep.assert_not_called()
+            prep.assert_called_once_with()
             boot.assert_not_called()
 
     def test_gpu_marker_wraps_the_only_game_process_and_clears_on_return(self):
@@ -190,13 +223,19 @@ class GraphicsEngineLaunchTests(unittest.TestCase):
             calls.append(("disarm", token))
             return True
 
+        def mark(token):
+            calls.append(("mark-returned", token))
+            return True
+
         with tempfile.TemporaryDirectory() as td:
             self.assertEqual(
-                self._exercise_ready_launch(Path(td), popen, arm, disarm), 0)
+                self._exercise_ready_launch(
+                    Path(td), popen, arm, disarm, mark=mark), 0)
         self.assertEqual(calls, [
             ("arm",),
             ("popen",),
             ("wait", 1),
+            ("mark-returned", "owned-token"),
             ("disarm", "owned-token"),
         ])
 
@@ -241,13 +280,18 @@ class GraphicsEngineLaunchTests(unittest.TestCase):
             calls.append(("disarm", token))
             return True
 
+        def mark(token):
+            calls.append(("mark-returned", token))
+            return True
+
         with tempfile.TemporaryDirectory() as td:
             self.assertEqual(self._exercise_ready_launch(
-                Path(td), popen, arm, disarm, prefix_idle=False), 0)
+                Path(td), popen, arm, disarm, prefix_idle=False, mark=mark), 0)
         self.assertEqual(calls, [
             ("arm",),
             ("popen",),
             ("wait", 1),
+            ("mark-returned", "owned-token"),
         ])
 
     def test_wrapper_return_requires_three_idle_rescans_without_killing(self):

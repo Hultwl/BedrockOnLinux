@@ -25,7 +25,7 @@ class FreezeDiagnosisTests(unittest.TestCase):
                     mock.patch.object(gamesetup, "info"):
                 hits = gamesetup.diagnose()
         self.assertEqual(len(hits), 1)
-        self.assertIn("1.3.0 compatibility engine", hits[0])
+        self.assertIn("current compatibility engine", hits[0])
 
 
 class OnlineDiagnosisTests(unittest.TestCase):
@@ -42,29 +42,45 @@ class OnlineDiagnosisTests(unittest.TestCase):
                     mock.patch.object(gamesetup, "info"):
                 return gamesetup.diagnose()
 
-    def test_disabled_memory_patch_explains_locked_servers_tab(self):
+    def test_native_identity_missing_after_preauth_is_reported(self):
         hits = self._diagnose(
             "preauth: loaded user/XSTS tokens\n",
             {"force_msa_facet": False},
         )
-        self.assertTrue(any("disabled in Settings" in hit for hit in hits))
+        self.assertTrue(any("native XGame identity" in hit for hit in hits))
 
-    def test_missing_online_gate_after_preauth_is_reported(self):
+    def test_native_identity_and_preauth_produce_no_auth_warning(self):
         hits = self._diagnose(
+            "native XGame identity loaded: TitleId 0x35760c07\n"
             "preauth: loaded user/XSTS tokens\n",
-            {"force_msa_facet": True},
-        )
-        self.assertTrue(any("memory patch did not activate" in hit
-                            for hit in hits))
-
-    def test_online_gate_and_preauth_produce_no_auth_warning(self):
-        hits = self._diagnose(
-            "patched online-server join gate at RVA 0x123\n"
-            "preauth: loaded user/XSTS tokens\n",
-            {"force_msa_facet": True},
+            {"force_msa_facet": False},
         )
         self.assertFalse(any("server" in hit.lower() or "xbox" in hit.lower()
                              for hit in hits))
+
+    def test_normal_uninitialize_stub_is_not_a_missing_xuser(self):
+        hits = self._diagnose(
+            "00e0:trace:xgameruntime:UninitializeApiImpl stub!\n",
+            {},
+        )
+        self.assertFalse(any("no WineGDK XUser" in hit for hit in hits))
+
+    def test_xuser_stub_still_reports_missing_runtime(self):
+        hits = self._diagnose(
+            "00e0:fixme:xgameruntime:XUserAddAsync stub!\n",
+            {},
+        )
+        self.assertTrue(any("no WineGDK XUser" in hit for hit in hits))
+
+    def test_large_log_keeps_initialization_proof_and_tail(self):
+        log = (
+            "native XGame identity loaded: TitleId 0x35760c07\n"
+            "preauth: loaded user/XSTS credentials\n"
+            + "middle\n" * 70000
+            + "00e0:trace:xgameruntime:UninitializeApiImpl stub!\n"
+        )
+        hits = self._diagnose(log, {})
+        self.assertFalse(any("no WineGDK XUser" in hit for hit in hits))
 
     def test_nv_dgc_raw_va_error_reports_compatibility_engine(self):
         with tempfile.TemporaryDirectory() as td:
@@ -82,7 +98,7 @@ class OnlineDiagnosisTests(unittest.TestCase):
                     mock.patch.object(gamesetup, "info"):
                 hits = gamesetup.diagnose()
         self.assertEqual(len(hits), 1)
-        self.assertIn("1.3.0 compatibility engine", hits[0])
+        self.assertIn("current compatibility engine", hits[0])
 
 
 if __name__ == "__main__":

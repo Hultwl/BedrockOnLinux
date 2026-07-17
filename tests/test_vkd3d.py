@@ -296,6 +296,21 @@ class ManifestValidationTests(EngineFixture, unittest.TestCase):
                 BolError, "missing or escapes the engine"):
             vkd3d.validate_engine_manifest(root, self.BUILD_REV)
 
+    def test_file_picker_runtime_is_mandatory_for_both_architectures(self):
+        paths = (
+            "files/lib/wine/x86_64-windows/windows.storage.dll",
+            "files/lib/wine/i386-windows/windows.storage.dll",
+        )
+        for relative in paths:
+            with self.subTest(relative=relative):
+                self.assertIn(relative, vkd3d.REQUIRED_CRITICAL_FILE_PATHS)
+                root = self.make_engine()
+                root.joinpath(*Path(relative).parts).unlink()
+                with self.assertRaisesRegex(
+                        BolError,
+                        r"missing or escapes.*windows[.]storage[.]dll"):
+                    vkd3d.validate_engine_manifest(root, self.BUILD_REV)
+
     def test_pinned_revision_rejects_unreviewed_native_threading(self):
         root = self.make_engine()
         manifest = self.read_manifest()

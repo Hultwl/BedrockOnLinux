@@ -23,7 +23,7 @@ echo "== Installing exact local engine candidate: $ARCHIVE"
 # A maintainer may rebuild an archive without changing REV while iterating.
 # Install directly so the helper can distinguish an accepted candidate from
 # ensure_winegdk() deliberately keeping an older working engine after a
-# rejected update. Then wire the engine and revalidate the installed r11 bytes
+# rejected update. Then wire the engine and revalidate the installed bytes
 # before there is any possibility of launching the application.
 PYTHONPATH="$SRC" python3 - "$REV" <<'PY'
 import sys

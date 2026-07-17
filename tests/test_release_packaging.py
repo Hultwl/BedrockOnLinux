@@ -247,6 +247,15 @@ class CandidateMetadataTests(unittest.TestCase):
 
 
 class BuildReleaseHygieneTests(unittest.TestCase):
+    def test_flatpak_app_builder_is_detected_before_failure_gate(self):
+        script = BUILD_RELEASE.read_text(encoding="utf-8")
+        detection = script.index("flatpak info org.flatpak.Builder")
+        build = script.index('bash "$SRC/scripts/build-flatpak.sh"', detection)
+        required = script.index("incomplete candidate: required formats failed")
+        self.assertLess(detection, build)
+        self.assertLess(build, required)
+        self.assertIn('required_failures+=("Flatpak")', script[build:required])
+
     def test_stale_app_artifacts_are_removed_but_shared_assets_survive(self):
         with tempfile.TemporaryDirectory() as directory:
             checkout = Path(directory)
@@ -444,7 +453,7 @@ class RunCandidateSafetyTests(unittest.TestCase):
         self.assertFalse(self.launch_marker.exists())
         self.assertFalse(self.validation_marker.exists())
 
-    def test_only_launches_after_installed_r11_manifest_is_revalidated(self):
+    def test_only_launches_after_installed_r12_manifest_is_revalidated(self):
         result = self._run(accept=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
@@ -477,7 +486,14 @@ class EnginePackagingComplianceTests(unittest.TestCase):
             "restore-nv-dgc.patch",
             ".bol-winegdk-build.env",
             ".bol-winegdk-package-versions.tsv",
+            "online-patches-after-user-ready.patch",
+            "0001-winegdk-native5-Xbox-and-file-picker-runtime.patch",
+            "SOURCE-SHA256SUMS",
             "xgameruntime.dll.threading",
+            "windows.storage.dll",
+            "Microsoft.Windows.Storage.Pickers.FileOpenPicker",
+            "PickSingleFileAsync",
+            "PickMultipleFilesAsync",
             "GDK-Proton10-32.tar.gz",
             "1e80f4e714f877f42101d5775bd38ca0a15a38d304e24af1f15c6deec4ebac2d",
             "4c3e3faf5bcd86779e4a69677902dd8b36a16e1136a5901e616c36d8a02b68f6",
@@ -488,6 +504,8 @@ class EnginePackagingComplianceTests(unittest.TestCase):
         self.assertIn(
             '"$WINEGDK_PROVENANCE_DEST/COPYING.LGPL-2.1"', script)
         self.assertIn("ARCHIVE_MEMBERS", script)
+        self.assertIn("verify_winegdk_source_provenance", script)
+        self.assertIn("native Xbox app configuration ready", script)
         self.assertIn('"critical_files": critical_files', script)
         self.assertIn("REQUIRED_CRITICAL_FILE_PATHS", script)
         self.assertIn("REQUIRED_PINNED_CRITICAL_HASHES", script)
@@ -496,6 +514,45 @@ class EnginePackagingComplianceTests(unittest.TestCase):
             'SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$WINEGDK_SOURCE_DATE_EPOCH}"',
             script,
         )
+
+    def test_package_requires_native_file_picker_in_both_architectures(self):
+        script = PACKAGE_ENGINE.read_text(encoding="utf-8")
+        loop = script.index('for arch in "${ARCHES[@]}"; do',
+                            script.index("# The native engine must expose"))
+        module = script.index(
+            'storage="$STAGED_ENGINE/files/lib/wine/$arch/windows.storage.dll"',
+            loop,
+        )
+        class_marker = script.index(
+            '"Microsoft.Windows.Storage.Pickers.FileOpenPicker"', module)
+        method_marker = script.index('"PickSingleFileAsync"', class_marker)
+        multi_method_marker = script.index(
+            '"PickMultipleFilesAsync"', method_marker)
+        registration = script.index(
+            'has_file_picker_registration "$storage"', method_marker)
+        loop_end = script.index("\ndone", registration)
+        self.assertLess(loop, module)
+        self.assertLess(module, class_marker)
+        self.assertLess(class_marker, method_marker)
+        self.assertLess(method_marker, multi_method_marker)
+        self.assertLess(method_marker, registration)
+        self.assertLess(registration, loop_end)
+
+        registration_helper = script[
+            script.index("has_file_picker_registration()"):
+            script.index("\n}\n", script.index(
+                "has_file_picker_registration()")) + 3]
+        self.assertIn("ForceRemove Microsoft", registration_helper)
+        self.assertIn("'DllPath' = s '%MODULE%'", registration_helper)
+
+    def test_memory_patch_import_guard_is_pipefail_safe(self):
+        script = PACKAGE_ENGINE.read_text(encoding="utf-8")
+        guard = script[script.index('if objdump -p "$xgdk"'):
+                       script.index("\ndone", script.index(
+                           'if objdump -p "$xgdk"'))]
+        self.assertIn('objdump -p "$xgdk" | grep -E', guard)
+        self.assertNotIn("grep -Eq", guard)
+        self.assertIn(">/dev/null", guard)
 
     def test_stage_is_prepatched_before_critical_hashes_are_computed(self):
         script = PACKAGE_ENGINE.read_text(encoding="utf-8")

@@ -25,7 +25,9 @@ from .gamesetup import diagnose
 from .gpu_safety import (
     arm_gpu_launch,
     disarm_gpu_launch,
+    mark_gpu_wrapper_returned,
     require_safe_graphics_session,
+    retire_idle_current_boot_marker,
 )
 from .log import BolError, die, info, ok, warn
 from .prefix import (
@@ -67,7 +69,7 @@ def _require_vkd3d_config(env, option):
     env["VKD3D_CONFIG"] = ",".join(options)
 
 
-def _prefix_stably_idle_after_wrapper(timeout=2.0, interval=0.1,
+def _prefix_stably_idle_after_wrapper(timeout=10.0, interval=0.1,
                                       confirmations=3):
     """Confirm UMU did not detach a live Wine child when its wrapper returned."""
 
@@ -113,9 +115,15 @@ def _launch_once():
         die("No game — choose a Minecraft version first.")
     if not proton_path():
         die("GDK-Proton missing — run Install / Update.")
-    require_safe_graphics_session()
-    # Validate/update the engine before any Wine or GPU-capable helper runs.
+    # Installing, hashing, and wiring the managed engine does not open a GPU.
+    # Do it before graphics validation so a corrected engine can migrate state
+    # left by the previous revision without bypassing kernel/display checks.
     _prepare_launch_engine()
+    # launch() holds the launch lock, and preparation just proved that no
+    # process owns the prefix. Retire only a same-boot marker whose wrapper
+    # completion was durably recorded; the full safety gate runs immediately.
+    retire_idle_current_boot_marker()
+    require_safe_graphics_session()
 
     account, account_epoch = msa_session_snapshot()
     tok = account.get("refresh_token")
@@ -158,9 +166,10 @@ def _launch_once():
     # Required by the menu's indirect root-CBV updates (#27/#29/#30).
     _require_vkd3d_config(env, "force_raw_va_cbv")
     diag = (s.get("diagnostics", False) or os.environ.get("BOL_DIAG") == "1")
-    # gdkc TRACE floods synchronous logs and can stall game initialisation.
+    # Keep diagnostics focused on the native GDK contracts. Raw WinHTTP trace
+    # includes Authorization headers and must never be enabled automatically.
     env["WINEDEBUG"] = (os.environ.get("WINEDEBUG")
-                        or ("+gdkc,trace-gdkc,+winhttp,fixme+all" if diag
+                        or ("trace+gdkc,trace+xgameruntime,fixme-all" if diag
                             else "fixme-all"))
     xlog = os.environ.get("BOL_XCURL_LOG")
     if xlog == "1" or (xlog is None and diag):
@@ -291,6 +300,17 @@ def _launch_once():
                        "back here.")
     finally:
         if game_returned and gpu_marker_token:
+            try:
+                wrapper_returned_recorded = mark_gpu_wrapper_returned(
+                    gpu_marker_token)
+            except Exception as marker_error:
+                wrapper_returned_recorded = False
+                warn("Minecraft returned, but recording its GPU-marker phase "
+                     "failed (%s)." % type(marker_error).__name__)
+            if not wrapper_returned_recorded:
+                warn("Minecraft returned, but its GPU marker could not record "
+                     "the completed wrapper phase. A failed teardown will "
+                     "require explicit Doctor acknowledgement.")
             if not _prefix_stably_idle_after_wrapper():
                 warn("The UMU wrapper returned while Wine/Minecraft processes "
                      "still appear live. The GPU safety marker was retained; "

@@ -266,7 +266,7 @@ class NewWineGDKPatchTests(unittest.TestCase):
             for call in info.call_args_list))
 
     def test_guarded_winegdk_ntquerywnf_stub_is_safe(self):
-        """The pinned r11 build retains logging and clears buffer_size."""
+        """The pinned r12 build retains logging and clears buffer_size."""
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "engine"
             dll_dir = root / "files/lib/wine/x86_64-windows"

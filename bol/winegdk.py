@@ -50,8 +50,9 @@ def _extract_archive(archive, destination: Path):
             raise ValueError(f"duplicate path in engine archive: {raw_name}")
         names.add(name)
         if not (member.isfile() or member.isdir() or member.issym()):
-            # r11 is packed with --hard-dereference. Rejecting hard links and
-            # special/PAX-only members keeps extraction safe on Python < 3.12.
+            # Managed engines are packed with --hard-dereference. Rejecting
+            # hard links and special/PAX-only members keeps extraction safe
+            # on Python < 3.12.
             raise ValueError(f"unsupported entry in engine archive: {raw_name}")
         if member.issym():
             target = member.linkname
@@ -149,7 +150,7 @@ def _validate_engine_candidate(root: Path):
 def _recover_interrupted_engine_swap_locked():
     """Recover a validated rollback left by a crash during atomic activation.
 
-    The caller owns ``managed_engine_lock(PROTON_DIR)``.  A valid active r11
+    The caller owns ``managed_engine_lock(PROTON_DIR)``.  A valid active engine
     tree is authoritative and makes an old rollback disposable.  If the active
     tree is absent or invalid but the rollback validates as the current pinned
     revision, restore it transactionally before any network lookup.  When
@@ -267,7 +268,7 @@ def _install_prebuilt_winegdk(progress=None, force=False):
     The download cache uses one ``.part`` filename per asset.  Keeping lookup,
     download, extraction and activation under the same inter-process lock
     prevents two launcher instances from deleting or renaming each other's
-    partial archive during an r10→r11 update.
+    partial archive during an engine update.
     """
     with managed_engine_lock(PROTON_DIR):
         _recover_interrupted_engine_swap_locked()
@@ -369,7 +370,7 @@ def ensure_winegdk(force=False, progress=None):
     # Inspect and recover the on-disk state under the same stable lock used by
     # activation.  Without this, a power loss after active→rollback but before
     # candidate→active made an offline launch report "no engine" even though a
-    # complete, verified r11 rollback was still present.
+    # complete, verified rollback was still present.
     with managed_engine_lock(PROTON_DIR):
         _recover_interrupted_engine_swap_locked()
         installed = (WINEGDK_OUT / "proton").is_file()

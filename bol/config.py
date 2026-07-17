@@ -6,7 +6,7 @@ from pathlib import Path
 
 APP = "bedrock-on-linux"
 PRETTY = "BedrockOnLinux"
-VERSION = "1.3.0"
+VERSION = "2.0.0"
 
 HOME = Path.home()
 DATA = Path(os.environ.get("BOL_HOME", HOME / ".local/share" / APP))
@@ -44,8 +44,11 @@ MSA_CONNECT = "https://login.live.com/oauth20_connect.srf"
 MSA_TOKEN = "https://login.live.com/oauth20_token.srf"
 WINEGDK_REG = r"Software\Wine\WineGDK"
 
-# Exact WineGDK source used for the reviewed r11 binary engine.
-WINEGDK_SOURCE_COMMIT = "670eda2864dcb22d11c7f2c28973214d4755ad2f"
+# Exact WineGDK source used for the reviewed native-online engine. It
+# completes XGame/XUser identity, XSAPI context initialization, stable native
+# task-queue bootstrap and Realms audience routing, implements the WinAppSDK
+# file picker, and removes the Minecraft process-memory patcher.
+WINEGDK_SOURCE_COMMIT = "75637b674e1f191e65753663c4c0c32bea05ba6e"
 # OSS replacements for the game's GDK Xbox-Live DLLs (minecraft-linux project).
 GDK_DEPS_URL = "https://github.com/minecraft-linux/mcpelauncher-gdk-dependencies/releases/download/v0.0.0"
 GDK_DEPS_DLLS = ("libHttpClient.GDK.dll", "XCurl.dll")
@@ -66,9 +69,9 @@ WINEGDK_OUT = PROTON_DIR / "GDK-Proton-xuser"
 # Build locally with scripts/package-engine.sh, then pin its printed SHA-256.
 WINEGDK_PREBUILT_REPO = "Wyze3306/BedrockOnLinux"
 # Bump when the build/packaging method changes → forces a clean rebuild.
-WINEGDK_BUILD_REV = "wow64-archs-r11"
-# SHA-256 of the reviewed, deterministic r11 archive.  An invalid value makes
+WINEGDK_BUILD_REV = "wow64-archs-native5"
+# SHA-256 of the reviewed, deterministic engine archive. An invalid value makes
 # the installer fail closed rather than accepting a differently packed engine.
-WINEGDK_ARCHIVE_SHA256 = "90959a664de8aed7ff4f5a9e8866ba9ba096fc7369f59069d4e873695ad9913c"
+WINEGDK_ARCHIVE_SHA256 = "35a2ead372f51bd3fc330a2da91e2a0846aa03a80bb0c175f049bef719398fcf"
 
 SELF_REPO = WINEGDK_PREBUILT_REPO

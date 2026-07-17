@@ -12,129 +12,6 @@ from unittest import mock
 from bol import auth
 
 
-MANAGED_STAMP = f"winegdk:{auth.WINEGDK_BUILD_REV}"
-
-
-class ForceMsaFacetSettingsTests(unittest.TestCase):
-    def _enabled(self, settings):
-        with mock.patch.dict(os.environ, {}, clear=True), \
-                mock.patch.object(auth, "load_settings",
-                                  return_value=settings), \
-                mock.patch.object(auth, "save_settings") as save, \
-                mock.patch.object(auth, "info"):
-            result = auth.force_msa_facet_enabled()
-        return result, save
-
-    def test_legacy_disabled_value_is_reenabled_for_guarded_engine(self):
-        settings = {
-            "proton_source": "winegdk",
-            "force_msa_facet": False,
-        }
-        enabled, save = self._enabled(settings)
-        self.assertTrue(enabled)
-        self.assertTrue(settings["force_msa_facet"])
-        self.assertEqual(settings["force_msa_facet_engine_rev"],
-                         MANAGED_STAMP)
-        save.assert_called_once_with(settings)
-
-    def test_disabled_choice_for_current_engine_is_respected(self):
-        settings = {
-            "proton_source": "winegdk",
-            "force_msa_facet": False,
-            "force_msa_facet_engine_rev": MANAGED_STAMP,
-        }
-        enabled, save = self._enabled(settings)
-        self.assertFalse(enabled)
-        save.assert_not_called()
-
-    def test_disabled_choice_is_retried_after_engine_upgrade(self):
-        settings = {
-            "proton_source": "winegdk",
-            "force_msa_facet": False,
-            "force_msa_facet_engine_rev": "winegdk:wow64-archs-r10",
-        }
-        enabled, save = self._enabled(settings)
-        self.assertTrue(enabled)
-        save.assert_called_once_with(settings)
-
-    def test_custom_engine_choice_is_not_migrated(self):
-        settings = {
-            "proton_source": "custom",
-            "force_msa_facet": False,
-        }
-        enabled, save = self._enabled(settings)
-        self.assertFalse(enabled)
-        save.assert_not_called()
-
-    def test_legacy_custom_proton_dir_is_not_migrated_as_managed(self):
-        settings = {
-            "proton_dir": "/opt/custom-proton",
-            "force_msa_facet": False,
-        }
-        enabled, save = self._enabled(settings)
-        self.assertFalse(enabled)
-        save.assert_not_called()
-
-    def test_environment_escape_hatch_is_non_persistent(self):
-        with mock.patch.dict(os.environ,
-                             {"BOL_DISABLE_SERVER_PATCHES": "yes"}, clear=True), \
-                mock.patch.object(auth, "load_settings") as load, \
-                mock.patch.object(auth, "save_settings") as save, \
-                mock.patch.object(auth, "warn"):
-            self.assertFalse(auth.force_msa_facet_enabled())
-        load.assert_not_called()
-        save.assert_not_called()
-
-    def test_explicit_choice_is_stamped_with_current_engine(self):
-        settings = {"proton_source": "winegdk"}
-        with mock.patch.object(auth, "load_settings",
-                               return_value=settings), \
-                mock.patch.object(auth, "save_settings") as save:
-            auth.set_force_msa_facet(False)
-        self.assertFalse(settings["force_msa_facet"])
-        self.assertEqual(settings["force_msa_facet_engine_rev"],
-                         MANAGED_STAMP)
-        save.assert_called_once_with(settings)
-
-    def test_registry_prerequisite_uses_resolved_online_setting(self):
-        prefix = Path("/tmp/bol-prefix")
-        with mock.patch.object(auth, "force_msa_facet_enabled",
-                               return_value=True), \
-                mock.patch.object(auth, "active_prefix", return_value=prefix), \
-                mock.patch.object(auth, "load_settings", return_value={}), \
-                mock.patch.object(auth, "update_prefix_registry") as update:
-            auth.wine_apply_winegdk_prereqs()
-
-        update.assert_called_once()
-        self.assertEqual(update.call_args.args[0], prefix)
-        force = [change for change in update.call_args.kwargs["machine"]
-                 if change.name == "ForceMsaFacet"]
-        self.assertEqual(len(force), 1)
-        self.assertEqual(force[0].value, 1)
-
-    def test_registry_failure_blocks_a_misconfigured_online_launch(self):
-        with mock.patch.object(auth, "force_msa_facet_enabled",
-                               return_value=True), \
-                mock.patch.object(auth, "active_prefix",
-                                  return_value=Path("/tmp/bol-prefix")), \
-                mock.patch.object(auth, "load_settings", return_value={}), \
-                mock.patch.object(auth, "update_prefix_registry",
-                                  side_effect=OSError("injected")), \
-                mock.patch.object(auth, "warn"), \
-                mock.patch.object(auth, "err"):
-            with self.assertRaisesRegex(auth.BolError, "offline WineGDK"):
-                auth.wine_apply_winegdk_prereqs()
-
-    def test_refresh_token_write_never_starts_wine(self):
-        prefix = Path("/tmp/bol-prefix")
-        with mock.patch.object(auth, "active_prefix", return_value=prefix), \
-                mock.patch.object(auth, "update_prefix_registry") as update:
-            self.assertTrue(auth.wine_reg_set_refresh_token("opaque-token"))
-        update.assert_called_once()
-        change = update.call_args.kwargs["machine"][0]
-        self.assertEqual(change.key, auth.WINEGDK_REG)
-        self.assertEqual(change.name, "RefreshToken")
-        self.assertEqual(change.value, "opaque-token")
 
 
 class OnlinePreauthPayloadTests(unittest.TestCase):
@@ -156,10 +33,69 @@ class OnlinePreauthPayloadTests(unittest.TestCase):
             "mp_rp": "https://multiplayer.minecraft.net/",
             "mp_uhs": "42",
             "mp_expiry": expiry,
+            "realms_token": "realms",
+            "realms_rp": "https://pocket.realms.minecraft.net/",
+            "realms_uhs": "42",
+            "realms_expiry": expiry,
+            "lic_token": "license",
+            "lic_rp": "https://licensing.minecraft.net/",
+            "lic_uhs": "42",
+            "lic_expiry": expiry,
         }
 
     def test_complete_future_payload_is_ready(self):
         self.assertEqual(auth._online_preauth_problems(self.payload()), [])
+
+    def test_legacy_payload_without_xbl_privileges_remains_ready(self):
+        payload = self.payload()
+        self.assertNotIn("xbl_privileges", payload)
+        self.assertEqual(auth._online_preauth_problems(payload), [])
+
+    def test_xbl_privileges_are_canonical_and_deduplicated(self):
+        self.assertEqual(
+            auth._normalize_xbl_privileges(
+                "254 185 000188 254 invalid -1 4294967296"),
+            "185 188 254",
+        )
+        self.assertEqual(
+            auth._normalize_xbl_privileges([254, "185", "0185", True]),
+            "185 254",
+        )
+
+    def test_invalid_xbl_privilege_claim_is_omitted(self):
+        self.assertIsNone(auth._normalize_xbl_privileges(None))
+        self.assertIsNone(auth._normalize_xbl_privileges("invalid -1"))
+
+    def test_xbl_privilege_claim_distinguishes_absent_from_empty(self):
+        self.assertEqual(auth._xbl_privilege_claim({}), (False, None))
+        self.assertEqual(auth._xbl_privilege_claim({"prv": ""}), (True, ""))
+        self.assertEqual(
+            auth._xbl_privilege_claim({"prv": "254 185 254"}),
+            (True, "185 254"),
+        )
+        # A present but malformed claim must not become the permissive legacy
+        # fallback merely because no valid IDs could be extracted.
+        self.assertEqual(
+            auth._xbl_privilege_claim({"prv": "invalid -1"}),
+            (True, ""),
+        )
+
+    def test_modern_gamertag_claims_are_kept_as_distinct_components(self):
+        self.assertEqual(
+            auth._xbl_gamertag_claims({
+                "mgt": "ModernPlayer",
+                "mgs": "1234",
+                "umg": "ModernPlayer#1234",
+                "gtg": "ClassicPlayer1234",
+            }),
+            {
+                "xbl_modern_gamertag": "ModernPlayer",
+                "xbl_modern_gamertag_suffix": "1234",
+                "xbl_unique_modern_gamertag": "ModernPlayer#1234",
+            },
+        )
+        self.assertEqual(
+            auth._xbl_gamertag_claims({"mgt": None, "mgs": 1234}), {})
 
     def test_xbox_seven_digit_expiry_is_python39_compatible(self):
         # Xbox NotAfter uses 100 ns precision. Python 3.9's fromisoformat()
@@ -177,6 +113,26 @@ class OnlinePreauthPayloadTests(unittest.TestCase):
         payload = self.payload()
         payload["mp_token"] = None
         self.assertIn("missing mp_token",
+                      auth._online_preauth_problems(payload))
+
+    def test_missing_realms_token_is_rejected(self):
+        payload = self.payload()
+        payload["realms_token"] = None
+        self.assertIn("missing realms_token",
+                      auth._online_preauth_problems(payload))
+
+    def test_missing_realms_routing_fields_are_rejected(self):
+        for field in ("realms_rp", "realms_uhs"):
+            with self.subTest(field=field):
+                payload = self.payload()
+                payload[field] = None
+                self.assertIn(f"missing {field}",
+                              auth._online_preauth_problems(payload))
+
+    def test_expired_realms_token_is_rejected(self):
+        payload = self.payload()
+        payload["realms_expiry"] = "2000-01-01T00:00:00Z"
+        self.assertIn("expired realms_token",
                       auth._online_preauth_problems(payload))
 
     def test_expired_token_is_rejected(self):
@@ -198,8 +154,21 @@ class OnlinePreauthPayloadTests(unittest.TestCase):
             path = Path(td) / "device.json"
             self.assertTrue(auth._store_online_preauth(path, self.payload()))
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
-            self.assertEqual(auth._load_online_preauth(path)["mp_token"],
-                             "multiplayer")
+            stored = auth._load_online_preauth(path)
+            self.assertEqual(stored["mp_token"], "multiplayer")
+            self.assertEqual(stored["realms_token"], "realms")
+            expected = str(int(auth._parse_xbox_expiry(
+                "2999-01-01T00:00:00Z").timestamp()))
+            for epoch_field in auth._WINEGDK_EXPIRY_EPOCH_FIELDS.values():
+                self.assertEqual(stored[epoch_field], expected)
+
+    def test_invalid_required_iso_expiry_is_still_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "device.json"
+            payload = self.payload()
+            payload["mp_expiry"] = "not-an-iso-timestamp"
+            self.assertFalse(auth._store_online_preauth(path, payload))
+            self.assertFalse(path.exists())
 
     def test_corrupt_or_unreadable_account_epoch_fails_closed(self):
         with tempfile.TemporaryDirectory() as td:
@@ -232,11 +201,16 @@ class OnlinePreauthPayloadTests(unittest.TestCase):
             root = Path(td)
             cache = root / "winegdk-preauth"
             cache.mkdir()
-            auth._store_online_preauth(cache / "device.json", self.payload())
+            path = cache / "device.json"
+            path.write_text(json.dumps(self.payload()))
+            self.assertNotIn("mp_expiry_epoch", json.loads(path.read_text()))
             with mock.patch.object(auth, "DATA", root), \
                     mock.patch.object(auth, "warn"), \
                     mock.patch.object(auth, "info"):
                 self.assertTrue(auth.xbl_preauth(""))
+            stored = json.loads(path.read_text())
+            for epoch_field in auth._WINEGDK_EXPIRY_EPOCH_FIELDS.values():
+                self.assertRegex(stored[epoch_field], r"^[0-9]+$")
 
     def test_missing_access_token_does_not_accept_partial_cache(self):
         with tempfile.TemporaryDirectory() as td:
@@ -331,6 +305,84 @@ class OnlinePreauthPayloadTests(unittest.TestCase):
                     mock.patch.object(auth, "warn"), \
                     mock.patch.object(auth, "info"):
                 self.assertFalse(auth.xbl_preauth("fresh-access-token"))
+
+    def test_successful_refresh_mints_exact_realms_audience(self):
+        expiry = "2999-01-01T00:00:00.1234567Z"
+        epoch = "e" * 32
+        requests = []
+
+        class Response:
+            def __init__(self, payload):
+                self.status = 200
+                self.payload = json.dumps(payload).encode()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return self.payload
+
+        def authorization(label, uhs="42", claims=None):
+            xui = {"uhs": uhs}
+            if claims:
+                xui.update(claims)
+            return {
+                "AuthorizationToken": {
+                    "Token": label,
+                    "NotAfter": expiry,
+                    "DisplayClaims": {"xui": [xui]},
+                },
+            }
+
+        responses = iter([
+            {"Token": "device", "NotAfter": expiry},
+            {"Token": "user", "NotAfter": expiry},
+            authorization("xbl", claims={
+                "xid": "1234", "gtg": "Player", "agg": "Adult",
+            }),
+            authorization("playfab"),
+            authorization("multiplayer"),
+            authorization("realms"),
+            authorization("license"),
+        ])
+
+        def urlopen(request, timeout):
+            self.assertEqual(timeout, 15)
+            requests.append(json.loads(request.data))
+            return Response(next(responses))
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cache = root / "winegdk-preauth"
+            cache.mkdir()
+            (cache / ".account-epoch").write_text(epoch + "\n")
+            with mock.patch.object(auth, "DATA", root), \
+                    mock.patch("urllib.request.urlopen", side_effect=urlopen), \
+                    mock.patch.object(auth, "warn"), \
+                    mock.patch.object(auth, "info"), \
+                    mock.patch.object(auth, "ok"):
+                self.assertTrue(auth.xbl_preauth("fresh-access-token", epoch))
+
+            self.assertEqual(
+                [request["RelyingParty"] for request in requests],
+                [
+                    "http://auth.xboxlive.com",
+                    "http://auth.xboxlive.com",
+                    "http://xboxlive.com",
+                    "https://b980a380.minecraft.playfabapi.com/",
+                    "https://multiplayer.minecraft.net/",
+                    "https://pocket.realms.minecraft.net/",
+                    "http://licensing.xboxlive.com",
+                ],
+            )
+            stored = json.loads((cache / "device.json").read_text())
+            self.assertEqual(stored["realms_rp"],
+                             "https://pocket.realms.minecraft.net/")
+            self.assertEqual(stored["realms_token"], "realms")
+            self.assertRegex(stored["realms_expiry_epoch"], r"^[0-9]+$")
 
 
 class NativeAuthCancellationTests(unittest.TestCase):

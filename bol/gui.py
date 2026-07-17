@@ -12,10 +12,8 @@ from pathlib import Path
 
 from .auth import (
     NativeAuth,
-    force_msa_facet_enabled,
     msa_logout,
     msa_signed_in,
-    set_force_msa_facet,
 )
 from .config import LOGS, PRETTY, VERSION
 from .content import _mojang_dir, import_content
@@ -127,7 +125,8 @@ def gui():
             return None
 
     na = NativeAuth()
-    ui = {"versions": [], "labels": [], "busy": False, "details": False}
+    ui = {"versions": [], "labels": [], "busy": False, "details": False,
+          "launch_active": False}
 
     def mkbtn(parent, text, cmd, kind="ghost", **kw):
         base = {
@@ -480,6 +479,7 @@ def gui():
                 ver = selected_version()
                 do_setup(mc_ver=ver, progress=set_progress)
                 set_status("Starting Minecraft…", FG)
+                ui["launch_active"] = True
                 launch()
                 set_status("Minecraft closed.", SUB)
             except Exception as e:
@@ -489,9 +489,12 @@ def gui():
                 root.after(0, lambda text=message: messagebox.showerror(
                     "Minecraft could not start", text[:2000], parent=root))
             finally:
+                ui["launch_active"] = False
                 end_progress()
                 root.after(0, lambda: busy(False))
-        threading.Thread(target=work, daemon=True).start()
+        # Never let closing Tk kill the marker-owning PLAY worker before its
+        # launch finally block can record/clear the completed GPU session.
+        threading.Thread(target=work, daemon=False).start()
 
     def open_settings():
         d = ctk.CTkToplevel(root)
@@ -525,15 +528,6 @@ def gui():
         ctk.CTkSwitch(wrap, text="Advanced diagnostics (verbose logs — for bug "
                       "reports)", variable=diag_v, command=save_diag,
                       progress_color=GREEN, font=font(13)).pack(anchor="w", pady=7)
-
-        msa_v = tk.BooleanVar(value=force_msa_facet_enabled())
-
-        def save_msa():
-            set_force_msa_facet(msa_v.get())
-        ctk.CTkSwitch(wrap, text="Microsoft/Xbox server access (recommended; "
-                      "disable only for launch troubleshooting)", variable=msa_v,
-                      command=save_msa, progress_color=GREEN,
-                      font=font(13)).pack(anchor="w", pady=7)
 
         confine_v = tk.BooleanVar(
             value=load_settings().get("confine_cursor", False))
@@ -713,6 +707,23 @@ def gui():
     threading.Thread(target=update_check, daemon=True).start()
 
     def on_close():
+        if ui.get("launch_active"):
+            messagebox.showwarning(
+                "Minecraft is running",
+                "Close Minecraft first and wait for the launcher to report "
+                "that it closed. To abort it, use Settings → Force stop "
+                "Minecraft.",
+                parent=root,
+            )
+            return
+        if ui.get("busy"):
+            messagebox.showwarning(
+                "Operation in progress",
+                "Wait for the current preparation task to finish before "
+                "closing the launcher.",
+                parent=root,
+            )
+            return
         na.stop()
         root.destroy()
     root.protocol("WM_DELETE_WINDOW", on_close)

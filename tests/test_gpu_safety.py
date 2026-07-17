@@ -215,7 +215,8 @@ class GraphicsSafetyTests(unittest.TestCase):
 
     def test_acknowledgement_hides_only_previous_not_current_fault(self):
         self.ack.write_text(json.dumps({
-            "version": 1, "boot_id": "boot-now", "acknowledged": 1,
+            "version": gpu_safety._STATE_VERSION,
+            "boot_id": "boot-now", "acknowledged": 1,
         }))
 
         def current_fault(args, **_kwargs):
@@ -227,7 +228,8 @@ class GraphicsSafetyTests(unittest.TestCase):
 
     def test_acknowledged_previous_boot_fault_is_not_rechecked(self):
         self.ack.write_text(json.dumps({
-            "version": 1, "boot_id": "boot-now", "acknowledged": 1,
+            "version": gpu_safety._STATE_VERSION,
+            "boot_id": "boot-now", "acknowledged": 1,
         }))
         calls = []
 
@@ -242,7 +244,8 @@ class GraphicsSafetyTests(unittest.TestCase):
 
     def test_hard_reboot_marker_blocks_next_launch(self):
         self.marker.write_text(json.dumps({
-            "version": 1,
+            "version": gpu_safety._STATE_VERSION,
+            "engine_rev": "wow64-archs-r12",
             "token": "old-token",
             "boot_id": "boot-before-power-loss",
             "launcher_pid": 424242,
@@ -266,6 +269,8 @@ class GraphicsSafetyTests(unittest.TestCase):
     def test_marker_is_private_exclusive_and_token_owned(self):
         token = gpu_safety.arm_gpu_launch()
         self.assertTrue(self.marker.is_file())
+        self.assertEqual(json.loads(self.marker.read_text())["phase"],
+                         "running")
         self.assertEqual(stat.S_IMODE(self.marker.stat().st_mode), 0o600)
         with self.assertRaisesRegex(gpu_safety.BolError,
                                     "previous Minecraft GPU launch"):
@@ -275,9 +280,70 @@ class GraphicsSafetyTests(unittest.TestCase):
         self.assertTrue(gpu_safety.disarm_gpu_launch(token))
         self.assertFalse(self.marker.exists())
 
+    def test_returned_wrapper_marker_is_retired_when_prefix_is_idle(self):
+        self.marker.write_text(json.dumps({
+            "version": gpu_safety._STATE_VERSION,
+            "engine_rev": "wow64-archs-r12",
+            "phase": "wrapper_returned",
+            "token": "1" * 32,
+            "boot_id": "boot-now",
+            "launcher_pid": 424242,
+            "created": 1,
+            "wrapper_returned": 2,
+        }))
+        with mock.patch.object(gpu_safety, "warn") as warning:
+            self.assertTrue(gpu_safety.retire_idle_current_boot_marker())
+        self.assertFalse(self.marker.exists())
+        warning.assert_called_once()
+
+    def test_idle_recovery_keeps_running_and_old_boot_markers(self):
+        state = {
+            "version": gpu_safety._STATE_VERSION,
+            "engine_rev": "wow64-archs-r12",
+            "phase": "running",
+            "token": "1" * 32,
+            "boot_id": "boot-now",
+            "launcher_pid": 424242,
+            "created": 1,
+        }
+        self.marker.write_text(json.dumps(state))
+        self.assertFalse(gpu_safety.retire_idle_current_boot_marker())
+        self.assertTrue(self.marker.exists())
+        state["phase"] = "wrapper_returned"
+        state["wrapper_returned"] = 2
+        state["boot_id"] = "boot-before-power-loss"
+        self.marker.write_text(json.dumps(state))
+        self.assertFalse(gpu_safety.retire_idle_current_boot_marker())
+        self.assertTrue(self.marker.exists())
+
+    def test_idle_recovery_keeps_malformed_current_boot_marker(self):
+        self.marker.write_text(json.dumps({
+            "version": gpu_safety._STATE_VERSION,
+            "engine_rev": "wow64-archs-r12",
+            "phase": "wrapper_returned",
+            "token": "not-an-owned-token",
+            "boot_id": "boot-now",
+            "launcher_pid": 424242,
+            "created": 1,
+            "wrapper_returned": 2,
+        }))
+        self.assertFalse(gpu_safety.retire_idle_current_boot_marker())
+        self.assertTrue(self.marker.exists())
+
+    def test_wrapper_return_phase_is_durable_and_token_owned(self):
+        with mock.patch.object(gpu_safety.time, "time", return_value=20):
+            token = gpu_safety.arm_gpu_launch()
+        with mock.patch.object(gpu_safety.time, "time", return_value=30):
+            self.assertTrue(gpu_safety.mark_gpu_wrapper_returned(token))
+        state = json.loads(self.marker.read_text())
+        self.assertEqual(state["phase"], "wrapper_returned")
+        self.assertEqual(state["wrapper_returned"], 30)
+        self.assertFalse(gpu_safety.mark_gpu_wrapper_returned("0" * 32))
+
     def test_explicit_acknowledgement_clears_old_marker_privately(self):
         self.marker.write_text(json.dumps({
-            "version": 1,
+            "version": gpu_safety._STATE_VERSION,
+            "engine_rev": "wow64-archs-r12",
             "token": "old-token",
             "boot_id": "boot-before-power-loss",
             "launcher_pid": 424242,
@@ -305,7 +371,8 @@ class GraphicsSafetyTests(unittest.TestCase):
 
     def test_active_marker_cannot_be_acknowledged(self):
         self.marker.write_text(json.dumps({
-            "version": 1,
+            "version": gpu_safety._STATE_VERSION,
+            "engine_rev": "wow64-archs-r12",
             "token": "active-token",
             "boot_id": "boot-now",
             "launcher_pid": os.getpid(),
@@ -315,6 +382,38 @@ class GraphicsSafetyTests(unittest.TestCase):
             gpu_safety.acknowledge_gpu_safety_incident()
         self.assertTrue(self.marker.exists())
         self.assertFalse(self.ack.exists())
+
+    def test_old_boot_legacy_marker_requires_explicit_acknowledgement(self):
+        self.marker.write_text(json.dumps({
+            "version": gpu_safety._LEGACY_MARKER_VERSION,
+            "token": "1" * 32,
+            "boot_id": "boot-with-r11",
+            "launcher_pid": 424242,
+            "created": 1,
+        }))
+        problem = gpu_safety.graphics_safety_problem(
+            {"XDG_SESSION_TYPE": "wayland"},
+            journal_runner=self.clean_journal,
+        )
+        self.assertIn("old marker cannot distinguish a Wine crash", problem)
+        self.assertIn("doctor --acknowledge-gpu-crash", problem)
+        self.assertTrue(self.marker.exists())
+
+    def test_current_boot_active_legacy_marker_is_not_silently_retired(self):
+        self.marker.write_text(json.dumps({
+            "version": gpu_safety._LEGACY_MARKER_VERSION,
+            "token": "1" * 32,
+            "boot_id": "boot-now",
+            "launcher_pid": os.getpid(),
+            "created": 1,
+        }))
+        problem = gpu_safety.graphics_safety_problem(
+            {"XDG_SESSION_TYPE": "wayland"},
+            journal_runner=self.clean_journal,
+        )
+        self.assertIn("legacy Minecraft GPU session is still marked active",
+                      problem)
+        self.assertTrue(self.marker.exists())
 
     def test_override_is_explicit_and_non_persistent(self):
         env = {"BOL_ALLOW_UNSAFE_GPU": "1"}

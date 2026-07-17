@@ -71,8 +71,9 @@ Maintainer: BedrockOnLinux contributors <noreply@bedrockonlinux.invalid>
 Homepage: https://github.com/Wyze3306/BedrockOnLinux
 Description: Run Minecraft Bedrock (Windows GDK) on Linux, multiplayer included
  One graphical launcher that downloads a reviewed WineGDK-based GDK-Proton,
- applies the binary patches the game needs, and signs you in to Microsoft
- inside the game (no relay, no proxy) so native and crossplay servers work.
+ provides native Microsoft/Xbox identity, and enables Friends, Servers,
+ Realms and file imports without a Minecraft process-memory patcher.
+ Sign-in is direct (no relay or proxy).
  No game files are shipped; you supply your own.
 EOF
 

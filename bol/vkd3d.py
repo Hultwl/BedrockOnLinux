@@ -35,11 +35,11 @@ REQUIRED_COMPONENTS = {
     "vkd3d_nv_dgc": VKD3D_NV_DGC_COMPONENT_VERSION,
 }
 
-# r11 is a reviewed universal payload. Hashing whatever an archive
-# declares would only prove internal consistency, so pin the known DLL bytes as
-# an independent trust anchor.  Future engine revisions must add their own pin
-# instead of silently inheriting these values.
-REQUIRED_VARIANT_HASHES_BUILD_REV = "wow64-archs-r11"
+# native5 keeps the reviewed r11/r12 universal graphics payload. Hashing
+# whatever an archive declares would only prove internal consistency, so pin
+# the known DLL bytes as an independent trust anchor. Future engine revisions
+# must update the revision pin deliberately.
+REQUIRED_VARIANT_HASHES_BUILD_REV = "wow64-archs-native5"
 REQUIRED_ENGINE_GLIBC_MAX = "2.31"
 REQUIRED_VKD3D_BASE_COMMIT = "3b10bd7a7ec6a7347e616cf8bea59333afec2255"
 REQUIRED_VKD3D_REVERT = "76c11d2e2b90b0a46dc894508e67e2aaacc2c04d"
@@ -69,14 +69,17 @@ REQUIRED_CRITICAL_FILE_PATHS = (
     "files/bin-wow64/wine-preloader",
     "files/bin-wow64/wineserver",
     "files/bin-wow64/msidb",
+    "files/share/wine/wine.inf",
     "files/lib/x86_64-linux-gnu/libunwind.so.8",
     "files/lib/wine/x86_64-windows/ntdll.dll",
     "files/lib/wine/x86_64-windows/combase.dll",
     "files/lib/wine/x86_64-windows/xgameruntime.dll",
+    "files/lib/wine/x86_64-windows/windows.storage.dll",
     XGAMERUNTIME_THREADING_PATH,
     "files/lib/wine/i386-windows/ntdll.dll",
     "files/lib/wine/i386-windows/combase.dll",
     "files/lib/wine/i386-windows/xgameruntime.dll",
+    "files/lib/wine/i386-windows/windows.storage.dll",
     "files/lib/wine/x86_64-unix/ntdll.so",
 )
 REQUIRED_EXECUTABLE_FILE_PATHS = (
@@ -637,7 +640,7 @@ def prepare_universal_vkd3d(
         enforce_pins: bool = True) -> Tuple[str, bool]:
     """Validate/activate the universal payload without opening Vulkan.
 
-    The reviewed r11 EXT and NV slots are byte-identical: the DLL contains both
+    The reviewed r12 EXT and NV slots are byte-identical: the DLL contains both
     implementations and vkd3d-proton selects the usable backend after the game
     opens its real device.  A launcher-side Vulkan probe is therefore not only
     redundant, it is unsafe on a broken kernel driver because the diagnostic

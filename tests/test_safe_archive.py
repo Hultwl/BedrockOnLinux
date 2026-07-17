@@ -387,5 +387,34 @@ class NetworkArchiveIntegrationTests(unittest.TestCase):
         download.assert_not_called()
 
 
+class LibHttpClientRoutingPatchTests(unittest.TestCase):
+    PREFIX = (b"\x83\xc0\xfe\xba\x04\x00\x00\x00\x48\x8d\x0d"
+              b"\x11\x22\x33\x44\x83\xf8\x06")
+
+    def test_provider_gate_is_patched_once(self):
+        with tempfile.TemporaryDirectory() as td:
+            game = Path(td)
+            dll = game / "libHttpClient.GDK.dll"
+            dll.write_bytes(b"header" + self.PREFIX
+                            + b"\x0f\x87\x01\x02\x03\x04" + b"tail")
+            with mock.patch.object(fixups, "warn") as warn:
+                fixups._patch_lhc_xcurl_gate(game)
+            self.assertIn(b"\x90" * 6, dll.read_bytes())
+            warn.assert_not_called()
+
+    def test_already_patched_provider_gate_is_silent(self):
+        with tempfile.TemporaryDirectory() as td:
+            game = Path(td)
+            dll = game / "libHttpClient.GDK.dll"
+            original = b"header" + self.PREFIX + b"\x90" * 6 + b"tail"
+            dll.write_bytes(original)
+            with mock.patch.object(fixups, "warn") as warn, \
+                    mock.patch.object(fixups, "apply_patch") as apply:
+                fixups._patch_lhc_xcurl_gate(game)
+            self.assertEqual(dll.read_bytes(), original)
+            warn.assert_not_called()
+            apply.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

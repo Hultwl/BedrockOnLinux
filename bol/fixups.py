@@ -363,13 +363,15 @@ def _patch_lhc_xcurl_gate(game_dir: Path):
     data = dll.read_bytes()
     # add eax,-2 ; mov edx,4 ; lea rcx,[rip+imm32] ; cmp eax,6 ; ja rel32
     m = re.search(rb"\x83\xc0\xfe\xba\x04\x00\x00\x00\x48\x8d\x0d.{4}\x83\xf8\x06"
-                  rb"\x0f\x87.{4}", data, re.S)
+                  rb"(?:\x0f\x87.{4}|\x90{6})", data, re.S)
     if not m:
         warn("libHttpClient provider gate not found — XCurl routing patch "
              "skipped (native login may fall back to WinHTTP).")
         return
     ja_off = m.start() + 18          # past add(3)+mov(5)+lea(7)+cmp(3)
     expect = data[ja_off:ja_off + 6]
+    if expect == b"\x90" * 6:
+        return
     if expect[:2] != b"\x0f\x87":
         warn("libHttpClient gate anchor misaligned — XCurl patch skipped.")
         return
