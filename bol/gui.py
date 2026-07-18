@@ -5,6 +5,7 @@ import base64
 import os
 import shutil
 import subprocess
+import re
 import sys
 import threading
 import zipfile
@@ -161,15 +162,189 @@ def gui():
 
     hero = ctk.CTkFrame(root, fg_color=CARD, corner_radius=18)
     hero.pack(fill="both", expand=True, padx=22, pady=6)
-    hw = ctk.CTkFrame(hero, fg_color="transparent")
-    hw.place(relx=0.5, rely=0.46, anchor="center")
-    hl = logo_label(hw, 120, CARD)
-    if hl:
-        hl.pack()
-    ctk.CTkLabel(hw, text="Minecraft Bedrock", font=font(27, "bold"),
-                 text_color=FG).pack(pady=(14, 2))
-    ctk.CTkLabel(hw, text="Bedrock Edition for Linux", font=font(13),
-                 text_color=SUB).pack()
+
+    def _insert_inline_formatted(widget, text, base_tag):
+        if not hasattr(widget, "link_count"):
+            widget.link_count = 0
+        tokens = re.split(r"(\*\*|`|__|\[[^\]]+\]\([^)]+\))", text)
+        is_bold = False
+        is_code = False
+        for token in tokens:
+            if not token:
+                continue
+            if token in ("**", "__"):
+                is_bold = not is_bold
+                continue
+            elif token == "`":
+                is_code = not is_code
+                continue
+            
+            link_match = re.match(r"^\[([^\]]+)\]\(([^)]+)\)$", token)
+            if link_match:
+                link_text = link_match.group(1)
+                url = link_match.group(2)
+                
+                widget.link_count += 1
+                url_tag = f"url_{widget.link_count}"
+                
+                widget.tag_bind(url_tag, "<Button-1>", lambda e, u=url: subprocess.Popen(
+                    ["xdg-open", u], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                ))
+                
+                tags = ["link", url_tag, base_tag]
+                if is_bold:
+                    tags.append("bold")
+                if is_code:
+                    tags.append("code")
+                widget.insert("end", link_text, tuple(tags))
+            else:
+                tags = [base_tag]
+                if is_bold:
+                    tags.append("bold")
+                if is_code:
+                    tags.append("code")
+                widget.insert("end", token, tuple(tags))
+
+    def render_markdown_to_text(widget, md):
+        lines = md.split("\n")
+        in_code_block = False
+        code_content = []
+        
+        for line in lines:
+            if line.strip().startswith("```"):
+                if in_code_block:
+                    widget.insert("end", "\n".join(code_content) + "\n", "code_block")
+                    in_code_block = False
+                    code_content = []
+                else:
+                    in_code_block = True
+                continue
+                
+            if in_code_block:
+                code_content.append(line)
+                continue
+                
+            # Headers
+            if line.startswith("#"):
+                hashes = len(line) - len(line.lstrip("#"))
+                content = line.lstrip("#").strip()
+                tag = f"h{min(hashes, 3)}"
+                widget.insert("end", content + "\n", tag)
+                continue
+                
+            # Bullet points
+            stripped = line.strip()
+            if stripped.startswith(("* ", "- ", "+ ", "• ")):
+                bullet_char = "• "
+                content = line.replace(stripped[:2], "", 1).strip()
+                widget.insert("end", "  " + bullet_char, "normal")
+                _insert_inline_formatted(widget, content + "\n", "bullet")
+                continue
+                
+            # Normal lines
+            if stripped == "":
+                widget.insert("end", "\n", "normal")
+            else:
+                _insert_inline_formatted(widget, line + "\n", "normal")
+
+    def load_changelog():
+        for child in hero.winfo_children():
+            child.destroy()
+        loading_frame = ctk.CTkFrame(hero, fg_color="transparent")
+        loading_frame.place(relx=0.5, rely=0.5, anchor="center")
+        ctk.CTkLabel(loading_frame, text="Loading changelog...", font=font(14)).pack()
+        
+        def work():
+            try:
+                from .util import gh_releases
+                from .config import SELF_REPO
+                rels = gh_releases(SELF_REPO)
+                root.after(0, lambda: show_changelog(rels))
+            except Exception as e:
+                root.after(0, lambda: show_error(str(e)))
+                
+        threading.Thread(target=work, daemon=True).start()
+
+    def show_error(err_msg):
+        for child in hero.winfo_children():
+            child.destroy()
+        err_frame = ctk.CTkFrame(hero, fg_color="transparent")
+        err_frame.place(relx=0.5, rely=0.5, anchor="center")
+        ctk.CTkLabel(err_frame, text="Could not load changelog.", font=font(14, "bold"), text_color=RED).pack(pady=4)
+        ctk.CTkLabel(err_frame, text=err_msg, font=font(11), text_color=SUB).pack(pady=4)
+        mkbtn(err_frame, "Retry", load_changelog, kind="ghost", width=100, height=32).pack(pady=8)
+
+    def show_changelog(rels):
+        for child in hero.winfo_children():
+            child.destroy()
+            
+        if not rels:
+            show_error("No releases found.")
+            return
+            
+        tb = ctk.CTkTextbox(hero, fg_color="transparent", corner_radius=18, text_color=FG, font=font(11))
+        tb.pack(fill="both", expand=True, padx=4, pady=4)
+        
+        widget = tb._textbox
+        widget.configure(wrap="word", spacing1=1, spacing2=2, spacing3=1, padx=16, pady=16)
+        
+        widget.link_count = 0
+        dividers = []
+        
+        f_family = font().cget("family")
+        widget.tag_configure("normal", font=(f_family, 11), spacing1=1, spacing3=1)
+        widget.tag_configure("bold", font=(f_family, 11, "bold"))
+        widget.tag_configure("h1", font=(f_family, 15, "bold"), spacing1=6, spacing3=2)
+        widget.tag_configure("h2", font=(f_family, 13, "bold"), spacing1=5, spacing3=2)
+        widget.tag_configure("h3", font=(f_family, 12, "bold"), spacing1=4, spacing3=2)
+        widget.tag_configure("code", font=("monospace", 9), background="#272b35", foreground="#e06c5b")
+        widget.tag_configure("code_block", font=("monospace", 9), background="#15171c", foreground=FG, lmargin1=16, rmargin=16, spacing1=3, spacing3=3)
+        widget.tag_configure("bullet", lmargin1=24, lmargin2=36)
+        widget.tag_configure("link", font=(f_family, 11, "underline"), foreground=GREEN)
+        widget.tag_bind("link", "<Enter>", lambda e: widget.configure(cursor="hand2"))
+        widget.tag_bind("link", "<Leave>", lambda e: widget.configure(cursor="arrow"))
+        
+        widget.tag_configure("release_title", font=(f_family, 15, "bold"), foreground=GREEN, spacing1=8, spacing3=1)
+        widget.tag_configure("release_date", font=(f_family, 11), foreground=SUB, spacing1=0, spacing3=4)
+        widget.tag_configure("divider_tag", spacing1=4, spacing3=4)
+        
+        widget.configure(state="normal")
+        
+        for i, rel in enumerate(rels):
+            tag_name = rel.get("tag_name", "Unknown")
+            name = rel.get("name")
+            date = (rel.get("published_at") or "").split("T")[0]
+            body = (rel.get("body") or "").strip()
+            
+            title_text = tag_name
+            if name and name != tag_name:
+                title_text += f" — {name}"
+                
+            widget.insert("end", title_text + "\n", "release_title")
+            widget.insert("end", date + "\n", "release_date")
+            
+            if body:
+                render_markdown_to_text(widget, body)
+            
+            if i < len(rels) - 1:
+                div_frame = tk.Frame(widget, bg=SUB, height=1, bd=0)
+                widget.insert("end", "\n", "divider_tag")
+                widget.window_create("end", window=div_frame)
+                widget.insert("end", "\n\n", "divider_tag")
+                dividers.append(div_frame)
+                
+        widget.configure(state="disabled")
+
+        def on_resize(event):
+            w_width = event.width - 48
+            for div in dividers:
+                try:
+                    div.configure(width=w_width)
+                except Exception:
+                    pass
+        widget.bind("<Configure>", on_resize)
+
+    load_changelog()
 
     status = ctk.CTkFrame(root, fg_color="transparent")
     status.pack(fill="x", padx=26, pady=(4, 0))
