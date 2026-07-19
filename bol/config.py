@@ -74,6 +74,6 @@ WINEGDK_PREBUILT_REPO = "Wyze3306/BedrockOnLinux"
 WINEGDK_BUILD_REV = "wow64-archs-native5"
 # SHA-256 of the reviewed, deterministic engine archive. An invalid value makes
 # the installer fail closed rather than accepting a differently packed engine.
-WINEGDK_ARCHIVE_SHA256 = "0c2572619e24facf405170235023d8a5d11d22080dfe8c67975fd2c461201c4d"
+WINEGDK_ARCHIVE_SHA256 = "d501d9fa86a01f51cd8697cd7c8012ce9cf5eeac701b41a8feaafb694a9757b5"
 
 SELF_REPO = WINEGDK_PREBUILT_REPO
