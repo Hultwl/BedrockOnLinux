@@ -563,6 +563,28 @@ def gui():
         env_entry.bind("<KeyRelease>", save_custom_env)
         env_entry.bind("<FocusOut>", save_custom_env)
 
+        ctk.CTkLabel(wrap, text="Gamescope",
+                     text_color=SUB, font=font(11, "bold"),
+                     anchor="w").pack(anchor="w", pady=(4, 3))
+
+        def save_gamescope(_event=None):
+            s2 = load_settings()
+            s2["gamescope"] = gamescope_entry.get()
+            save_settings(s2)
+
+        gamescope_entry = ctk.CTkEntry(
+            wrap,
+            placeholder_text="1 for auto, or e.g. -w 1920 -h 1080 -f",
+            fg_color=FIELD, border_color=FIELD, text_color=FG,
+            placeholder_text_color=SUB, corner_radius=10, height=36,
+            font=font(13))
+        gamescope_entry.pack(fill="x", pady=(0, 7))
+        saved_gamescope = load_settings().get("gamescope") or ""
+        if saved_gamescope:
+            gamescope_entry.insert(0, saved_gamescope)
+        gamescope_entry.bind("<KeyRelease>", save_gamescope)
+        gamescope_entry.bind("<FocusOut>", save_gamescope)
+
         ctk.CTkFrame(wrap, fg_color=CARD2, height=1).pack(fill="x", pady=14)
 
         imp_status = tk.StringVar(value="")
