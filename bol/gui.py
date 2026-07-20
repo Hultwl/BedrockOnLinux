@@ -1022,5 +1022,11 @@ def gui():
         na.stop()
         root.destroy()
     root.protocol("WM_DELETE_WINDOW", on_close)
-    root.bind("<Return>", lambda e: do_play())
+    def on_enter_pressed(e):
+        focus = root.focus_get()
+        if isinstance(focus, (tk.Entry, tk.Text)):
+            return "break"
+        do_play()
+
+    root.bind("<Return>", on_enter_pressed)
     root.mainloop()
