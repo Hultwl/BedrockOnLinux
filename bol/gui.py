@@ -33,6 +33,9 @@ from .prefix import (
 from .update import check_for_update, self_update
 from .util import load_settings, save_settings
 
+RE_MD_TOKENS = re.compile(r"(\*\*|`|__|\[[^\]]+\]\([^)]+\))")
+RE_MD_LINK = re.compile(r"^\[([^\]]+)\]\(([^)]+)\)$")
+
 
 def _desktop_error(message):
     warn(message)
@@ -164,9 +167,7 @@ def gui():
     hero.pack(fill="both", expand=True, padx=22, pady=6)
 
     def _insert_inline_formatted(widget, text, base_tag):
-        if not hasattr(widget, "link_count"):
-            widget.link_count = 0
-        tokens = re.split(r"(\*\*|`|__|\[[^\]]+\]\([^)]+\))", text)
+        tokens = RE_MD_TOKENS.split(text)
         is_bold = False
         is_code = False
         for token in tokens:
@@ -179,19 +180,12 @@ def gui():
                 is_code = not is_code
                 continue
             
-            link_match = re.match(r"^\[([^\]]+)\]\(([^)]+)\)$", token)
+            link_match = RE_MD_LINK.match(token)
             if link_match:
                 link_text = link_match.group(1)
                 url = link_match.group(2)
                 
-                widget.link_count += 1
-                url_tag = f"url_{widget.link_count}"
-                
-                widget.tag_bind(url_tag, "<Button-1>", lambda e, u=url: subprocess.Popen(
-                    ["xdg-open", u], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-                ))
-                
-                tags = ["link", url_tag, base_tag]
+                tags = ["link", f"url:{url}", base_tag]
                 if is_bold:
                     tags.append("bold")
                 if is_code:
@@ -250,9 +244,35 @@ def gui():
     def load_changelog():
         for child in hero.winfo_children():
             child.destroy()
-        loading_frame = ctk.CTkFrame(hero, fg_color="transparent")
-        loading_frame.place(relx=0.5, rely=0.5, anchor="center")
-        ctk.CTkLabel(loading_frame, text="Loading changelog...", font=font(14)).pack()
+        
+        bg_color = hero.cget("fg_color")
+        if isinstance(bg_color, tuple):
+            bg_color = hero._apply_appearance_mode(bg_color)
+        elif bg_color == "transparent":
+            bg_color = root._apply_appearance_mode(root.cget("fg_color"))
+            
+        lab = tk.Label(hero, bg=bg_color, bd=0)
+        lab.place(relx=0.5, rely=0.5, anchor="center")
+        
+        if icon_img is not None:
+            factors = [10, 9, 8, 7, 6, 7, 8, 9]
+            step_idx = 0
+            
+            def animate():
+                nonlocal step_idx
+                if not lab.winfo_exists():
+                    return
+                try:
+                    factor = factors[step_idx]
+                    im = icon_img.subsample(factor)
+                    lab.configure(image=im)
+                    lab.image = im
+                except Exception:
+                    pass
+                step_idx = (step_idx + 1) % len(factors)
+                root.after(125, animate)
+                
+            animate()
         
         def work():
             try:
@@ -262,6 +282,8 @@ def gui():
                 root.after(0, lambda: show_changelog(rels))
             except Exception as e:
                 err_msg = str(e)
+                if "403" in err_msg:
+                    err_msg += "\n(Rate limit reached. Try setting GITHUB_TOKEN environment variable.)"
                 root.after(0, lambda: show_error(err_msg))
                 
         threading.Thread(target=work, daemon=True).start()
@@ -276,20 +298,17 @@ def gui():
         mkbtn(err_frame, "Retry", load_changelog, kind="ghost", width=100, height=32).pack(pady=8)
 
     def show_changelog(rels):
-        for child in hero.winfo_children():
-            child.destroy()
-            
         if not rels:
             show_error("No releases found.")
             return
             
-        tb = ctk.CTkTextbox(hero, fg_color="transparent", corner_radius=18, text_color=FG, font=font(11))
-        tb.pack(fill="both", expand=True, padx=4, pady=4)
+        tb = ctk.CTkTextbox(hero, fg_color="transparent", corner_radius=18, text_color=FG, font=font(11), wrap="word")
+        tb._x_scrollbar.grid = lambda *args, **kwargs: None
+        tb._x_scrollbar.grid_forget()
         
         widget = tb._textbox
         widget.configure(wrap="word", spacing1=1, spacing2=2, spacing3=1, padx=16, pady=16)
         
-        widget.link_count = 0
         dividers = []
         
         f_family = font().cget("family")
@@ -298,12 +317,22 @@ def gui():
         widget.tag_configure("h1", font=(f_family, 15, "bold"), spacing1=6, spacing3=2)
         widget.tag_configure("h2", font=(f_family, 13, "bold"), spacing1=5, spacing3=2)
         widget.tag_configure("h3", font=(f_family, 12, "bold"), spacing1=4, spacing3=2)
-        widget.tag_configure("code", font=("monospace", 9), background="#272b35", foreground="#e06c5b")
+        widget.tag_configure("code", font=("monospace", 9), background="#272b35", foreground="#8C6446")
         widget.tag_configure("code_block", font=("monospace", 9), background="#15171c", foreground=FG, lmargin1=16, rmargin=16, spacing1=3, spacing3=3)
         widget.tag_configure("bullet", lmargin1=24, lmargin2=36)
         widget.tag_configure("link", font=(f_family, 11, "underline"), foreground=GREEN)
+        
+        def on_link_click(event):
+            idx = widget.index(f"@{event.x},{event.y}")
+            for tag in widget.tag_names(idx):
+                if tag.startswith("url:"):
+                    url = tag[4:]
+                    subprocess.Popen(["xdg-open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    break
+                    
         widget.tag_bind("link", "<Enter>", lambda e: widget.configure(cursor="hand2"))
         widget.tag_bind("link", "<Leave>", lambda e: widget.configure(cursor="arrow"))
+        widget.tag_bind("link", "<Button-1>", on_link_click)
         
         widget.tag_configure("release_title", font=(f_family, 15, "bold"), foreground=GREEN, spacing1=8, spacing3=1)
         widget.tag_configure("release_date", font=(f_family, 11), foreground=SUB, spacing1=0, spacing3=4)
@@ -328,7 +357,7 @@ def gui():
                 render_markdown_to_text(widget, body)
             
             if i < len(rels) - 1:
-                div_frame = tk.Frame(widget, bg=SUB, height=1, bd=0)
+                div_frame = tk.Frame(widget, bg=SUB, height=1, width=1, bd=0)
                 widget.insert("end", "\n", "divider_tag")
                 widget.window_create("end", window=div_frame)
                 widget.insert("end", "\n\n", "divider_tag")
@@ -344,6 +373,12 @@ def gui():
                 except Exception:
                     pass
         widget.bind("<Configure>", on_resize)
+
+        for child in hero.winfo_children():
+            if child != tb:
+                child.destroy()
+                
+        tb.pack(fill="both", expand=True, padx=4, pady=4)
 
     load_changelog()
 

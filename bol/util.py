@@ -84,10 +84,13 @@ def save_settings(s):
             os.close(lock_fd)
 
 
-def http_json(url):
-    req = urllib.request.Request(
-        url, headers={"User-Agent": APP, "Accept": "application/vnd.github+json"})
-    with urllib.request.urlopen(req, timeout=30) as r:
+def http_json(url, timeout=10):
+    headers = {"User-Agent": APP, "Accept": "application/vnd.github+json"}
+    token = os.environ.get("GITHUB_TOKEN")
+    if token:
+        headers["Authorization"] = f"token {token}"
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode())
 
 
@@ -177,13 +180,46 @@ def download(url, dest: Path, label=None, progress=None, attempts=5):
     die(f"Download failed after {attempts} attempts: {url}\n{last_err}")
 
 
+def _fetch_with_fallback(cache_file, url, ttl=3600):
+    cache_path = CACHE / cache_file
+    if cache_path.exists():
+        try:
+            mtime = cache_path.stat().st_mtime
+            if time.time() - mtime < ttl:
+                with open(cache_path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+        except Exception:
+            pass
+
+    try:
+        data = http_json(url)
+        if data:
+            try:
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(cache_path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2)
+            except Exception:
+                pass
+            return data
+    except Exception:
+        if cache_path.exists():
+            try:
+                with open(cache_path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        raise
+
+
 def gh_latest(repo):
-    return http_json(f"https://api.github.com/repos/{repo}/releases/latest")
+    cache_file = f"releases_latest_{repo.replace('/', '_')}.json"
+    return _fetch_with_fallback(cache_file, f"https://api.github.com/repos/{repo}/releases/latest")
 
 
 def gh_releases(repo, per_page=50):
-    return http_json(
-        f"https://api.github.com/repos/{repo}/releases?per_page={per_page}")
+    cache_file = f"releases_{repo.replace('/', '_')}_per_page_{per_page}.json"
+    return _fetch_with_fallback(
+        cache_file, f"https://api.github.com/repos/{repo}/releases?per_page={per_page}")
 
 
 def asset_url(release, predicate):
