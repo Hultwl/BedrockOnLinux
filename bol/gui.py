@@ -382,12 +382,14 @@ def gui():
                     (T.GOLD if is_beta else T.FG),
                     font=font(12), command=lambda l=lab: set_version(l))
                 row.pack(fill="x", pady=1)
-
+                
         def on_enter(_e=None):
             q = search.get().strip().lower()
             shown = [lab for lab in labels if q in lab.lower()] if q else labels
             if shown:
                 set_version(shown[0])
+                return "break"
+            return "break"
 
         search.bind("<KeyRelease>", rebuild)
         search.bind("<Return>", on_enter)
