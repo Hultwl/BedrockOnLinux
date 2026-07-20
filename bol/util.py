@@ -89,7 +89,13 @@ def apply_custom_env(env, custom_env):
     """Merge KEY=VALUE tokens from a space-separated string into env."""
     if not custom_env or not str(custom_env).strip():
         return
-    for token in shlex.split(str(custom_env).strip()):
+    try:
+        tokens = shlex.split(str(custom_env).strip())
+    except ValueError as e:
+        warn(f"Custom environment variables ignored — invalid syntax ({e}). "
+             "Check for a missing closing quote.")
+        return
+    for token in tokens:
         if "=" not in token:
             continue
         key, _, value = token.partition("=")
