@@ -805,7 +805,8 @@ def gui():
             env_entry.insert(0, saved_env)
         env_entry.bind("<KeyRelease>", save_custom_env)
         env_entry.bind("<FocusOut>", save_custom_env)
-
+        env_entry.bind("<Return>", lambda e: "break")
+        
         ctk.CTkLabel(tab_advanced, text="Gamescope arguments",
                      text_color=T.SUB, font=font(11, "bold"),
                      anchor="w").pack(anchor="w", pady=(0, 4), padx=4)
@@ -827,7 +828,8 @@ def gui():
             gamescope_entry.insert(0, saved_gamescope)
         gamescope_entry.bind("<KeyRelease>", save_gamescope)
         gamescope_entry.bind("<FocusOut>", save_gamescope)
-
+        gamescope_entry.bind("<Return>", lambda e: "break")
+        
         # ---- Tools --------------------------------------------------
         imp_status = tk.StringVar(value="")
 
