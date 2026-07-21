@@ -363,6 +363,22 @@ def asset_url(release, predicate):
     return None, None, 0
 
 
+def format_display_version(text, is_beta=False):
+    import re
+    def repl(m):
+        prefix = m.group(1)
+        major = int(m.group(2))
+        rest = m.group(3)
+        if not is_beta:
+            parts = rest.split('.')
+            if len(parts) == 3:
+                rest = '.' + parts[1]
+        if major >= 22:
+            return str(major) + rest
+        return prefix + str(major) + rest
+    return re.sub(r"(?<!\d)(v?1\.)(\d+)(\.\d+(?:\.\d+)?)", repl, text)
+
+
 def _screen_wh(runner=None):
     """Primary screen WxH (for gamescope/Wine desktop sizing), or None. See
     bol.x11.primary_output_size for how the primary monitor is found."""

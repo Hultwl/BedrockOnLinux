@@ -741,7 +741,8 @@ def gui():
         except Exception as e:
             log._LOG_SINK(f"xx versions: {e}")
             return
-        labels = [v["tag"] + ("  · beta" if v["beta"] else "")
+        from .util import format_display_version
+        labels = [format_display_version(v["tag"], v["beta"]) + ("  · beta" if v["beta"] else "")
                   for v in ui["versions"]]
 
         def ap():
@@ -759,7 +760,8 @@ def gui():
     def selected_version():
         if not ui["versions"] or not mc_var.get():
             return None
-        labels = [v["tag"] + ("  · beta" if v["beta"] else "")
+        from .util import format_display_version
+        labels = [format_display_version(v["tag"], v["beta"]) + ("  · beta" if v["beta"] else "")
                   for v in ui["versions"]]
         try:
             return ui["versions"][labels.index(mc_var.get())]
@@ -1148,11 +1150,14 @@ def gui():
                 dividers.append(div_frame)
 
     def render_game_changelog(widget, data, dividers, wrap_width=75):
+        from .util import format_display_version
         articles = data.get("articles", [])[:40]
         for i, art in enumerate(articles):
             title = art.get("title", "Unknown Release")
             if not ("bedrock" in title.lower() or "beta" in title.lower() or "preview" in title.lower()):
                 continue
+            is_beta = "beta" in title.lower() or "preview" in title.lower()
+            title = format_display_version(title, is_beta)
             date = (art.get("updated_at") or "").split("T")[0]
             body = art.get("body") or ""
 
