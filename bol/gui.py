@@ -5,7 +5,6 @@ import base64
 import os
 import shutil
 import subprocess
-import re
 import sys
 import threading
 import zipfile
@@ -33,9 +32,6 @@ from .prefix import (
 from .update import check_for_update, self_update
 from .util import load_settings, save_settings
 
-RE_MD_TOKENS = re.compile(r"(\*\*|`|__|\[[^\]]+\]\([^)]+\))")
-RE_MD_LINK = re.compile(r"^\[([^\]]+)\]\(([^)]+)\)$")
-
 
 def _desktop_error(message):
     warn(message)
@@ -51,30 +47,31 @@ def _desktop_error(message):
 
 
 # --------------------------------------------------------------------------
-# Palette
+# Palette. A little deeper / more layered than a flat two-tone slate, so
+# cards actually separate from the window instead of blending into it.
 # --------------------------------------------------------------------------
 class Theme:
     BG        = "#0f1115"   # window
     CARD      = "#181b22"   # primary panels
     CARD_2    = "#20242e"   # nested surfaces (fields, rows)
     CARD_3    = "#2a2f3b"   # hover / raised state
-    BORDER    = "#2a2e38"   # border outline
+    BORDER    = "#2a2e38"
 
-    FG        = "#f2f4f7"   # primary
-    SUB       = "#8b93a7"   # secondary
-    MUTED     = "#5d6577"   # tertiary
+    FG        = "#f2f4f7"
+    SUB       = "#8b93a7"
+    MUTED     = "#5d6577"
 
-    GREEN     = "#43a047"   # play
-    GREEN_HOV = "#4fc153"   # hover play
-    GREEN_DIM = "#1c2c1c"   # dimmed play
+    GREEN     = "#43a047"
+    GREEN_HOV = "#4fc153"
+    GREEN_DIM = "#1c2c1c"
 
-    GOLD      = "#e3b34a"   # beta
-    GOLD_DIM  = "#33291a"   # dimmed beta
+    GOLD      = "#e3b34a"
+    GOLD_DIM  = "#33291a"
 
-    RED       = "#e2685a"   # danger
-    RED_DIM   = "#341f1d"   # dimmed danger
+    RED       = "#e2685a"
+    RED_DIM   = "#341f1d"
 
-    BLUE      = "#5b9bd9"   # other
+    BLUE      = "#5b9bd9"
 
 
 def gui():
@@ -114,6 +111,7 @@ def gui():
 
     MONO = "monospace"
 
+    # ---------------------------------------------------------------- icon --
     icon_img = None
     here = Path(__file__).resolve().parent
     for p in (here.parent / "data/icon.png",
@@ -152,6 +150,7 @@ def gui():
         except Exception:
             return None
 
+    # ------------------------------------------------------------- helpers --
     def mkbtn(parent, text, cmd, kind="ghost", **kw):
         base = {
             "play":    dict(fg_color=T.GREEN, hover_color=T.GREEN_HOV,
@@ -224,12 +223,10 @@ def gui():
 
     na = NativeAuth()
     ui = {"versions": [], "labels": [], "busy": False, "details": False,
-          "launch_active": False, "changelogs_loaded": False}
-    tab_game = None
-    tab_launcher = None
+          "launch_active": False}
 
     # ==================================================================
-    # Top bar: brand + changelog + account
+    # Top bar: brand + account
     # ==================================================================
     top = ctk.CTkFrame(root, fg_color="transparent")
     top.pack(fill="x", padx=22, pady=(18, 8))
@@ -239,19 +236,13 @@ def gui():
     ll = logo_label(brand, 30, T.BG)
     if ll:
         ll.pack(side="left", padx=(0, 10))
+    ctk.CTkLabel(brand, text="BedrockOnLinux", font=font(18, "bold"),
+                 text_color=T.FG).pack(side="left")
     ctk.CTkLabel(brand, text=f"v{VERSION}", font=font(11), text_color=T.MUTED
-                 ).pack(side="left", pady=(4, 0))
+                 ).pack(side="left", padx=(8, 0), pady=(4, 0))
 
-    right_bar = ctk.CTkFrame(top, fg_color="transparent")
-    right_bar.pack(side="right")
-
-    changelog_btn = mkbtn(right_bar, "What's New", lambda: toggle_view("changelog"),
-                           kind="ghost", width=110, height=36, font=font(12, "bold"))
-    changelog_btn.pack(side="left", padx=(0, 10))
-    Tooltip(changelog_btn, "Game & launcher changelog")
-
-    acct = ctk.CTkFrame(right_bar, fg_color=T.CARD, corner_radius=14)
-    acct.pack(side="left")
+    acct = ctk.CTkFrame(top, fg_color=T.CARD, corner_radius=14)
+    acct.pack(side="right")
     acct_dot = ctk.CTkLabel(acct, text="●", text_color=T.SUB, font=font(12),
                              width=10)
     acct_dot.pack(side="left", padx=(14, 4), pady=8)
@@ -263,13 +254,15 @@ def gui():
     acct_btn.pack(side="left", padx=(0, 8), pady=8)
 
     # ==================================================================
-    # View area — swaps between the Hero, Settings, and What's New panels.
+    # View area — swaps between the Hero and the (now built-in) Settings
+    # panel, instead of Settings opening a separate window.
     # ==================================================================
     view_area = ctk.CTkFrame(root, fg_color="transparent")
     view_area.pack(fill="both", expand=True, padx=22, pady=6)
 
     hero = ctk.CTkFrame(view_area, fg_color=T.CARD, corner_radius=18,
                          border_width=1, border_color=T.BORDER)
+    hero.pack(fill="both", expand=True)
     hw = ctk.CTkFrame(hero, fg_color="transparent")
     hw.place(relx=0.5, rely=0.44, anchor="center")
     hl = logo_label(hw, 118, T.CARD)
@@ -313,20 +306,10 @@ def gui():
                  anchor="w").pack(anchor="w", pady=(0, 4))
     mc_var = tk.StringVar(value="")
 
-    _pick = {"win": None, "hover": False, "bind_id": None}
+    # ---- version picker (searchable dropdown) ------------------------
+    _pick = {"win": None}
 
     def close_picker():
-        bid = _pick.get("bind_id")
-        if bid:
-            root.unbind("<Configure>", bid)
-            _pick["bind_id"] = None
-            
-        try:
-            ver_arrow.configure(text="▾")
-            if not _pick.get("hover"):
-                ver_field.configure(fg_color=T.CARD_2)
-        except NameError:
-            pass
         w = _pick["win"]
         _pick["win"] = None
         if w is not None:
@@ -359,65 +342,15 @@ def gui():
         labels = ui.get("labels") or []
         if not labels:
             return
-        x = ver_field.winfo_rootx() - root.winfo_rootx()
-        y = ver_field.winfo_rooty() - root.winfo_rooty()
-        w = ver_field.winfo_width()
-        
-        s = load_settings()
-        saved_h = s.get("picker_height")
-        if saved_h is not None:
-            h = min(max(100, int(saved_h)), y - 24)
-        else:
-            h = min(360, 40 + 32 * min(len(labels), 8))
-        
-        win = ctk.CTkFrame(root, width=w, height=h, fg_color=T.CARD_2, bg_color=T.CARD_2, border_width=1, border_color=T.BORDER, corner_radius=12)
+        win = ctk.CTkToplevel(root)
         _pick["win"] = win
-        win.pack_propagate(False)
-        win.place(x=x, y=y - h - 4)
-        win.lift()
-        
-        def drag_resize(event):
-            cur_y = ver_field.winfo_rooty() - root.winfo_rooty()
-            mouse_y = event.y_root - root.winfo_rooty()
-            mouse_y = max(24, min(mouse_y, cur_y - 4 - 100))
-            new_h = cur_y - 4 - mouse_y
-            win.configure(height=new_h)
-            win.place(y=mouse_y)
-            
-        def end_drag(event):
-            cur_y = ver_field.winfo_rooty() - root.winfo_rooty()
-            mouse_y = event.y_root - root.winfo_rooty()
-            mouse_y = max(24, min(mouse_y, cur_y - 4 - 100))
-            new_h = cur_y - 4 - mouse_y
-            s2 = load_settings()
-            s2["picker_height"] = new_h
-            save_settings(s2)
-            
-        def update_position(e=None):
-            if _pick["win"] != win: return
-            try:
-                cur_x = ver_field.winfo_rootx() - root.winfo_rootx()
-                cur_y = ver_field.winfo_rooty() - root.winfo_rooty()
-                cur_h = win.cget("height")
-                win.place(x=cur_x, y=cur_y - int(cur_h) - 4)
-            except Exception:
-                pass
-                
-        _pick["bind_id"] = root.bind("<Configure>", update_position, add="+")
-            
-        grip_container = ctk.CTkFrame(win, width=w - 40, height=18, fg_color="transparent", cursor="sb_v_double_arrow")
-        grip_container.pack(side="top", pady=(2, 0))
-        grip_container.pack_propagate(False)
-        
-        grip = ctk.CTkFrame(grip_container, width=40, height=4, fg_color=T.BORDER, corner_radius=2)
-        grip.place(relx=0.5, rely=0.5, anchor="center")
-        
-        for widget in (grip_container, grip):
-            widget.bind("<B1-Motion>", drag_resize)
-            widget.bind("<ButtonRelease-1>", end_drag)
-            widget.bind("<Button-1>", lambda e: search.focus_set())
-
-        ver_arrow.configure(text="▴")
+        win.overrideredirect(True)
+        win.configure(fg_color=T.CARD_2)
+        win.attributes("-topmost", True)
+        x, y = ver_field.winfo_rootx(), ver_field.winfo_rooty()
+        h = min(360, 40 + 32 * min(len(labels), 8))
+        win.geometry(f"{max(240, ver_field.winfo_width())}x{h}"
+                     f"+{x}+{y + ver_field.winfo_height() + 4}")
 
         search = ctk.CTkEntry(win, placeholder_text="Filter versions…",
                                fg_color=T.CARD_3, border_width=0,
@@ -429,34 +362,26 @@ def gui():
         sf = ctk.CTkScrollableFrame(win, fg_color=T.CARD_2, corner_radius=8)
         sf.pack(fill="both", expand=True, padx=6, pady=(0, 6))
         cur = mc_var.get()
-        
-        _pick["no_match"] = ctk.CTkLabel(sf, text="No matches", text_color=T.MUTED, font=font(12))
-        _pick["buttons"] = []
-        for lab in labels:
-            is_beta = "beta" in lab
-            row = ctk.CTkButton(
-                sf, text=lab, anchor="w", height=30, corner_radius=6,
-                fg_color=T.GREEN if lab == cur else "transparent",
-                hover_color=T.CARD_3,
-                text_color="white" if lab == cur else (T.GOLD if is_beta else T.FG),
-                font=font(12), command=lambda l=lab: set_version(l))
-            _pick["buttons"].append((lab, row))
-            row.pack(fill="x", pady=1)
 
         def rebuild(_e=None):
+            for child in sf.winfo_children():
+                child.destroy()
             q = search.get().strip().lower()
-            shown_any = False
-            for lab, row in _pick["buttons"]:
-                if not q or q in lab.lower():
-                    row.pack(fill="x", pady=1)
-                    shown_any = True
-                else:
-                    row.pack_forget()
-                    
-            if not shown_any:
-                _pick["no_match"].pack(pady=10)
-            else:
-                _pick["no_match"].pack_forget()
+            shown = [lab for lab in labels if q in lab.lower()] if q else labels
+            if not shown:
+                ctk.CTkLabel(sf, text="No matches", text_color=T.MUTED,
+                             font=font(12)).pack(pady=10)
+                return
+            for lab in shown:
+                is_beta = "beta" in lab
+                row = ctk.CTkButton(
+                    sf, text=lab, anchor="w", height=30, corner_radius=6,
+                    fg_color=T.GREEN if lab == cur else "transparent",
+                    hover_color=T.CARD_3,
+                    text_color="white" if lab == cur else
+                    (T.GOLD if is_beta else T.FG),
+                    font=font(12), command=lambda l=lab: set_version(l))
+                row.pack(fill="x", pady=1)
                 
         def on_enter(_e=None):
             q = search.get().strip().lower()
@@ -469,33 +394,9 @@ def gui():
         search.bind("<KeyRelease>", rebuild)
         search.bind("<Return>", on_enter)
         search.bind("<Escape>", lambda e: close_picker())
-        search.bind("<KeyRelease>", rebuild)
-        search.bind("<Return>", on_enter)
-        search.bind("<Escape>", lambda e: close_picker())
-        
         rebuild()
+        win.bind("<FocusOut>", lambda e: win.after(80, close_picker))
         win.bind("<Escape>", lambda e: close_picker())
-        
-    def global_click(event):
-        w = _pick.get("win")
-        if w is None:
-            return
-        try:
-            wx, wy = w.winfo_rootx(), w.winfo_rooty()
-            ww, wh = w.winfo_width(), w.winfo_height()
-            vx, vy = ver_field.winfo_rootx(), ver_field.winfo_rooty()
-            vw, vh = ver_field.winfo_width(), ver_field.winfo_height()
-            mx, my = event.x_root, event.y_root
-            
-            in_w = (wx <= mx <= wx + ww) and (wy <= my <= wy + wh)
-            in_v = (vx <= mx <= vx + vw) and (vy <= my <= vy + vh)
-            
-            if not in_w and not in_v:
-                close_picker()
-        except Exception:
-            pass
-
-    root.bind_all("<Button-1>", global_click, add="+")
 
     ver_field = ctk.CTkFrame(vbox, fg_color=T.CARD_2, corner_radius=10,
                               width=220, height=38)
@@ -508,12 +409,7 @@ def gui():
     ver_arrow.pack(side="right", padx=(0, 12))
 
     def _ver_hover(on):
-        _pick["hover"] = on
-        if on or _pick["win"] is not None:
-            ver_field.configure(fg_color=T.CARD_3)
-        else:
-            ver_field.configure(fg_color=T.CARD_2)
-            
+        ver_field.configure(fg_color=T.CARD_3 if on else T.CARD_2)
     for _w in (ver_field, ver_lbl, ver_arrow):
         _w.bind("<Enter>", lambda e: _ver_hover(True))
         _w.bind("<Leave>", lambda e: _ver_hover(False))
@@ -524,7 +420,7 @@ def gui():
                       font=font(16, "bold"))
     play_btn.pack(side="right")
 
-    settings_btn = mkbtn(bar, "⚙", lambda: toggle_view("settings"), kind="ghost",
+    settings_btn = mkbtn(bar, "⚙", lambda: toggle_settings(), kind="ghost",
                           width=48, height=52, corner_radius=12, font=font(18))
     settings_btn.pack(side="right", padx=(0, 10))
     Tooltip(settings_btn, "Settings")
@@ -573,10 +469,10 @@ def gui():
         ui["details"] = not ui["details"]
         if ui["details"]:
             detwrap.pack(fill="both", padx=14, pady=(0, 14))
-            det_btn.configure(text_color=T.FG, fg_color=T.CARD_3)
+            det_btn.configure(text_color=T.FG)
         else:
             detwrap.pack_forget()
-            det_btn.configure(text_color=T.SUB, fg_color="transparent")
+            det_btn.configure(text_color=T.SUB)
 
     # ==================================================================
     # Status / progress helpers
@@ -620,7 +516,7 @@ def gui():
                 break
         low = m.lower()
         if "downloading minecraft" in low:
-            return None
+            return None        # handled by the % progress bar
         if ("building winegdk" in low or "cloning winegdk" in low
                 or "updating winegdk" in low):
             return ("Setting up the game engine — first run, "
@@ -690,6 +586,9 @@ def gui():
         if getattr(acct_btn, "_mode", "in") == "out":
             na.stop()
             try:
+                # PLAY holds this same non-blocking lock through the complete
+                # game session, so Sign out can never invalidate credentials
+                # halfway through launch or while Minecraft is using them.
                 with prefix_operation_lock("sign out of Microsoft"):
                     msa_logout()
             except BolError as exc:
@@ -748,8 +647,7 @@ def gui():
         except Exception as e:
             log._LOG_SINK(f"xx versions: {e}")
             return
-        from .util import format_display_version
-        labels = [format_display_version(v["tag"], v["beta"]) + ("  · beta" if v["beta"] else "")
+        labels = [v["tag"] + ("  · beta" if v["beta"] else "")
                   for v in ui["versions"]]
 
         def ap():
@@ -767,8 +665,7 @@ def gui():
     def selected_version():
         if not ui["versions"] or not mc_var.get():
             return None
-        from .util import format_display_version
-        labels = [format_display_version(v["tag"], v["beta"]) + ("  · beta" if v["beta"] else "")
+        labels = [v["tag"] + ("  · beta" if v["beta"] else "")
                   for v in ui["versions"]]
         try:
             return ui["versions"][labels.index(mc_var.get())]
@@ -807,31 +704,28 @@ def gui():
                 ui["launch_active"] = False
                 end_progress()
                 root.after(0, lambda: busy(False))
+        # Never let closing Tk kill the marker-owning PLAY worker before its
+        # launch finally block can record/clear the completed GPU session.
         threading.Thread(target=work, daemon=False).start()
 
     # ==================================================================
-    # View switching: hero ⇄ settings ⇄ changelog
+    # Settings (tabbed) — built in, lives in view_area next to the hero
     # ==================================================================
     settings_view = ctk.CTkFrame(view_area, fg_color=T.CARD, corner_radius=18,
                                   border_width=1, border_color=T.BORDER)
-    changelog_view = ctk.CTkFrame(view_area, fg_color=T.CARD, corner_radius=18,
-                                   border_width=1, border_color=T.BORDER)
-    views = {"hero": hero, "settings": settings_view, "changelog": changelog_view}
 
-    def show_view(name):
-        for w in views.values():
-            w.pack_forget()
-        views[name].pack(fill="both", expand=True)
-        settings_btn.configure(fg_color=T.CARD_3 if name == "settings" else T.CARD_2)
-        changelog_btn.configure(fg_color=T.CARD_3 if name == "changelog" else T.CARD_2)
-        if name == "changelog":
-            load_changelogs()
-
-    def toggle_view(name):
-        show_view("hero" if views[name].winfo_ismapped() else name)
+    def toggle_settings():
+        if settings_view.winfo_ismapped():
+            settings_view.pack_forget()
+            hero.pack(fill="both", expand=True)
+            settings_btn.configure(fg_color=T.CARD_2)
+        else:
+            hero.pack_forget()
+            settings_view.pack(fill="both", expand=True)
+            settings_btn.configure(fg_color=T.CARD_3)
 
     def _build_settings():
-        d = root
+        d = root  # dialog filedialogs/messageboxes parent to the main window
         outer = ctk.CTkFrame(settings_view, fg_color="transparent")
         outer.pack(fill="both", expand=True, padx=20, pady=18)
 
@@ -839,7 +733,7 @@ def gui():
         head.pack(fill="x", pady=(0, 12))
         ctk.CTkLabel(head, text="Settings", font=font(16, "bold"),
                      text_color=T.FG).pack(side="left")
-        mkbtn(head, "← Back", lambda: show_view("hero"), kind="flat", width=76,
+        mkbtn(head, "← Back", toggle_settings, kind="flat", width=76,
               height=28, font=font(12)).pack(side="right")
 
         tabs = ctk.CTkTabview(
@@ -861,7 +755,6 @@ def gui():
             s2["show_betas"] = beta_v.get()
             save_settings(s2)
             threading.Thread(target=refresh_versions, daemon=True).start()
-            load_changelogs(force=True)
         ctk.CTkSwitch(tab_general, text="Show beta / preview versions",
                       variable=beta_v, command=save_beta,
                       progress_color=T.GREEN, font=font(13)
@@ -960,7 +853,7 @@ def gui():
                         done += import_content(f)
                     except BolError as e:
                         errs.append(str(e))
-                    except Exception as e:
+                    except Exception as e:        # noqa: BLE001
                         errs.append(f"{Path(f).name}: {e}")
                 msg = (f"Imported {len(done)} item(s)."
                        if done else "Nothing imported.")
@@ -1000,7 +893,7 @@ def gui():
                     msg = (f"Injected {name} into Minecraft. ✓\n\n"
                            "(Native / AppImage only — not inside the Flatpak "
                            "sandbox.)")
-                except Exception as e:
+                except Exception as e:                # noqa: BLE001
                     msg = f"Couldn't inject:\n{e}"
                 d.after(0, lambda: (imp_status.set(""),
                                     mb.showinfo("DLL injector", msg,
@@ -1027,451 +920,10 @@ def gui():
         ctk.CTkLabel(tab_tools, textvariable=imp_status, text_color=T.GOLD,
                      font=font(11)).pack(anchor="w", pady=(6, 0), padx=4)
 
+        ctk.CTkLabel(outer, text=f"{PRETTY} {VERSION}", text_color=T.MUTED,
+                     font=font(11)).pack(anchor="w", pady=(10, 0))
+
     _build_settings()
-
-    # ==================================================================
-    # Changelog
-    # ==================================================================
-    def _insert_inline_formatted(widget, text, base_tag, extra_tags=None):
-        tokens = RE_MD_TOKENS.split(text)
-        is_bold = False
-        is_code = False
-        for i, token in enumerate(tokens):
-            if not token:
-                continue
-            if token in ("**", "__"):
-                is_bold = not is_bold
-                continue
-            elif token == "`":
-                is_code = not is_code
-                continue
-
-            link_match = RE_MD_LINK.match(token)
-            if link_match:
-                link_text = link_match.group(1)
-                url = link_match.group(2)
-                tags = ["link", f"url:{url}", base_tag] + list(extra_tags or [])
-                if is_bold:
-                    tags.append("bold")
-                if is_code:
-                    tags.append("code")
-                widget.insert("end", link_text, tuple(tags))
-                next_tok = tokens[i + 1] if i + 1 < len(tokens) else ""
-                if next_tok and not next_tok[0].isspace():
-                    widget.insert("end", " ", (base_tag,))
-            else:
-                tags = [base_tag] + list(extra_tags or [])
-                if is_bold:
-                    tags.append("bold")
-                if is_code:
-                    tags.append("code")
-                widget.insert("end", token, tuple(tags))
-
-    def render_markdown_to_text(widget, md, wrap_width=75):
-        lines = md.split("\n")
-        in_code_block = False
-        code_in_quote = False
-        code_content = []
-
-        for line in lines:
-            stripped = line.strip()
-            is_quote = stripped.startswith(">")
-
-            if is_quote:
-                content_line = stripped[1:].strip()
-            else:
-                content_line = line
-
-            if content_line.startswith("```"):
-                if in_code_block:
-                    for cl in code_content:
-                        widget.insert("end", cl + "\n", "code_block")
-                    in_code_block = False
-                    code_in_quote = False
-                    code_content = []
-                else:
-                    in_code_block = True
-                    code_in_quote = is_quote
-                continue
-
-            if in_code_block:
-                code_content.append(content_line)
-                continue
-
-            # Headers
-            if content_line.startswith("#"):
-                hashes = len(content_line) - len(content_line.lstrip("#"))
-                content = content_line.lstrip("#").strip()
-                tag = f"h{min(hashes, 3)}"
-                widget.insert("end", content + "\n", (tag, "quote") if is_quote else tag)
-                continue
-
-            # Blockquotes
-            if is_quote:
-                if content_line:
-                    _insert_inline_formatted(widget, content_line + "\n", "quote")
-                else:
-                    widget.insert("end", "\n", "quote")
-                continue
-
-            if stripped.startswith(("* ", "- ", "+ ", "\u2022 ")):
-                bullet_char = "\u2022 "
-                content = line.replace(stripped[:2], "", 1).strip()
-                widget.insert("end", bullet_char, "bullet")
-                _insert_inline_formatted(widget, content + "\n", "bullet")
-                continue
-
-            # Normal lines
-            if stripped == "":
-                widget.insert("end", "\n", "normal")
-            else:
-                _insert_inline_formatted(widget, line + "\n", "normal")
-
-    def render_launcher_changelog(widget, rels, dividers, wrap_width=75):
-        for i, rel in enumerate(rels):
-            tag_name = rel.get("tag_name", "Unknown")
-            name = rel.get("name")
-            date = (rel.get("published_at") or "").split("T")[0]
-            body = (rel.get("body") or "").strip()
-
-            title_text = tag_name
-            if name and name != tag_name:
-                title_text += f" \u2014 {name}"
-
-            widget.insert("end", title_text + "\n", "release_title")
-            widget.insert("end", date + "\n", "release_date")
-
-            if body:
-                render_markdown_to_text(widget, body, wrap_width=wrap_width)
-
-            if i < len(rels) - 1:
-                div_frame = tk.Frame(widget, bg=T.SUB, height=1, width=1, bd=0)
-                div_frame.pack_propagate(False)
-                widget.insert("end", "\n", "divider_tag")
-                widget.window_create("end", window=div_frame)
-                widget.insert("end", "\n\n", "divider_tag")
-                dividers.append(div_frame)
-
-    def render_game_changelog(widget, data, dividers, wrap_width=75):
-        from .util import format_display_version
-        articles = data.get("articles", [])[:40]
-        for i, art in enumerate(articles):
-            title = art.get("title", "Unknown Release")
-            if not ("bedrock" in title.lower() or "beta" in title.lower() or "preview" in title.lower()):
-                continue
-            is_beta = "beta" in title.lower() or "preview" in title.lower()
-            title = format_display_version(title, is_beta)
-            date = (art.get("updated_at") or "").split("T")[0]
-            body = art.get("body") or ""
-
-            widget.insert("end", title + "\n", "release_title")
-            widget.insert("end", date + "\n", "release_date")
-
-            if body:
-                from html.parser import HTMLParser
-
-                class HTMLToTkinterParser(HTMLParser):
-                    def __init__(self, w):
-                        super().__init__()
-                        self.w = w
-                        self.tags = []
-                        self.current_href = None
-                        self.in_blockquote = False
-
-                    def _ensure_newlines(self, count):
-                        if self.w.index("end-1c") == "1.0":
-                            return
-                        text = self.w.get(f"end-{count+1}c", "end-1c")
-                        missing = count - text.count("\n")
-                        if missing > 0:
-                            self.w.insert("end", "\n" * missing)
-
-                    def handle_starttag(self, tag, attrs):
-                        attrs_dict = dict(attrs)
-                        if tag in ("strong", "b"):
-                            self.tags.append("bold")
-                        elif tag in ("h1", "h2", "h3"):
-                            self.tags.append(tag)
-                            self._ensure_newlines(2)
-                        elif tag == "a" and "href" in attrs_dict:
-                            self.current_href = attrs_dict["href"]
-                            self.tags.append("link")
-                            self.tags.append(f"url:{self.current_href}")
-                        elif tag == "li":
-                            self._ensure_newlines(1)
-                            self.w.insert("end", "\u2022 ", "bullet")
-                            self.tags.append("bullet")
-                            self.in_li = True
-                            self.li_has_content = False
-                        elif tag == "blockquote":
-                            self.tags.append("quote")
-                            self.in_blockquote = True
-                            self._ensure_newlines(1)
-                        elif tag == "p":
-                            if not getattr(self, "in_li", False):
-                                self._ensure_newlines(2)
-
-                    def handle_endtag(self, tag):
-                        if tag in ("strong", "b"):
-                            if "bold" in self.tags:
-                                self.tags.remove("bold")
-                        elif tag in ("h1", "h2", "h3"):
-                            if tag in self.tags:
-                                self.tags.remove(tag)
-                            self._ensure_newlines(1)
-                        elif tag == "a":
-                            if "link" in self.tags:
-                                self.tags.remove("link")
-                            if f"url:{self.current_href}" in self.tags:
-                                self.tags.remove(f"url:{self.current_href}")
-                            self.current_href = None
-                        elif tag == "li":
-                            if "bullet" in self.tags:
-                                self.tags.remove("bullet")
-                            self.in_li = False
-                            self.li_has_content = False
-                            self._ensure_newlines(1)
-                        elif tag == "ul":
-                            self._ensure_newlines(2)
-                        elif tag == "blockquote":
-                            if "quote" in self.tags:
-                                self.tags.remove("quote")
-                            self.in_blockquote = False
-                            self._ensure_newlines(1)
-                        elif tag == "p":
-                            self._ensure_newlines(1)
-
-                    def handle_data(self, d_text):
-                        in_li = getattr(self, "in_li", False)
-                        in_link = self.current_href is not None
-                        
-                        d_text = d_text.replace("\n", " ")
-                        
-                        if not d_text.strip():
-                            if d_text and (in_li or in_link):
-                                if in_li and not getattr(self, "li_has_content", False):
-                                    return
-                                self.w.insert("end", d_text,
-                                              tuple(self.tags or ["normal"]))
-                        else:
-                            if in_li and not getattr(self,
-                                                     "li_has_content", False):
-                                d_text = d_text.lstrip()
-                                self.li_has_content = True
-                            self.w.insert("end", d_text,
-                                          tuple(self.tags or ["normal"]))
-
-                parser = HTMLToTkinterParser(widget)
-                parser.feed(body)
-
-            if i < len(articles) - 1:
-                div_frame = tk.Frame(widget, bg=T.SUB, height=1, width=1, bd=0)
-                div_frame.pack_propagate(False)
-                widget.insert("end", "\n", "divider_tag")
-                widget.window_create("end", window=div_frame)
-                widget.insert("end", "\n\n", "divider_tag")
-                dividers.append(div_frame)
-
-    def load_tab_changelog(tab, fetch_func, render_func):
-        tab.unbind("<Configure>")
-        for child in tab.winfo_children():
-            child.destroy()
-
-        bg_color = tab.cget("fg_color")
-        if isinstance(bg_color, tuple):
-            bg_color = tab._apply_appearance_mode(bg_color)
-        elif bg_color == "transparent":
-            bg_color = T.CARD_2
-
-        lab = tk.Label(tab, bg=bg_color, bd=0)
-        lab.place(relx=0.5, rely=0.5, anchor="center")
-
-        if icon_img is not None:
-            factors = [10, 9, 8, 7, 6, 7, 8, 9]
-            step_idx = 0
-
-            def animate():
-                nonlocal step_idx
-                if not lab.winfo_exists():
-                    return
-                try:
-                    factor = factors[step_idx]
-                    im = icon_img.subsample(factor)
-                    lab.configure(image=im)
-                    lab.image = im
-                except Exception:
-                    pass
-                step_idx = (step_idx + 1) % len(factors)
-                tab.after(125, animate)
-
-            animate()
-
-        def show_error(err_msg):
-            for child in tab.winfo_children():
-                child.destroy()
-            err_frame = ctk.CTkFrame(tab, fg_color="transparent")
-            err_frame.place(relx=0.5, rely=0.5, anchor="center")
-            ctk.CTkLabel(err_frame, text="Could not load changelog.",
-                         font=font(14, "bold"), text_color=T.RED).pack(pady=4)
-            ctk.CTkLabel(err_frame, text=err_msg, font=font(11),
-                         text_color=T.SUB).pack(pady=4)
-            mkbtn(err_frame, "Retry",
-                  lambda: load_tab_changelog(tab, fetch_func, render_func),
-                  kind="ghost", width=100, height=32).pack(pady=8)
-
-        def show_data(data):
-            if not data:
-                show_error("No releases found.")
-                return
-
-            tb = ctk.CTkTextbox(tab, fg_color="transparent", corner_radius=12,
-                                text_color=T.FG, font=font(11), wrap="word")
-            tb._x_scrollbar.grid = lambda *a, **k: None
-            tb._x_scrollbar.grid_forget()
-
-            widget = tb._textbox
-            widget.configure(wrap="word", spacing1=1, spacing2=2,
-                             spacing3=1, padx=16, pady=16)
-
-            dividers = []
-            f_family = font().cget("family")
-            widget.tag_configure("quote", font=(f_family, 11, "italic"),
-                                 background=T.CARD_2, foreground=T.SUB,
-                                 lmargin1=10, rmargin=10,
-                                 spacing1=3, spacing3=3)
-            widget.tag_configure("normal", font=(f_family, 11),
-                                 spacing1=1, spacing3=1)
-            widget.tag_configure("bold", font=(f_family, 11, "bold"))
-            widget.tag_configure("h1", font=(f_family, 15, "bold"),
-                                 spacing1=6, spacing3=2)
-            widget.tag_configure("h2", font=(f_family, 13, "bold"),
-                                 spacing1=5, spacing3=2)
-            widget.tag_configure("h3", font=(f_family, 12, "bold"),
-                                 spacing1=4, spacing3=2)
-            widget.tag_configure("code", font=(MONO, 9),
-                                 background=T.CARD_2,
-                                 foreground="#8C6446")
-            widget.tag_configure("code_block", font=(MONO, 9),
-                                 background=T.CARD_2, foreground=T.FG,
-                                 lmargin1=10, rmargin=10,
-                                 spacing1=3, spacing3=3)
-            widget.tag_configure("bullet", font=(f_family, 11),
-                                 lmargin1=14, lmargin2=24)
-            widget.tag_configure("link", underline=True,
-                                 foreground=T.GREEN)
-
-            def on_link_click(event):
-                idx = widget.index(f"@{event.x},{event.y}")
-                for tag in widget.tag_names(idx):
-                    if tag.startswith("url:"):
-                        url = tag[4:]
-                        subprocess.Popen(
-                            ["xdg-open", url],
-                            stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL)
-                        break
-
-            widget.tag_bind("link", "<Enter>",
-                            lambda e: widget.configure(cursor="hand2"))
-            widget.tag_bind("link", "<Leave>",
-                            lambda e: widget.configure(cursor="arrow"))
-            widget.tag_bind("link", "<Button-1>", on_link_click)
-
-            widget.tag_configure("release_title",
-                                 font=(f_family, 15, "bold"),
-                                 foreground=T.GREEN,
-                                 spacing1=8, spacing3=1)
-            widget.tag_configure("release_date", font=(f_family, 11),
-                                 foreground=T.SUB,
-                                 spacing1=0, spacing3=4)
-            widget.tag_configure("divider_tag", spacing1=4, spacing3=4)
-
-            widget.rendering = False
-
-            def do_render(container_width):
-                if getattr(widget, "rendering", False):
-                    return
-                widget.rendering = True
-                try:
-                    tb_width = container_width
-                    tb.configure(width=tb_width)
-                    char_width = max(30, int((tb_width - 48) / 7.2))
-                    w_width = tb_width - 48
-                    dividers.clear()
-                    widget.configure(state="normal")
-                    widget.delete("1.0", "end")
-                    render_func(widget, data, dividers,
-                                wrap_width=char_width)
-                    widget.configure(state="disabled")
-                    for div in dividers:
-                        try:
-                            div.configure(width=w_width)
-                        except Exception:
-                            pass
-                finally:
-                    widget.rendering = False
-
-            def on_resize(event):
-                do_render(event.width)
-            tab.bind("<Configure>", on_resize)
-
-            for child in tab.winfo_children():
-                if child != tb:
-                    child.destroy()
-            tb.pack(fill="both", expand=True, padx=4, pady=4)
-            tab.update_idletasks()
-            do_render(tab.winfo_width())
-
-        def work():
-            try:
-                data = fetch_func()
-                tab.after(0, lambda: show_data(data))
-            except Exception as e:
-                err_msg = str(e)
-                if "403" in err_msg:
-                    err_msg += ("\n(Rate limit reached. Try setting "
-                                "GITHUB_TOKEN environment variable.)")
-                tab.after(0, lambda: show_error(err_msg))
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def load_changelogs(force=False):
-        if ui["changelogs_loaded"] and not force:
-            return
-        ui["changelogs_loaded"] = True
-
-        from .util import mc_releases, gh_releases
-        from .config import SELF_REPO
-
-        load_tab_changelog(tab_game, mc_releases, render_game_changelog)
-        load_tab_changelog(tab_launcher,
-                           lambda: gh_releases(SELF_REPO),
-                           render_launcher_changelog)
-
-    def _build_changelog_view():
-        nonlocal tab_game, tab_launcher
-        outer = ctk.CTkFrame(changelog_view, fg_color="transparent")
-        outer.pack(fill="both", expand=True, padx=20, pady=18)
-
-        head = ctk.CTkFrame(outer, fg_color="transparent")
-        head.pack(fill="x", pady=(0, 12))
-        ctk.CTkLabel(head, text="What's New", font=font(16, "bold"),
-                     text_color=T.FG).pack(side="left")
-        mkbtn(head, "← Back", lambda: show_view("hero"), kind="flat", width=76,
-              height=28, font=font(12)).pack(side="right")
-
-        tabs = ctk.CTkTabview(
-            outer, fg_color=T.CARD_2,
-            segmented_button_fg_color=T.CARD_2,
-            segmented_button_selected_color=T.GREEN,
-            segmented_button_selected_hover_color=T.GREEN_HOV,
-            segmented_button_unselected_color=T.CARD_2,
-            text_color=T.FG, corner_radius=12)
-        tabs.pack(fill="both", expand=True)
-        tab_game = tabs.add("Game")
-        tab_launcher = tabs.add("Launcher")
-
-    _build_changelog_view()
 
     # ==================================================================
     # Self-update
@@ -1548,10 +1000,6 @@ def gui():
     acct_state("in" if msa_signed_in() else "out")
     threading.Thread(target=refresh_versions, daemon=True).start()
     threading.Thread(target=update_check, daemon=True).start()
-
-    hero.pack(fill="both", expand=True)
-
-    root.update_idletasks()
 
     def on_close():
         if ui.get("launch_active"):
