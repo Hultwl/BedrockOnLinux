@@ -60,10 +60,10 @@ GDK_DEPS_DLLS = ("libHttpClient.GDK.dll", "XCurl.dll")
 # scripts/build-openssl-xcurl.sh (pinned msys2 curl closure + source shim +
 # source cryptbase stub); the rev/SHA below track that build.
 OPENSSL_XCURL_SET = DATA / "xodus-xcurl" / "openssl-set"
-OPENSSL_XCURL_REV = "366acd702f81"
+OPENSSL_XCURL_REV = "504bb166e4e7"
 # Exact reviewed online-login payload. A filename/revision alone is not an
 # integrity boundary; local siblings and downloaded assets must match this pin.
-OPENSSL_XCURL_ARCHIVE_SHA256 = "366acd702f8176c59a40abe9351a9885fadf6c8aad1b964666a8e8ed19758d3c"
+OPENSSL_XCURL_ARCHIVE_SHA256 = "504bb166e4e737ad81c3ac8e7a917740b28478f69acd89e538c3bf921c29523f"
 WINEGDK_OUT = PROTON_DIR / "GDK-Proton-xuser"
 # Prebuilt engine: users download GDK-Proton-xuser-<build-rev>.tar.gz from the
 # app's releases instead of compiling Wine.  Managed engines are fail-closed:
