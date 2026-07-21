@@ -10,6 +10,7 @@ import sys
 import threading
 import zipfile
 from pathlib import Path
+from PIL import Image, ImageDraw
 
 from .auth import (
     NativeAuth,
@@ -87,6 +88,24 @@ class Theme:
     CONSOLE_FG  = "#7fd97f"   # foreground
 
 
+def _create_play_icon(size=22, color="white"):
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    pad = 2
+    draw.polygon([(pad, pad), (size - pad, size // 2), (pad, size - pad)], fill=color)
+    import customtkinter as ctk
+    return ctk.CTkImage(img, size=(size, size))
+
+def _create_kill_icon(size=22, color="white"):
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    pad = 3
+    width = 3
+    draw.line([(pad, pad), (size - pad, size - pad)], fill=color, width=width)
+    draw.line([(size - pad, pad), (pad, size - pad)], fill=color, width=width)
+    import customtkinter as ctk
+    return ctk.CTkImage(img, size=(size, size))
+
 def gui():
     if os.environ.get("WAYLAND_DISPLAY") and not os.environ.get("DISPLAY"):
         _desktop_error(
@@ -123,7 +142,7 @@ def gui():
         return
     root.title(PRETTY)
     root.geometry("980x650")
-    root.minsize(860, 580)
+    root.minsize(860, 640)
     root.configure(fg_color=T.BG)
 
     def font(size=13, weight="normal", family=None):
@@ -332,7 +351,7 @@ def gui():
     # ==================================================================
     status = ctk.CTkFrame(root, fg_color="transparent")
     status.pack(fill="x", padx=26, pady=(4, 0))
-    status_txt = tk.StringVar(value="Ready to play.")
+    status_txt = tk.StringVar(value="Select a version to play.")
     status_lbl = ctk.CTkLabel(status, textvariable=status_txt, text_color=T.SUB,
                                font=font(12), anchor="w")
     status_lbl.pack(fill="x")
@@ -346,13 +365,31 @@ def gui():
     dock = ctk.CTkFrame(root, fg_color=T.CARD, corner_radius=16,
                          border_width=1, border_color=T.BORDER)
     dock.pack(fill="x", padx=22, pady=(10, 16))
+    
+    _sash_state = {"y": 0, "h": 220, "max_h": 600}
+    def sash_click(e):
+        if not ui.get("details"): return
+        _sash_state["y"] = e.y_root
+        _sash_state["h"] = detwrap.winfo_height()
+        allowable = view_area.winfo_height() - 340
+        _sash_state["max_h"] = _sash_state["h"] + max(0, allowable)
+    def sash_drag(e):
+        if not ui.get("details"): return
+        new_h = _sash_state["h"] - (e.y_root - _sash_state["y"])
+        if new_h < 100: new_h = 100
+        if new_h > _sash_state["max_h"]: new_h = _sash_state["max_h"]
+        detwrap.configure(height=new_h)
+        root.minsize(860, 640 + new_h)
+        
+    for _w in (status, status_lbl, prog, getattr(prog, "_canvas", prog)):
+        _w.bind("<Button-1>", sash_click, add="+")
+        _w.bind("<B1-Motion>", sash_drag, add="+")
+
     bar = ctk.CTkFrame(dock, fg_color="transparent")
     bar.pack(fill="x", padx=16, pady=14)
 
     vbox = ctk.CTkFrame(bar, fg_color="transparent")
     vbox.pack(side="left")
-    ctk.CTkLabel(vbox, text="VERSION", text_color=T.MUTED, font=font(11, "bold"),
-                 anchor="w").pack(anchor="w", pady=(0, 4))
     mc_var = tk.StringVar(value="")
 
     _pick = {"win": None, "hover": False, "bind_id": None}
@@ -367,6 +404,7 @@ def gui():
             ver_arrow.configure(text="▾")
             if not _pick.get("hover"):
                 ver_field.configure(fg_color=T.CARD_2)
+                ver_lbl.configure(text_color=T.FG)
         except NameError:
             pass
         w = _pick["win"]
@@ -387,7 +425,7 @@ def gui():
         if not lab:
             selected_chip.configure(text="")
             return
-        is_beta = "beta" in lab
+        is_beta = "BETA" in lab
         
         s = load_settings()
         if s.get("ui_is_beta") != is_beta:
@@ -399,6 +437,13 @@ def gui():
                  f"{'  ·  BETA' if is_beta else ''}  ",
             text_color=T.GOLD if is_beta else T.GREEN,
             fg_color=T.GOLD_DIM if is_beta else T.GREEN_DIM)
+            
+        try:
+            active = _pick.get("hover") or _pick.get("win")
+            ver_lbl.configure(text_color=T.THEME_ACCENT if active else T.FG)
+            ver_arrow.configure(text_color=T.SUB)
+        except Exception:
+            pass
 
         def _sync_theme(w):
             if w == acct_dot:
@@ -441,6 +486,14 @@ def gui():
                 try: w._textbox.tag_configure("link", foreground=c_new)
                 except Exception: pass
                 try: w._textbox.tag_configure("release_title", foreground=c_new)
+                except Exception: pass
+                
+            if getattr(w, "_is_play_btn", False):
+                try:
+                    w.configure(fg_color=T.THEME_DIM, hover_color=T.THEME_ACCENT)
+                    w._img_norm = _create_play_icon(22, c_new)
+                    w._img_hov = _create_play_icon(22, T.THEME_DIM)
+                    w.configure(image=w._img_hov if (getattr(w, "_is_hovered", False) and not getattr(w, "_is_pressed", False)) else w._img_norm)
                 except Exception: pass
                 
             for child in w.winfo_children():
@@ -529,14 +582,21 @@ def gui():
         _pick["no_match"] = ctk.CTkLabel(sf, text="No matches", text_color=T.MUTED, font=font(12))
         _pick["buttons"] = []
         for lab in labels:
-            is_beta = "beta" in lab
-            c_cur = T.GOLD if "beta" in cur else T.GREEN
+            is_beta = "BETA" in lab
+            c_bg = T.GOLD if is_beta else T.GREEN
+            c_dim = T.GOLD_DIM if is_beta else T.GREEN_DIM
+            
             row = ctk.CTkButton(
                 sf, text=lab, anchor="w", height=30, corner_radius=6,
-                fg_color=c_cur if lab == cur else "transparent",
-                hover_color=T.CARD_3,
-                text_color="white" if lab == cur else (T.GOLD if is_beta else T.FG),
+                fg_color=c_dim if lab == cur else "transparent",
+                hover_color=c_dim,
+                text_color=c_bg if lab == cur else T.FG,
                 font=font(12), command=lambda l=lab: set_version(l))
+            if lab != cur:
+                def _enter(e, r=row, c=c_bg): r.configure(text_color=c)
+                def _leave(e, r=row): r.configure(text_color=T.FG)
+                row.bind("<Enter>", _enter, add="+")
+                row.bind("<Leave>", _leave, add="+")
             _pick["buttons"].append((lab, row))
             row.pack(fill="x", pady=1)
 
@@ -594,47 +654,80 @@ def gui():
 
     root.bind_all("<Button-1>", global_click, add="+")
 
-    ver_field = ctk.CTkFrame(vbox, fg_color=T.CARD_2, bg_color=T.CARD, corner_radius=10,
-                              width=220, height=38)
+    ver_field = ctk.CTkFrame(vbox, fg_color=T.CARD_2, bg_color=T.CARD, corner_radius=12,
+                              width=220, height=52)
     ver_field.pack(anchor="w")
     ver_field.pack_propagate(False)
     ver_lbl = ctk.CTkLabel(ver_field, textvariable=mc_var, text_color=T.FG,
-                            font=font(13), anchor="w")
-    ver_lbl.pack(side="left", fill="x", expand=True, padx=(12, 0))
-    ver_arrow = ctk.CTkLabel(ver_field, text="▾", text_color=T.SUB, font=font(14))
+                            font=font(16, "bold"), anchor="w")
+    ver_lbl.pack(side="left", fill="x", expand=True, padx=(14, 0))
+    ver_arrow = ctk.CTkLabel(ver_field, text="▾", text_color=T.SUB, font=font(16, "bold"))
     ver_arrow.pack(side="right", padx=(0, 12))
+    Tooltip(ver_field, "Change Version")
 
     def _ver_hover(on):
         _pick["hover"] = on
         if on or _pick["win"] is not None:
             ver_field.configure(fg_color=T.CARD_3)
+            ver_lbl.configure(text_color=T.THEME_ACCENT)
         else:
             ver_field.configure(fg_color=T.CARD_2)
+            ver_lbl.configure(text_color=T.FG)
             
     for _w in (ver_field, ver_lbl, ver_arrow):
         _w.bind("<Enter>", lambda e: _ver_hover(True))
         _w.bind("<Leave>", lambda e: _ver_hover(False))
         _w.bind("<Button-1>", lambda e: open_picker())
 
-    play_btn = mkbtn(bar, "▶   PLAY", lambda: do_play(), kind="play",
-                      width=168, height=52, corner_radius=12,
-                      font=font(16, "bold"))
-    play_btn.pack(side="right")
+    rbox = ctk.CTkFrame(bar, fg_color="transparent")
+    rbox.pack(side="right")
+    
+    hbox = ctk.CTkFrame(rbox, fg_color="transparent")
+    hbox.pack(fill="x")
 
-    settings_btn = mkbtn(bar, "⚙", lambda: toggle_settings(), kind="ghost",
-                          width=48, height=52, corner_radius=12, font=font(18))
-    settings_btn.pack(side="right", padx=(0, 10))
+    play_btn = mkbtn(hbox, "", lambda: do_play(), kind="play",
+                      width=52, height=52, corner_radius=12)
+    play_btn._is_play_btn = True
+    play_btn._img_norm = _create_play_icon(22, T.THEME_ACCENT)
+    play_btn._img_hov = _create_play_icon(22, T.THEME_DIM)
+    play_btn.configure(image=play_btn._img_norm, fg_color=T.THEME_DIM, hover_color=T.THEME_ACCENT)
+    
+    def _pe(e):
+        play_btn._is_hovered = True
+        if not getattr(play_btn, "_is_pressed", False):
+            play_btn.configure(image=play_btn._img_hov)
+    def _pl(e):
+        play_btn._is_hovered = False
+        play_btn.configure(image=play_btn._img_norm)
+    def _pd(e):
+        play_btn._is_pressed = True
+        play_btn.configure(image=play_btn._img_norm)
+    def _pu(e):
+        play_btn._is_pressed = False
+        if getattr(play_btn, "_is_hovered", False):
+            play_btn.configure(image=play_btn._img_hov)
+    play_btn.bind("<Enter>", _pe, add="+")
+    play_btn.bind("<Leave>", _pl, add="+")
+    play_btn.bind("<Button-1>", _pd, add="+")
+    play_btn.bind("<ButtonRelease-1>", _pu, add="+")
+    play_btn.pack(side="right")
+    play_btn._tooltip = Tooltip(play_btn, "Play Game")
+
+    settings_btn = mkbtn(hbox, "⚙", lambda: toggle_settings(), kind="ghost",
+                          width=52, height=52, corner_radius=12, font=font(18))
+    settings_btn.pack(side="right", padx=(0, 8))
     Tooltip(settings_btn, "Settings")
 
-    det_btn = mkbtn(bar, "Details", lambda: toggle_details(), kind="flat",
-                     width=86, height=52)
-    det_btn.pack(side="right", padx=(0, 6))
-    Tooltip(det_btn, "Show install / run log")
+    det_btn = mkbtn(hbox, "📋", lambda: toggle_details(), kind="ghost",
+                     width=52, height=52, corner_radius=12, font=font(18))
+    det_btn.pack(side="right", padx=(0, 8))
+    Tooltip(det_btn, "Details")
 
     # ==================================================================
     # Details / log panel
     # ==================================================================
-    detwrap = ctk.CTkFrame(dock, fg_color=T.CARD_2, corner_radius=12)
+    detwrap = ctk.CTkFrame(dock, fg_color=T.CARD_2, corner_radius=12, height=220)
+    detwrap.pack_propagate(False)
     log_head = ctk.CTkFrame(detwrap, fg_color="transparent")
     log_head.pack(fill="x", padx=10, pady=(8, 0))
     ctk.CTkLabel(log_head, text="ACTIVITY LOG", text_color=T.MUTED,
@@ -669,11 +762,24 @@ def gui():
     def toggle_details():
         ui["details"] = not ui["details"]
         if ui["details"]:
+            h = int(detwrap.cget("height"))
+            root.minsize(860, 640 + h)
+            for _w in (status, status_lbl, prog):
+                try: _w.configure(cursor="sb_v_double_arrow")
+                except: pass
+            try: prog._canvas.configure(cursor="sb_v_double_arrow")
+            except: pass
             detwrap.pack(fill="both", padx=14, pady=(0, 14))
             det_btn.configure(text_color=T.FG, fg_color=T.CARD_3)
         else:
+            root.minsize(860, 640)
+            for _w in (status, status_lbl, prog):
+                try: _w.configure(cursor="")
+                except: pass
+            try: prog._canvas.configure(cursor="")
+            except: pass
             detwrap.pack_forget()
-            det_btn.configure(text_color=T.SUB, fg_color="transparent")
+            det_btn.configure(text_color=T.FG, fg_color=T.CARD_2)
 
     # ==================================================================
     # Status / progress helpers
@@ -879,7 +985,7 @@ def gui():
             log._LOG_SINK(f"xx versions: {e}")
             return
         from .util import format_display_version
-        labels = [format_display_version(v["tag"], v["beta"]) + ("  · beta" if v["beta"] else "")
+        labels = [format_display_version(v["tag"], v["beta"]) + ("  ·  BETA" if v["beta"] else "")
                   for v in ui["versions"]]
 
         def ap():
@@ -898,7 +1004,7 @@ def gui():
         if not ui["versions"] or not mc_var.get():
             return None
         from .util import format_display_version
-        labels = [format_display_version(v["tag"], v["beta"]) + ("  · beta" if v["beta"] else "")
+        labels = [format_display_version(v["tag"], v["beta"]) + ("  ·  BETA" if v["beta"] else "")
                   for v in ui["versions"]]
         try:
             return ui["versions"][labels.index(mc_var.get())]
@@ -910,7 +1016,31 @@ def gui():
     # ==================================================================
     def busy(on):
         ui["busy"] = on
-        play_btn.configure(state="disabled" if on else "normal")
+        if on:
+            play_btn._img_norm = _create_kill_icon(22, T.RED)
+            play_btn._img_hov = _create_kill_icon(22, T.RED_DIM)
+            play_btn.configure(
+                image=play_btn._img_hov if (getattr(play_btn, "_is_hovered", False) and not getattr(play_btn, "_is_pressed", False)) else play_btn._img_norm,
+                fg_color=T.RED_DIM,
+                hover_color=T.RED,
+                command=lambda: kill_wine()
+            )
+            if hasattr(play_btn, "_tooltip"):
+                play_btn._tooltip.text = "Kill Game"
+        else:
+            is_beta = "BETA" in mc_var.get() if mc_var.get() else False
+            accent = T.GOLD if is_beta else T.GREEN
+            dim = T.GOLD_DIM if is_beta else T.GREEN_DIM
+            play_btn._img_norm = _create_play_icon(22, accent)
+            play_btn._img_hov = _create_play_icon(22, dim)
+            play_btn.configure(
+                image=play_btn._img_hov if (getattr(play_btn, "_is_hovered", False) and not getattr(play_btn, "_is_pressed", False)) else play_btn._img_norm,
+                fg_color=dim,
+                hover_color=accent,
+                command=lambda: do_play()
+            )
+            if hasattr(play_btn, "_tooltip"):
+                play_btn._tooltip.text = "Play"
 
     def do_play():
         if ui["busy"]:
@@ -986,9 +1116,26 @@ def gui():
             segmented_button_unselected_color=T.CARD_2,
             text_color=T.FG, corner_radius=12)
         tabs.pack(fill="both", expand=True)
-        tab_general = tabs.add("General")
-        tab_advanced = tabs.add("Advanced")
-        tab_tools = tabs.add("Tools")
+        
+        def _mk_sf(parent):
+            sf = ctk.CTkScrollableFrame(parent, fg_color="transparent")
+            def _check(*_):
+                try:
+                    c = sf._parent_canvas
+                    if sf.winfo_reqheight() > c.winfo_height() and c.winfo_height() > 10:
+                        sf._scrollbar.grid()
+                    else:
+                        sf._scrollbar.grid_remove()
+                except Exception: pass
+            sf.bind("<Configure>", _check, add="+")
+            try: sf._parent_canvas.bind("<Configure>", _check, add="+")
+            except Exception: pass
+            sf.pack(fill="both", expand=True)
+            return sf
+
+        tab_general = _mk_sf(tabs.add("General"))
+        tab_advanced = _mk_sf(tabs.add("Advanced"))
+        tab_tools = _mk_sf(tabs.add("Tools"))
 
         # ---- General --------------------------------------------------
         beta_v = tk.BooleanVar(value=load_settings().get("show_betas", False))
@@ -1413,6 +1560,9 @@ def gui():
                 dividers.append(div_frame)
 
     def load_tab_changelog(tab, fetch_func, render_func):
+        if getattr(tab, "_is_loading", False):
+            return
+        tab._is_loading = True
         tab.unbind("<Configure>")
         for child in tab.winfo_children():
             child.destroy()
@@ -1468,6 +1618,22 @@ def gui():
                                 text_color=T.FG, font=font(11), wrap="word")
             tb._x_scrollbar.grid = lambda *a, **k: None
             tb._x_scrollbar.grid_forget()
+            
+            def _tb_check(*_):
+                try:
+                    yv = tb._textbox.yview()
+                    if yv[0] <= 0.0 and yv[1] >= 1.0:
+                        tb._yscrollbar.grid_remove()
+                    else:
+                        tb._yscrollbar.grid()
+                except Exception: pass
+            
+            tb._textbox.bind("<Configure>", _tb_check, add="+")
+            def _poll_tb():
+                if tb.winfo_exists():
+                    _tb_check()
+                    tb.after(500, _poll_tb)
+            tb.after(500, _poll_tb)
 
             widget = tb._textbox
             widget.configure(wrap="word", spacing1=1, spacing2=2,
@@ -1565,13 +1731,19 @@ def gui():
         def work():
             try:
                 data = fetch_func()
-                tab.after(0, lambda: show_data(data))
+                def _done():
+                    tab._is_loading = False
+                    show_data(data)
+                tab.after(0, _done)
             except Exception as e:
                 err_msg = str(e)
                 if "403" in err_msg:
                     err_msg += ("\n(Rate limit reached. Try setting "
                                 "GITHUB_TOKEN environment variable.)")
-                tab.after(0, lambda: show_error(err_msg))
+                def _err():
+                    tab._is_loading = False
+                    show_error(err_msg)
+                tab.after(0, _err)
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -1610,6 +1782,20 @@ def gui():
         tabs.pack(fill="both", expand=True)
         tab_game = tabs.add("Game")
         tab_launcher = tabs.add("Launcher")
+        
+        def _force_refresh(tab_name):
+            from .util import mc_releases, gh_releases
+            from .config import SELF_REPO
+            if tab_name == "Game":
+                load_tab_changelog(tab_game, lambda: mc_releases(ignore_cache=True), render_game_changelog)
+            elif tab_name == "Launcher":
+                load_tab_changelog(tab_launcher, lambda: gh_releases(SELF_REPO, ignore_cache=True), render_launcher_changelog)
+                
+        try:
+            for btn in tabs._segmented_button._buttons_dict.values():
+                btn.bind("<Button-1>", lambda e, b=btn: _force_refresh(b.cget("text")), add="+")
+        except Exception:
+            pass
 
     _build_changelog_view()
 

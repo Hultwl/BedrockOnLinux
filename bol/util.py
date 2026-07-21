@@ -236,11 +236,11 @@ def gh_latest(repo):
     return _fetch_with_fallback(cache_file, f"https://api.github.com/repos/{repo}/releases/latest")
 
 
-def gh_releases(repo, per_page=100, fetch_all=False):
+def gh_releases(repo, per_page=100, fetch_all=False, ignore_cache=False):
     cache_file = f"releases_{repo.replace('/', '_')}_{'all' if fetch_all else per_page}.json"
     cache_path = CACHE / cache_file
     
-    if cache_path.exists():
+    if cache_path.exists() and not ignore_cache:
         try:
             if time.time() - cache_path.stat().st_mtime < 43200:
                 with open(cache_path, "r", encoding="utf-8") as f:
@@ -280,14 +280,14 @@ def gh_releases(repo, per_page=100, fetch_all=False):
     return []
 
 
-def mc_releases(fetch_all=True):
+def mc_releases(fetch_all=True, ignore_cache=False):
     beta = load_settings().get("show_betas", False)
     
     def fetch_section(section):
         cache_file = f"releases_mc_{section}_{'all' if fetch_all else '100'}.json"
         cache_path = CACHE / cache_file
         
-        if cache_path.exists():
+        if cache_path.exists() and not ignore_cache:
             try:
                 if time.time() - cache_path.stat().st_mtime < 43200:
                     with open(cache_path, "r", encoding="utf-8") as f:
