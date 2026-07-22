@@ -533,7 +533,7 @@ def gui():
             try: w._textbox.tag_configure("release_title", foreground=T.r(c_new))
             except Exception: pass
             
-        if w.__class__.__name__ == "Text":
+        if w.__class__.__name__ == "Text" and getattr(w, "_is_logbox", False):
             try:
                 w.configure(bg=T.r(T.CONSOLE_BG), fg=T.r(T.CONSOLE_FG), insertbackground=T.r(T.FG))
             except Exception:
@@ -565,8 +565,17 @@ def gui():
         is_beta = "BETA" in lab
         
         s = load_settings()
+        changed = False
         if s.get("ui_is_beta") != is_beta:
             s["ui_is_beta"] = is_beta
+            changed = True
+            
+        cur_mc_ver = lab.split('  ')[0]
+        if s.get("mc_version") != cur_mc_ver:
+            s["mc_version"] = cur_mc_ver
+            changed = True
+            
+        if changed:
             save_settings(s)
             
         selected_chip.configure(
@@ -583,6 +592,10 @@ def gui():
             pass
 
         _sync_theme(root, is_beta)
+        
+        if ui.get("changelogs_loaded") and tab_game is not None and changelog_view.winfo_ismapped():
+            from .util import mc_releases
+            load_tab_changelog(tab_game, lambda: mc_releases(fetch_all=False), render_game_changelog)
 
     def open_picker():
         if _pick["win"] is not None:
@@ -804,6 +817,7 @@ def gui():
     logbox = tk.Text(detwrap, height=10, bg=T.r(T.CONSOLE_BG), fg=T.r(T.CONSOLE_FG), bd=0,
                       font=(MONO, 10), highlightthickness=0,
                       padx=12, pady=10, insertbackground=T.r(T.FG), wrap="word")
+    logbox._is_logbox = True
 
     def clear_log():
         logbox.delete("1.0", "end")
@@ -1312,6 +1326,18 @@ def gui():
                       progress_color=T.THEME_ACCENT, font=font(13)
                       ).pack(anchor="w", pady=8, padx=4)
 
+        changelog_startup_v = tk.BooleanVar(value=load_settings().get("show_changelog_on_startup", False))
+        
+        def save_changelog_startup():
+            s2 = load_settings()
+            s2["show_changelog_on_startup"] = changelog_startup_v.get()
+            save_settings(s2)
+            
+        ctk.CTkSwitch(tab_general, text="Show changelog on startup",
+                      variable=changelog_startup_v, command=save_changelog_startup,
+                      progress_color=T.THEME_ACCENT, font=font(13)
+                      ).pack(anchor="w", pady=8, padx=4)
+
         beta_v = tk.BooleanVar(value=load_settings().get("show_betas", False))
 
         def save_beta():
@@ -1617,16 +1643,31 @@ def gui():
 
     def render_game_changelog(widget, data, dividers, wrap_width=75):
         from .util import format_display_version
-        articles = data.get("articles", [])[:40]
-        for i, art in enumerate(articles):
+        ui_sel = mc_var.get()
+        ui_wants_beta = "BETA" in ui_sel if ui_sel else False
+        target_version = ui_sel.split('  ')[0].strip() if ui_sel else None
+        target_index = None
+        
+        filtered = []
+        for art in data.get("articles", []):
             title = art.get("title", "Unknown Release")
             if not ("bedrock" in title.lower() or "beta" in title.lower() or "preview" in title.lower()):
                 continue
+            is_beta = "beta" in title.lower() or "preview" in title.lower()
+            if is_beta == ui_wants_beta:
+                filtered.append(art)
+                
+        articles = filtered[:40]
+        for i, art in enumerate(articles):
+            title = art.get("title", "Unknown Release")
             is_beta = "beta" in title.lower() or "preview" in title.lower()
             title = format_display_version(title, is_beta)
             date = (art.get("updated_at") or "").split("T")[0]
             body = art.get("body") or ""
             url = art.get("html_url")
+
+            if target_version and target_version in title and target_index is None:
+                target_index = widget.index("end-1c")
 
             tags = ("release_title", "link", f"url:{url}") if url else ("release_title",)
             widget.insert("end", title + "\n", tags)
@@ -1736,6 +1777,11 @@ def gui():
                 widget.window_create("end", window=div_frame)
                 widget.insert("end", "\n\n", "divider_tag")
                 dividers.append(div_frame)
+
+        if target_index is not None:
+            def _do_scroll():
+                widget.yview(target_index)
+            widget.after(300, _do_scroll)
 
     def load_tab_changelog(tab, fetch_func, render_func):
         if getattr(tab, "_is_loading", False):
@@ -2104,4 +2150,8 @@ def gui():
         do_play()
 
     root.bind("<Return>", on_enter_pressed)
+    
+    if load_settings().get("show_changelog_on_startup", False):
+        toggle_changelog()
+        
     root.mainloop()
