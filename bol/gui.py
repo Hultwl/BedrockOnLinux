@@ -18,7 +18,15 @@ from .auth import (
     msa_signed_in,
     msa_gamertag,
 )
-from .config import LOGS, PRETTY, VERSION
+from .config import (
+    LOGS,
+    PRETTY,
+    VERSION,
+    get_install_location,
+    set_install_location,
+    clear_install_location,
+    default_install_location,
+)
 from .content import _mojang_dir, import_content
 from .games import list_mc_versions
 from .gamesetup import do_setup
@@ -1450,6 +1458,143 @@ def gui():
         gamescope_entry.bind("<KeyRelease>", save_gamescope)
         gamescope_entry.bind("<FocusOut>", save_gamescope)
         gamescope_entry.bind("<Return>", lambda e: "break")
+
+        # ===== Game files location =====
+        ctk.CTkLabel(tab_advanced, text="Game files location",
+                     text_color=T.SUB, font=font(11, "bold"),
+                     anchor="w").pack(anchor="w", pady=(12, 4), padx=4)
+
+        loc_row = ctk.CTkFrame(tab_advanced, fg_color="transparent")
+        loc_row.pack(fill="x", pady=(0, 2), padx=4)
+
+        loc_var = tk.StringVar(value=get_install_location())
+        loc_field = ctk.CTkLabel(
+            loc_row, textvariable=loc_var, text_color=T.FG, font=font(12),
+            fg_color=T.CARD_3, corner_radius=8, anchor="w", height=36)
+        loc_field.pack(side="left", fill="x", expand=True, padx=(0, 8))
+
+        loc_status = tk.StringVar(value="")
+        loc_move_v = tk.BooleanVar(value=True)
+
+        def _relocate_blocked():
+            if ui.get("launch_active"):
+                messagebox.showwarning(
+                    "Minecraft is running",
+                    "Close Minecraft first before changing the game files "
+                    "location.", parent=d)
+                return True
+            if ui.get("busy"):
+                messagebox.showwarning(
+                    "Operation in progress",
+                    "Wait for the current preparation task to finish before "
+                    "changing the game files location.", parent=d)
+                return True
+            if _mc_running():
+                messagebox.showwarning(
+                    "Minecraft is running",
+                    "Close Minecraft first before changing the game files "
+                    "location.", parent=d)
+                return True
+            return False
+
+        def do_browse():
+            if _relocate_blocked():
+                return
+            from tkinter import filedialog, messagebox as mb
+            chosen = filedialog.askdirectory(
+                parent=d, title="Choose a folder for BedrockOnLinux's files",
+                mustexist=False)
+            if not chosen:
+                return
+            old_dir = Path(get_install_location())
+            new_dir = Path(chosen).expanduser()
+            if new_dir == old_dir:
+                return
+            if new_dir.exists() and any(new_dir.iterdir()):
+                mb.showerror(
+                    "Folder not empty",
+                    f"'{new_dir}' already has files in it. Choose an empty "
+                    "or new folder.", parent=d)
+                return
+
+            move_existing = mb.askyesnocancel(
+                "Move existing files?",
+                f"Move everything currently in\n{old_dir}\nto\n{new_dir}\n\n"
+                "Yes: move the existing install (engine, downloaded "
+                "versions, saves, settings) to the new location.\n"
+                "No: leave the old files where they are and start fresh at "
+                "the new location (re-downloads the engine and game).\n"
+                "Cancel: don't change anything.",
+                parent=d)
+            if move_existing is None:
+                return
+
+            loc_status.set("Moving…" if move_existing else "Applying…")
+
+            def work():
+                try:
+                    if move_existing:
+                        new_dir.parent.mkdir(parents=True, exist_ok=True)
+                        if new_dir.exists():
+                            new_dir.rmdir()  # only succeeds if empty
+                        shutil.move(str(old_dir), str(new_dir))
+                    set_install_location(new_dir)
+                    msg = ("Location updated.\n\nRestart BedrockOnLinux for "
+                           "this to take effect.")
+                    ok_flag = True
+                except Exception as e:
+                    msg = f"Couldn't change the location:\n{e}"
+                    ok_flag = False
+
+                def finish():
+                    loc_status.set("")
+                    if ok_flag:
+                        loc_var.set(str(new_dir))
+                        if mb.askyesno("Restart now?",
+                                       msg + "\n\nRestart now?", parent=d):
+                            relaunch_app()
+                    else:
+                        mb.showerror("Game files location", msg, parent=d)
+                d.after(0, finish)
+            threading.Thread(target=work, daemon=True).start()
+
+        def do_reset():
+            if _relocate_blocked():
+                return
+            from tkinter import messagebox as mb
+            if get_install_location() == default_install_location():
+                return
+            if not mb.askyesno(
+                    "Reset location",
+                    "Reset to the default location "
+                    f"({default_install_location()})?\n\nThis only clears "
+                    "the saved preference — it does not move or delete any "
+                    "files. Restart required.", parent=d):
+                return
+            clear_install_location()
+            loc_var.set(default_install_location())
+            if mb.askyesno("Restart now?", "Restart BedrockOnLinux now?",
+                           parent=d):
+                relaunch_app()
+
+        loc_btns = ctk.CTkFrame(loc_row, fg_color="transparent")
+        loc_btns.pack(side="right")
+        mkbtn(loc_btns, "Browse…", do_browse, kind="ghost", width=84,
+              height=36, font=font(12)).pack(side="left", padx=(0, 4))
+        mkbtn(loc_btns, "Reset", do_reset, kind="flat", width=64,
+              height=36, font=font(12)).pack(side="left")
+
+        ctk.CTkLabel(tab_advanced, textvariable=loc_status,
+                     text_color=T.GOLD, font=font(11)
+                     ).pack(anchor="w", pady=(4, 0), padx=4)
+        ctk.CTkLabel(tab_advanced,
+                     text="Moves where the engine, downloaded Minecraft "
+                          "versions, saves and settings are stored — handy "
+                          "if your home drive is low on space. Changing this "
+                          "requires a restart.",
+                     text_color=T.MUTED, font=font(10), anchor="w",
+                     justify="left", wraplength=340
+                     ).pack(anchor="w", pady=(2, 8), padx=4)
         
         # ---- Tools --------------------------------------------------
         imp_status = tk.StringVar(value="")
