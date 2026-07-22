@@ -10,7 +10,6 @@ import sys
 import threading
 import zipfile
 from pathlib import Path
-from PIL import Image, ImageDraw
 
 from .auth import (
     NativeAuth,
