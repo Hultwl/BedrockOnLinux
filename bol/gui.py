@@ -1516,30 +1516,44 @@ def gui():
                     "or new folder.", parent=d)
                 return
 
-            move_existing = mb.askyesnocancel(
-                "Move existing files?",
-                f"Move everything currently in\n{old_dir}\nto\n{new_dir}\n\n"
-                "Yes: move the existing install (engine, downloaded "
-                "versions, saves, settings) to the new location.\n"
-                "No: leave the old files where they are and start fresh at "
-                "the new location (re-downloads the engine and game).\n"
-                "Cancel: don't change anything.",
-                parent=d)
-            if move_existing is None:
+            # ===== WARNING: Fresh install – nothing moves =====
+            warning_msg = (
+                f"⚠️  WARNING: FRESH INSTALL\n\n"
+                f"You are about to change the game files location to:\n"
+                f"  {new_dir}\n\n"
+                f"Your current game files are at:\n"
+                f"  {old_dir}\n\n"
+                f"🔴 NOTHING WILL BE MOVED OR COPIED.\n\n"
+                f"This means:\n"
+                f"  • Your worlds, saves, and settings will stay in the old location\n"
+                f"  • The new location will start completely empty\n"
+                f"  • The launcher will re-download the entire engine and game\n"
+                f"  • You will need to sign in to Xbox Live again\n\n"
+                f"💡 RECOMMENDED: Back up your worlds manually before proceeding.\n"
+                f"   Your worlds are stored in:\n"
+                f"   {old_dir / 'pfx/drive_c/users' / os.getlogin() / 'AppData/Roaming/Minecraft/worlds'}\n\n"
+                f"Proceed with fresh install?"
+            )
+
+            if not mb.askyesno(
+                    "⚠️ Warning – Fresh Install",
+                    warning_msg,
+                    parent=d,
+                    icon='warning'
+            ):
                 return
 
-            loc_status.set("Moving…" if move_existing else "Applying…")
+            loc_status.set("Applying new location…")
 
             def work():
                 try:
-                    if move_existing:
-                        new_dir.parent.mkdir(parents=True, exist_ok=True)
-                        if new_dir.exists():
-                            new_dir.rmdir()  # only succeeds if empty
-                        shutil.move(str(old_dir), str(new_dir))
                     set_install_location(new_dir)
-                    msg = ("Location updated.\n\nRestart BedrockOnLinux for "
-                           "this to take effect.")
+                    msg = (
+                        "Location updated.\n\n"
+                        "Restart BedrockOnLinux for this to take effect.\n\n"
+                        "The engine and game will be re-downloaded into the new location.\n"
+                        "Your old files remain at the old location – you can delete them manually later."
+                    )
                     ok_flag = True
                 except Exception as e:
                     msg = f"Couldn't change the location:\n{e}"
@@ -1556,7 +1570,7 @@ def gui():
                         mb.showerror("Game files location", msg, parent=d)
                 d.after(0, finish)
             threading.Thread(target=work, daemon=True).start()
-
+            
         def do_reset():
             if _relocate_blocked():
                 return
