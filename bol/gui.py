@@ -1637,7 +1637,7 @@ def gui():
                 f"✅ Your worlds, saves, settings, and login tokens will be **moved** to the new location.\n\n"
                 f"⚠️ The game engine will be **re‑downloaded** to ensure compatibility with the current launcher version.\n\n"
                 f"💡 This preserves your progress and prevents hash‑mismatch errors.\n\n"
-                f"Proceed with relocation?"
+                "Proceed with relocation?"
             )
 
             if not mb.askyesno("Confirm Relocation", warning_msg, parent=d, icon='info'):
