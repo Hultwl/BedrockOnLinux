@@ -1541,15 +1541,55 @@ def gui():
                     ):
                         return
 
+            # ===== Define which subdirectories are user data (preserve these) =====
+            preserve_dirs = ["games", "pfx", "content", "msa"]
+
+            # ===== Calculate total size of directories to move =====
+            total_size = 0
+            for sub in preserve_dirs:
+                src = old_dir / sub
+                if src.exists():
+                    for f in src.rglob('*'):
+                        if f.is_file():
+                            total_size += f.stat().st_size
+
+            # ===== Check free space on new location =====
+            # If new_dir doesn't exist yet, use its parent to check free space
+            new_path = new_dir if new_dir.exists() else new_dir.parent
+            try:
+                free_space = shutil.disk_usage(new_path).free
+            except Exception as e:
+                mb.showerror(
+                    "Could not check free space",
+                    f"Unable to determine free space on {new_path}:\n{e}",
+                    parent=d
+                )
+                return
+
+            if total_size > free_space:
+                # Helper to format bytes human-readably
+                def fmt_size(bytes_val):
+                    for unit in ['B', 'KB', 'MB', 'GB']:
+                        if bytes_val < 1024.0:
+                            return f"{bytes_val:.1f} {unit}"
+                        bytes_val /= 1024.0
+                    return f"{bytes_val:.1f} TB"
+
+                mb.showerror(
+                    "Not enough free space",
+                    f"The new location has {fmt_size(free_space)} free, "
+                    f"but you need {fmt_size(total_size)} to move your user data.\n\n"
+                    "Please free up space or choose a different location.",
+                    parent=d
+                )
+                return
+
             loc_status.set("Moving user data…")
 
             def work():
                 try:
                     # Create the new directory if it doesn't exist
                     new_dir.mkdir(parents=True, exist_ok=True)
-
-                    # Define which subdirectories are user data (preserve these)
-                    preserve_dirs = ["games", "pfx", "content", "msa"]
 
                     for sub in preserve_dirs:
                         src = old_dir / sub
