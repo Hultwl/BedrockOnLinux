@@ -1509,54 +1509,71 @@ def gui():
             new_dir = Path(chosen).expanduser()
             if new_dir == old_dir:
                 return
-            if new_dir.exists() and any(new_dir.iterdir()):
-                mb.showerror(
-                    "Folder not empty",
-                    f"'{new_dir}' already has files in it. Choose an empty "
-                    "or new folder.", parent=d)
-                return
 
-            # ===== WARNING: Fresh install – nothing moves =====
+            # ===== WARNING + EXPLANATION =====
             warning_msg = (
-                f"⚠️  WARNING: FRESH INSTALL\n\n"
-                f"You are about to change the game files location to:\n"
-                f"  {new_dir}\n\n"
-                f"Your current game files are at:\n"
-                f"  {old_dir}\n\n"
-                f"🔴 NOTHING WILL BE MOVED OR COPIED.\n\n"
-                f"This means:\n"
-                f"  • Your worlds, saves, and settings will stay in the old location\n"
-                f"  • The new location will start completely empty\n"
-                f"  • The launcher will re-download the entire engine and game\n"
-                f"  • You will need to sign in to Xbox Live again\n\n"
-                f"💡 RECOMMENDED: Back up your worlds manually before proceeding.\n"
-                f"   Your worlds are stored in:\n"
-                f"   {old_dir / 'pfx/drive_c/users' / os.getlogin() / 'AppData/Roaming/Minecraft/worlds'}\n\n"
-                f"Proceed with fresh install?"
+                f"🔧 Game Location Change\n\n"
+                f"Current location: {old_dir}\n"
+                f"New location:     {new_dir}\n\n"
+                f"✅ Your worlds, saves, settings, and login tokens will be **moved** to the new location.\n\n"
+                f"⚠️ The game engine will be **re‑downloaded** to ensure compatibility with the current launcher version.\n\n"
+                f"💡 This preserves your progress and prevents hash‑mismatch errors.\n\n"
+                f"Proceed with relocation?"
             )
 
-            if not mb.askyesno(
-                    "⚠️ Warning – Fresh Install",
-                    warning_msg,
-                    parent=d,
-                    icon='warning'
-            ):
+            if not mb.askyesno("Confirm Relocation", warning_msg, parent=d, icon='info'):
                 return
 
-            loc_status.set("Applying new location…")
+            # ===== Check if new location already has data =====
+            if new_dir.exists() and any(new_dir.iterdir()):
+                overlap = False
+                for subdir in ["games", "pfx", "content", "msa"]:
+                    if (new_dir / subdir).exists():
+                        overlap = True
+                        break
+                if overlap:
+                    if not mb.askyesno(
+                        "Existing data detected",
+                        f"The new location already contains some user data folders.\n\n"
+                        f"Overwriting may cause conflicts. Do you want to continue and overwrite?",
+                        parent=d,
+                        icon='warning'
+                    ):
+                        return
+
+            loc_status.set("Moving user data…")
 
             def work():
                 try:
+                    # Create the new directory if it doesn't exist
+                    new_dir.mkdir(parents=True, exist_ok=True)
+
+                    # Define which subdirectories are user data (preserve these)
+                    preserve_dirs = ["games", "pfx", "content", "msa"]
+
+                    for sub in preserve_dirs:
+                        src = old_dir / sub
+                        dst = new_dir / sub
+                        if src.exists():
+                            # If dst exists, remove it first (to avoid conflicts)
+                            if dst.exists():
+                                shutil.rmtree(dst, ignore_errors=True)
+                            # Move the directory
+                            shutil.move(str(src), str(dst))
+
+                    # Update the location pointer
                     set_install_location(new_dir)
+
                     msg = (
-                        "Location updated.\n\n"
-                        "Restart BedrockOnLinux for this to take effect.\n\n"
-                        "The engine and game will be re-downloaded into the new location.\n"
-                        "Your old files remain at the old location – you can delete them manually later."
+                        "✅ User data moved successfully.\n\n"
+                        "The game engine will be re‑downloaded on the next start.\n"
+                        "Your worlds, settings, and login are preserved.\n\n"
+                        "Restart BedrockOnLinux for the changes to take effect."
                     )
                     ok_flag = True
+
                 except Exception as e:
-                    msg = f"Couldn't change the location:\n{e}"
+                    msg = f"❌ Could not relocate user data:\n{e}"
                     ok_flag = False
 
                 def finish():
@@ -1567,7 +1584,7 @@ def gui():
                                        msg + "\n\nRestart now?", parent=d):
                             relaunch_app()
                     else:
-                        mb.showerror("Game files location", msg, parent=d)
+                        mb.showerror("Relocation Error", msg, parent=d)
                 d.after(0, finish)
             threading.Thread(target=work, daemon=True).start()
             
