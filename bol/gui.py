@@ -1459,18 +1459,99 @@ def gui():
         gamescope_entry.bind("<Return>", lambda e: "break")
 
         # ===== Game files location =====
+        def fmt_size(bytes_val):
+            for unit in ['B', 'KB', 'MB', 'GB']:
+                if bytes_val < 1024.0:
+                    return f"{bytes_val:.1f} {unit}"
+                bytes_val /= 1024.0
+            return f"{bytes_val:.1f} TB"
+
         ctk.CTkLabel(tab_advanced, text="Game files location",
                      text_color=T.SUB, font=font(11, "bold"),
-                     anchor="w").pack(anchor="w", pady=(12, 4), padx=4)
+                     anchor="w").pack(anchor="w", pady=(12, 2), padx=4)
 
-        loc_row = ctk.CTkFrame(tab_advanced, fg_color="transparent")
-        loc_row.pack(fill="x", pady=(0, 2), padx=4)
+        ctk.CTkLabel(tab_advanced,
+                     text="Moves where the engine, downloaded Minecraft "
+                          "versions, saves and settings are stored — handy "
+                          "if your home drive is low on space. Changing this "
+                          "requires a restart.",
+                     text_color=T.MUTED, font=font(10), anchor="w",
+                     justify="left", wraplength=340
+                     ).pack(anchor="w", pady=(0, 6), padx=4)
 
         loc_var = tk.StringVar(value=get_install_location())
+
+        # --- Path row (simple, flat) ---
+        path_row = ctk.CTkFrame(tab_advanced, fg_color="transparent")
+        path_row.pack(fill="x", padx=4, pady=(0, 2))
+
         loc_field = ctk.CTkLabel(
-            loc_row, textvariable=loc_var, text_color=T.FG, font=font(12),
-            fg_color=T.CARD_3, corner_radius=8, anchor="w", height=36)
-        loc_field.pack(side="left", fill="x", expand=True, padx=(0, 8))
+            path_row,
+            textvariable=loc_var,
+            text_color=T.FG,
+            font=font(12, family="monospace"),
+            fg_color=T.CARD_3,
+            corner_radius=8,
+            anchor="w",
+            height=36,
+            padx=12,
+        )
+        loc_field.pack(side="left", fill="x", expand=True, padx=(0, 4))
+        loc_tip = Tooltip(loc_field, "Full path")  # will update dynamically
+
+        # --- Copy button ---
+        def _copy_path():
+            root.clipboard_clear()
+            root.clipboard_append(loc_var.get())
+            copy_btn.configure(text="✓")
+            root.after(1400, lambda: copy_btn.configure(text="⧉"))
+
+        copy_btn = mkbtn(path_row, "⧉", _copy_path, kind="flat",
+                         width=28, height=28, font=font(14))
+        copy_btn.pack(side="right", padx=(0, 2))
+        Tooltip(copy_btn, "Copy path")
+
+        # --- Open button ---
+        def _open_folder():
+            try:
+                subprocess.Popen(["xdg-open", loc_var.get()],
+                                  stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL)
+            except Exception:
+                pass
+
+        open_btn = mkbtn(path_row, "⤢", _open_folder, kind="flat",
+                         width=28, height=28, font=font(14))
+        open_btn.pack(side="right", padx=(0, 2))
+        Tooltip(open_btn, "Open in file manager")
+
+        # --- Free space display (below) ---
+        loc_free_var = tk.StringVar(value="")
+        free_lbl = ctk.CTkLabel(tab_advanced, textvariable=loc_free_var,
+                                text_color=T.MUTED, font=font(10), anchor="w")
+        free_lbl.pack(anchor="w", padx=4, pady=(2, 6))
+
+        def _refresh_free_space():
+            try:
+                p = Path(loc_var.get())
+                check_p = p if p.exists() else p.parent
+                loc_free_var.set(
+                    f"{fmt_size(shutil.disk_usage(check_p).free)} free "
+                    "on this drive")
+                loc_tip.text = loc_var.get()   # update tooltip
+            except Exception:
+                loc_free_var.set("")
+
+        def _update_loc_display():
+            # No truncation – show full path
+            # If path is very long, the label will wrap or scroll; that's fine.
+            _refresh_free_space()
+
+        _refresh_free_space()
+
+        # --- Buttons row (Browse / Reset) ---
+        loc_row = ctk.CTkFrame(tab_advanced, fg_color="transparent")
+        loc_row.pack(fill="x", pady=(4, 2), padx=4)
 
         loc_status = tk.StringVar(value="")
         loc_move_v = tk.BooleanVar(value=True)
@@ -1554,7 +1635,6 @@ def gui():
                             total_size += f.stat().st_size
 
             # ===== Check free space on new location =====
-            # If new_dir doesn't exist yet, use its parent to check free space
             new_path = new_dir if new_dir.exists() else new_dir.parent
             try:
                 free_space = shutil.disk_usage(new_path).free
@@ -1567,14 +1647,6 @@ def gui():
                 return
 
             if total_size > free_space:
-                # Helper to format bytes human-readably
-                def fmt_size(bytes_val):
-                    for unit in ['B', 'KB', 'MB', 'GB']:
-                        if bytes_val < 1024.0:
-                            return f"{bytes_val:.1f} {unit}"
-                        bytes_val /= 1024.0
-                    return f"{bytes_val:.1f} TB"
-
                 mb.showerror(
                     "Not enough free space",
                     f"The new location has {fmt_size(free_space)} free, "
@@ -1588,20 +1660,16 @@ def gui():
 
             def work():
                 try:
-                    # Create the new directory if it doesn't exist
                     new_dir.mkdir(parents=True, exist_ok=True)
 
                     for sub in preserve_dirs:
                         src = old_dir / sub
                         dst = new_dir / sub
                         if src.exists():
-                            # If dst exists, remove it first (to avoid conflicts)
                             if dst.exists():
                                 shutil.rmtree(dst, ignore_errors=True)
-                            # Move the directory
                             shutil.move(str(src), str(dst))
 
-                    # Update the location pointer
                     set_install_location(new_dir)
 
                     msg = (
@@ -1620,6 +1688,7 @@ def gui():
                     loc_status.set("")
                     if ok_flag:
                         loc_var.set(str(new_dir))
+                        _update_loc_display()
                         if mb.askyesno("Restart now?",
                                        msg + "\n\nRestart now?", parent=d):
                             relaunch_app()
@@ -1643,6 +1712,7 @@ def gui():
                 return
             clear_install_location()
             loc_var.set(default_install_location())
+            _update_loc_display()
             if mb.askyesno("Restart now?", "Restart BedrockOnLinux now?",
                            parent=d):
                 relaunch_app()
@@ -1656,15 +1726,7 @@ def gui():
 
         ctk.CTkLabel(tab_advanced, textvariable=loc_status,
                      text_color=T.GOLD, font=font(11)
-                     ).pack(anchor="w", pady=(4, 0), padx=4)
-        ctk.CTkLabel(tab_advanced,
-                     text="Moves where the engine, downloaded Minecraft "
-                          "versions, saves and settings are stored — handy "
-                          "if your home drive is low on space. Changing this "
-                          "requires a restart.",
-                     text_color=T.MUTED, font=font(10), anchor="w",
-                     justify="left", wraplength=340
-                     ).pack(anchor="w", pady=(2, 8), padx=4)
+                     ).pack(anchor="w", pady=(4, 8), padx=4)
         
         # ---- Tools --------------------------------------------------
         imp_status = tk.StringVar(value="")
