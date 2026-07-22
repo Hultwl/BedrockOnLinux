@@ -308,17 +308,22 @@ def gui():
         def _show(self):
             if self.win is not None:
                 return
-            self.win = ctk.CTkToplevel(root)
-            self.win.overrideredirect(True)
-            self.win.attributes("-topmost", True)
-            x = self.widget.winfo_rootx() + self.widget.winfo_width() // 2
-            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 8
-            lab = ctk.CTkLabel(self.win, text=self.text, fg_color=T.CARD_3, text_color=T.FG,
+            widget_y = self.widget.winfo_rooty() - root.winfo_rooty()
+            x = self.widget.winfo_rootx() - root.winfo_rootx() + self.widget.winfo_width() // 2
+            
+            if widget_y > root.winfo_height() // 2:
+                y = widget_y - 8
+                anchor = "s"
+            else:
+                y = widget_y + self.widget.winfo_height() + 8
+                anchor = "n"
+            
+            self.win = ctk.CTkFrame(root, fg_color=T.CARD_3, corner_radius=6)
+            lab = ctk.CTkLabel(self.win, text=self.text, fg_color="transparent", text_color=T.FG,
                                font=font(10))
             lab.pack(padx=8, pady=4)
-            self.win.update_idletasks()
-            self.win.geometry(
-                f"+{x - self.win.winfo_width() // 2}+{y}")
+            self.win.place(x=x, y=y, anchor=anchor)
+            self.win.lift()
 
         def _hide(self, _e=None):
             if self._job:
@@ -392,6 +397,9 @@ def gui():
     acct_btn = mkbtn(acct, "Sign in", lambda: acct_click(), kind="ghost",
                       width=88, height=30, font=font(12, "bold"))
     acct_btn.pack(side="left", padx=(0, 8), pady=8)
+    
+    acct_txt_lbl._tooltip = Tooltip(acct_txt_lbl, "")
+    acct_btn._tooltip = Tooltip(acct_btn, "")
 
     # ==================================================================
     # View area
@@ -588,6 +596,13 @@ def gui():
             active = _pick.get("hover") or _pick.get("win")
             ver_lbl.configure(text_color=T.THEME_ACCENT if active else T.FG)
             ver_arrow.configure(text_color=T.SUB)
+        except Exception:
+            pass
+            
+        try:
+            if hasattr(play_btn, "_tooltip"):
+                is_kill = "Kill" in play_btn._tooltip.text
+                play_btn._tooltip.text = f"{'Kill' if is_kill else 'Play'} {cur_mc_ver}"
         except Exception:
             pass
 
@@ -802,7 +817,7 @@ def gui():
     det_btn = mkbtn(hbox, "Details", lambda: toggle_details(), kind="ghost",
                      width=70, height=52, corner_radius=12, font=font(16))
     det_btn.pack(side="right", padx=(0, 8))
-    Tooltip(det_btn, "Details")
+    Tooltip(det_btn, "Show Activity Logs")
 
     # ==================================================================
     # Details / log panel
@@ -956,11 +971,14 @@ def gui():
     # Account
     # ==================================================================
     def acct_state(ph):
+        gt = msa_gamertag() or "Xbox Live"
         if ph == "in":
             acct_dot.configure(text_color=T.GREEN)
             acct_txt_lbl.configure(cursor="", text_color=T.FG)
             acct_txt.set("Signed in")
+            acct_txt_lbl._tooltip.text = f"Signed in as {gt}"
             acct_btn.configure(text="Sign out", fg_color=T.CARD_2, hover_color=T.CARD_3, text_color=T.FG)
+            acct_btn._tooltip.text = f"Sign out of {gt}"
             acct_btn._mode = "out"
             acct_btn._confirm_out = False
             acct_btn._confirm_cancel = False
@@ -968,7 +986,9 @@ def gui():
             acct_txt_lbl.configure(cursor="", text_color=T.FG)
             acct_dot.configure(text_color=T.GOLD)
             acct_txt.set("Sign-in pending…")
+            acct_txt_lbl._tooltip.text = "Sign-in pending"
             acct_btn.configure(text="Cancel", fg_color=T.CARD_2, hover_color=T.CARD_3, text_color=T.FG)
+            acct_btn._tooltip.text = "Cancel sign-in"
             acct_btn._mode = "cancel"
             acct_btn._confirm_out = False
             acct_btn._confirm_cancel = False
@@ -976,7 +996,9 @@ def gui():
             acct_txt_lbl.configure(cursor="", text_color=T.FG)
             acct_dot.configure(text_color=T.SUB)
             acct_txt.set("Not signed in")
+            acct_txt_lbl._tooltip.text = "Not signed in"
             acct_btn.configure(text="Sign in", fg_color=T.CARD_2, hover_color=T.CARD_3, text_color=T.FG)
+            acct_btn._tooltip.text = "Sign in to Microsoft"
             acct_btn._mode = "in"
             acct_btn._confirm_out = False
             acct_btn._confirm_cancel = False
@@ -998,7 +1020,9 @@ def gui():
                 acct_state("out")
             else:
                 acct_btn._confirm_out = True
+                gt = msa_gamertag() or "Xbox Live"
                 acct_btn.configure(text="Sign out?", fg_color=T.RED, hover_color=T.RED_HOV, text_color="white")
+                acct_btn._tooltip.text = f"Sign out of {gt}?"
         elif mode == "cancel":
             if getattr(acct_btn, "_confirm_cancel", False):
                 na.stop()
@@ -1022,6 +1046,8 @@ def gui():
             if cp != bp and not cp.startswith(bp + "."):
                 acct_btn._confirm_out = False
                 acct_btn.configure(text="Sign out", fg_color=T.CARD_2, hover_color=T.CARD_3, text_color=T.FG)
+                gt = msa_gamertag() or "Xbox Live"
+                acct_btn._tooltip.text = f"Sign out of {gt}"
         if getattr(acct_btn, "_confirm_cancel", False):
             if cp != bp and not cp.startswith(bp + "."):
                 acct_btn._confirm_cancel = False
@@ -1202,7 +1228,8 @@ def gui():
                     command=lambda: kill_wine()
                 )
                 if hasattr(play_btn, "_tooltip"):
-                    play_btn._tooltip.text = "Kill Game"
+                    cur_ver = mc_var.get().split('  ')[0].strip() if mc_var.get() else "Game"
+                    play_btn._tooltip.text = f"Kill {cur_ver}"
             else:
                 play_btn._img_norm = _create_play_icon(16, T.FG, T.THEME_ACCENT)
                 play_btn.configure(
@@ -1214,7 +1241,8 @@ def gui():
                     command=lambda: do_play()
                 )
                 if hasattr(play_btn, "_tooltip"):
-                    play_btn._tooltip.text = "Play Game"
+                    cur_ver = mc_var.get().split('  ')[0].strip() if mc_var.get() else "Game"
+                    play_btn._tooltip.text = f"Play {cur_ver}"
 
     def do_play():
         if ui["busy"]:
