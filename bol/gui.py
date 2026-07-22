@@ -1554,7 +1554,6 @@ def gui():
         loc_row.pack(fill="x", pady=(4, 2), padx=4)
 
         loc_status = tk.StringVar(value="")
-        loc_move_v = tk.BooleanVar(value=True)
 
         def _relocate_blocked():
             if ui.get("launch_active"):
@@ -1653,8 +1652,8 @@ def gui():
                 if overlap:
                     if not mb.askyesno(
                         "Existing data detected",
-                        f"The new location already contains some user data folders.\n\n"
-                        f"Overwriting may cause conflicts. Do you want to continue and overwrite?",
+                        "The new location already contains some user data folders.\n\n"
+                        "Overwriting may cause conflicts. Do you want to continue and overwrite?",
                         parent=d,
                         icon='warning'
                     ):
