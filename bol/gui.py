@@ -768,7 +768,7 @@ def gui():
     hbox = ctk.CTkFrame(rbox, fg_color="transparent")
     hbox.pack(fill="x")
 
-    play_btn = mkbtn(hbox, "  Play", lambda: do_play(), kind="play",
+    play_btn = mkbtn(hbox, "  PLAY", lambda: do_play(), kind="play",
                       width=110, height=52, corner_radius=12,
                       font=font(16, "bold"), text_color=T.FG)
     play_btn.configure(anchor="center")
@@ -1170,7 +1170,7 @@ def gui():
             return None
 
     # ==================================================================
-    # Play
+    # Play & Kill
     # ==================================================================
     def busy(on):
         ui["busy"] = on
@@ -1180,7 +1180,7 @@ def gui():
             if on:
                 play_btn._img_norm = _create_kill_icon(16, T.FG, T.RED)
                 play_btn.configure(
-                    text="  Kill",
+                    text="  KILL",
                     image=play_btn._img_norm,
                     fg_color=T.RED,
                     hover_color=T.RED,
@@ -1192,7 +1192,7 @@ def gui():
             else:
                 play_btn._img_norm = _create_play_icon(16, T.FG, T.THEME_ACCENT)
                 play_btn.configure(
-                    text="  Play",
+                    text="  PLAY",
                     image=play_btn._img_norm,
                     fg_color=T.THEME_ACCENT,
                     hover_color=T.THEME_ACCENT,
