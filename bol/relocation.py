@@ -8,7 +8,6 @@ directly by tests: the GUI's "Game files location" feature (Settings ->
 Advanced) is a thin wrapper that collects a target directory from the
 user and calls migrate_data() on a background thread.
 """
-
 import json
 import shutil
 from pathlib import Path
@@ -41,7 +40,6 @@ def paths_overlap(old_dir: Path, new_dir: Path) -> bool:
     old_r = old_dir.resolve()
     # new_dir may not exist yet -- resolve() still normalizes safely.
     new_r = new_dir.resolve()
-
     if old_r == new_r:
         return True
     try:
@@ -73,8 +71,14 @@ def _move_item(src_path: Path, dst_path: Path, moved_items: list) -> None:
             else:
                 backup.unlink()
         shutil.move(str(dst_path), str(backup))
-    shutil.move(str(src_path), str(dst_path))
+    # Record *before* attempting the source move: if the backup above
+    # succeeded but the move below throws partway through (e.g. a
+    # cross-filesystem move that dies mid-copy), rollback still needs
+    # to know a backup exists at dst_path.name + ".old" so it can be
+    # restored. Recording only after both steps succeed would leave
+    # that backup permanently stranded on failure.
     moved_items.append((src_path, dst_path, backup))
+    shutil.move(str(src_path), str(dst_path))
 
 
 def _rollback(moved_items: list) -> None:
@@ -128,24 +132,37 @@ def _rewrite_game_dir(new_dir: Path, old_games_dir: Path) -> None:
         log.warn(f"Could not update game_dir in settings.json: {e}")
 
 
-def _recreate_content_symlink(old_content_target, new_dir: Path) -> None:
+def _recreate_content_symlink(old_content_target, old_dir: Path, new_dir: Path) -> None:
     """If "content" was a symlink (not a real directory) before the
-    move, recreate it at the new location pointing at the same target.
+    move, recreate it at the new location.
 
-    This must be captured *before* content is moved -- once the link
-    itself has been relocated by _move_item, there's nothing left at
-    the old path to inspect.
+    If the original target lived *inside* old_dir (e.g.
+    content -> games/<version>/resource_packs), it's re-anchored under
+    new_dir -- otherwise it would keep pointing at a path that no
+    longer exists once games/ has moved. If the target was external to
+    old_dir (e.g. content imported from a separate drive), it's left
+    unchanged since it never moved.
+
+    old_content_target must be captured *before* anything is moved --
+    once the link itself has been relocated by _move_item, there's
+    nothing left at the old path to inspect.
     """
     if old_content_target is None:
         return
     new_content = new_dir / "content"
+    target = old_content_target
+    try:
+        rel = target.relative_to(old_dir.resolve())
+        target = new_dir.resolve() / rel
+    except ValueError:
+        pass  # target isn't under old_dir -- leave it as-is
     try:
         if new_content.is_symlink() or new_content.exists():
             if new_content.is_dir() and not new_content.is_symlink():
                 shutil.rmtree(new_content)
             else:
                 new_content.unlink()
-        new_content.symlink_to(old_content_target)
+        new_content.symlink_to(target)
     except OSError as e:
         log.warn(f"Could not recreate content symlink: {e}")
 
@@ -161,7 +178,6 @@ def migrate_data(old_dir, new_dir) -> None:
     """
     old_dir = Path(old_dir)
     new_dir = Path(new_dir)
-
     if paths_overlap(old_dir, new_dir):
         raise RelocationError(
             "The new location overlaps with the current location.")
@@ -178,15 +194,12 @@ def migrate_data(old_dir, new_dir) -> None:
 
         for sub in DIRS_TO_MOVE:
             _move_item(old_dir / sub, new_dir / sub, moved_items)
-
         for fname in FILES_TO_MOVE:
             _move_item(old_dir / fname, new_dir / fname, moved_items)
 
-        _recreate_content_symlink(content_target, new_dir)
+        _recreate_content_symlink(content_target, old_dir, new_dir)
         _rewrite_game_dir(new_dir, old_games_dir)
-
         set_install_location(new_dir)
-
     except Exception as e:
         _rollback(moved_items)
         try:
