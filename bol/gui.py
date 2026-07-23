@@ -1579,7 +1579,7 @@ def gui():
                 return
             from tkinter import messagebox as mb
 
-            # Try Zenity first (modern GTK dialog), fallback to Tkinter
+            # Try Zenity first (modern GTK dialog)
             chosen = None
             try:
                 result = subprocess.run(
@@ -1589,10 +1589,18 @@ def gui():
                 )
                 if result.returncode == 0 and result.stdout.strip():
                     chosen = result.stdout.strip()
-            except (FileNotFoundError, subprocess.SubprocessError):
-                pass
-
-            if not chosen:
+                else:
+                    # User cancelled or error – just return
+                    return
+            except FileNotFoundError:
+                # Zenity not installed – fallback to Tkinter
+                from tkinter import filedialog
+                chosen = filedialog.askdirectory(
+                    parent=d, title="Choose a folder for BedrockOnLinux's files",
+                    mustexist=False
+                )
+            except subprocess.SubprocessError:
+                # Other subprocess error – fallback to Tkinter
                 from tkinter import filedialog
                 chosen = filedialog.askdirectory(
                     parent=d, title="Choose a folder for BedrockOnLinux's files",
