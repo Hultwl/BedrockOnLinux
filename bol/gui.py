@@ -1578,12 +1578,31 @@ def gui():
         def do_browse():
             if _relocate_blocked():
                 return
-            from tkinter import filedialog, messagebox as mb
-            chosen = filedialog.askdirectory(
-                parent=d, title="Choose a folder for BedrockOnLinux's files",
-                mustexist=False)
+            from tkinter import messagebox as mb
+
+            # Try Zenity first (modern GTK dialog), fallback to Tkinter
+            chosen = None
+            try:
+                result = subprocess.run(
+                    ["zenity", "--file-selection", "--directory",
+                     "--title=Choose a folder for BedrockOnLinux's files"],
+                    capture_output=True, text=True, check=False
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    chosen = result.stdout.strip()
+            except (FileNotFoundError, subprocess.SubprocessError):
+                pass
+
+            if not chosen:
+                from tkinter import filedialog
+                chosen = filedialog.askdirectory(
+                    parent=d, title="Choose a folder for BedrockOnLinux's files",
+                    mustexist=False
+                )
+
             if not chosen:
                 return
+                
             old_dir = Path(get_install_location())
             new_dir = Path(chosen).expanduser()
             if new_dir == old_dir:
