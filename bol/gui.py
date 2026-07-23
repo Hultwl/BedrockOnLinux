@@ -17,7 +17,22 @@ from .auth import (
     msa_signed_in,
     msa_gamertag,
 )
-from .config import LOGS, PRETTY, VERSION
+from .config import (
+    LOGS,
+    PRETTY,
+    VERSION,
+    get_install_location,
+    clear_install_location,
+    default_install_location,
+    is_relocation_allowed,
+)
+from .relocation import (
+    migrate_data,
+    paths_overlap,
+    RelocationError,
+    DIRS_TO_MOVE,
+    FILES_TO_MOVE,
+)
 from .content import _mojang_dir, import_content
 from .games import list_mc_versions
 from .gamesetup import do_setup
@@ -1446,6 +1461,349 @@ def gui():
         gamescope_entry.bind("<KeyRelease>", save_gamescope)
         gamescope_entry.bind("<FocusOut>", save_gamescope)
         gamescope_entry.bind("<Return>", lambda e: "break")
+
+        # ===== Game files location =====
+        def fmt_size(bytes_val):
+            for unit in ['B', 'KB', 'MB', 'GB']:
+                if bytes_val < 1024.0:
+                    return f"{bytes_val:.1f} {unit}"
+                bytes_val /= 1024.0
+            return f"{bytes_val:.1f} TB"
+
+        ctk.CTkLabel(tab_advanced, text="Game files location",
+                     text_color=T.SUB, font=font(11, "bold"),
+                     anchor="w").pack(anchor="w", pady=(12, 2), padx=4)
+
+        ctk.CTkLabel(tab_advanced,
+                     text="Moves where the engine, downloaded Minecraft "
+                          "versions, saves and settings are stored — handy "
+                          "if your home drive is low on space. Changing this "
+                          "requires a restart.",
+                     text_color=T.MUTED, font=font(10), anchor="w",
+                     justify="left", wraplength=340
+                     ).pack(anchor="w", pady=(0, 6), padx=4)
+
+        loc_var = tk.StringVar(value=get_install_location())
+
+        # --- Path row (simple, flat) ---
+        path_row = ctk.CTkFrame(tab_advanced, fg_color="transparent")
+        path_row.pack(fill="x", padx=4, pady=(0, 2))
+
+        loc_field = ctk.CTkLabel(
+            path_row,
+            textvariable=loc_var,
+            text_color=T.FG,
+            font=font(12, family="monospace"),
+            fg_color=T.CARD_3,
+            corner_radius=8,
+            anchor="w",
+            height=36,
+            padx=12,
+        )
+        loc_field.pack(side="left", fill="x", expand=True, padx=(0, 4))
+        loc_tip = Tooltip(loc_field, "Full path")
+
+        # --- Copy button ---
+        def _copy_path():
+            root.clipboard_clear()
+            root.clipboard_append(loc_var.get())
+            copy_btn.configure(text="✓")
+            root.after(1400, lambda: copy_btn.configure(text="⧉"))
+
+        copy_btn = mkbtn(path_row, "⧉", _copy_path, kind="flat",
+                         width=28, height=28, font=font(14))
+        copy_btn.pack(side="right", padx=(0, 2))
+        Tooltip(copy_btn, "Copy path")
+
+        # --- Open button ---
+        def _open_folder():
+            try:
+                subprocess.Popen(["xdg-open", loc_var.get()],
+                                  stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL)
+            except Exception:
+                pass
+
+        open_btn = mkbtn(path_row, "⤢", _open_folder, kind="flat",
+                         width=28, height=28, font=font(14))
+        open_btn.pack(side="right", padx=(0, 2))
+        Tooltip(open_btn, "Open in file manager")
+
+        # --- Free space display (below) ---
+        loc_free_var = tk.StringVar(value="")
+        free_lbl = ctk.CTkLabel(tab_advanced, textvariable=loc_free_var,
+                                text_color=T.MUTED, font=font(10), anchor="w")
+        free_lbl.pack(anchor="w", padx=4, pady=(2, 6))
+
+        def _refresh_free_space():
+            try:
+                p = Path(loc_var.get())
+                check_p = p if p.exists() else p.parent
+                loc_free_var.set(
+                    f"{fmt_size(shutil.disk_usage(check_p).free)} free "
+                    "on this drive")
+                loc_tip.text = loc_var.get()
+            except Exception:
+                loc_free_var.set("")
+
+        def _update_loc_display():
+            _refresh_free_space()
+
+        _refresh_free_space()
+
+        # --- Buttons row (Browse / Reset) ---
+        loc_row = ctk.CTkFrame(tab_advanced, fg_color="transparent")
+        loc_row.pack(fill="x", pady=(4, 2), padx=4)
+
+        loc_status = tk.StringVar(value="")
+
+        def _relocate_blocked():
+            if ui.get("launch_active"):
+                messagebox.showwarning(
+                    "Minecraft is running",
+                    "Close Minecraft first before changing the game files "
+                    "location.", parent=d)
+                return True
+            if ui.get("busy"):
+                messagebox.showwarning(
+                    "Operation in progress",
+                    "Wait for the current preparation task to finish before "
+                    "changing the game files location.", parent=d)
+                return True
+            if _mc_running():
+                messagebox.showwarning(
+                    "Minecraft is running",
+                    "Close Minecraft first before changing the game files "
+                    "location.", parent=d)
+                return True
+            return False
+
+        def do_browse():
+            if _relocate_blocked():
+                return
+            from tkinter import messagebox as mb
+
+            # Check if relocation is allowed (BOL_HOME not externally set)
+            if not is_relocation_allowed():
+                mb.showerror(
+                    "Relocation disabled",
+                    "BOL_HOME is set in the environment. The location cannot be changed via the GUI.",
+                    parent=d
+                )
+                return
+
+            # Try Zenity first (modern GTK dialog)
+            chosen = None
+            try:
+                result = subprocess.run(
+                    ["zenity", "--file-selection", "--directory",
+                     "--title=Choose a folder for BedrockOnLinux's files"],
+                    capture_output=True, text=True, check=False
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    chosen = result.stdout.strip()
+                else:
+                    # User cancelled or error – just return
+                    return
+            except FileNotFoundError:
+                # Zenity not installed – fallback to Tkinter
+                from tkinter import filedialog
+                chosen = filedialog.askdirectory(
+                    parent=d, title="Choose a folder for BedrockOnLinux's files",
+                    mustexist=False
+                )
+            except subprocess.SubprocessError:
+                # Other subprocess error – fallback to Tkinter
+                from tkinter import filedialog
+                chosen = filedialog.askdirectory(
+                    parent=d, title="Choose a folder for BedrockOnLinux's files",
+                    mustexist=False
+                )
+
+            if not chosen:
+                return
+                
+            old_dir = Path(get_install_location())
+            new_dir = Path(chosen).expanduser()
+            if paths_overlap(old_dir, new_dir):
+                if old_dir.resolve() == new_dir.resolve():
+                    return
+                mb.showerror(
+                    "Invalid location",
+                    "The new location can't be inside the current location "
+                    "(or the other way around). Choose a separate folder.",
+                    parent=d
+                )
+                return
+
+            # ===== WARNING + EXPLANATION =====
+            warning_msg = (
+                f"🔧 Game Location Change\n\n"
+                f"Current location: {old_dir}\n"
+                f"New location:     {new_dir}\n\n"
+                f"✅ Your worlds, saves, settings, and login tokens will be **moved** to the new location.\n\n"
+                f"⚠️ The game engine will be **re‑downloaded** to ensure compatibility with the current launcher version.\n\n"
+                f"💡 This preserves your progress and prevents hash‑mismatch errors.\n\n"
+                f"Proceed with relocation?"
+            )
+
+            if not mb.askyesno("Confirm Relocation", warning_msg, parent=d, icon='info'):
+                return
+
+            # ===== Check if new location already has data =====
+            # We need to check for the presence of any of the items we'll move.
+            existing_data = False
+            for item in DIRS_TO_MOVE + FILES_TO_MOVE:
+                if (new_dir / item).exists():
+                    existing_data = True
+                    break
+            if existing_data:
+                if not mb.askyesno(
+                    "Existing data detected",
+                    "The new location already contains some user data folders or files.\n\n"
+                    "Proceeding will move your current data there, overwriting any existing\n"
+                    "folders with the same name (they will be backed up with a .old suffix).\n\n"
+                    "Do you want to continue?",
+                    parent=d,
+                    icon='warning'
+                ):
+                    return
+
+            # ===== Calculate total size of data to move =====
+            total_size = 0
+            for sub in DIRS_TO_MOVE:
+                src = old_dir / sub
+                if src.exists() and not src.is_symlink():
+                    for f in src.rglob('*'):
+                        if f.is_file():
+                            total_size += f.stat().st_size
+            for fname in FILES_TO_MOVE:
+                settings_src = old_dir / fname
+                if settings_src.exists() and settings_src.is_file():
+                    total_size += settings_src.stat().st_size
+
+            # ===== Check free space on new location =====
+            new_path = new_dir if new_dir.exists() else new_dir.parent
+            try:
+                free_space = shutil.disk_usage(new_path).free
+            except Exception as e:
+                mb.showerror(
+                    "Could not check free space",
+                    f"Unable to determine free space on {new_path}:\n{e}",
+                    parent=d
+                )
+                return
+
+            if total_size > free_space:
+                mb.showerror(
+                    "Not enough free space",
+                    f"The new location has {fmt_size(free_space)} free, "
+                    f"but you need {fmt_size(total_size)} to move your user data.\n\n"
+                    "Please free up space or choose a different location.",
+                    parent=d
+                )
+                return
+
+            # ===== Set busy state and acquire lock =====
+            ui["busy"] = True
+            loc_status.set("Moving user data…")
+
+            def work():
+                try:
+                    migrate_data(old_dir, new_dir)
+                    msg = (
+                        "✅ User data moved successfully.\n\n"
+                        "The game engine will be re‑downloaded on the next start.\n"
+                        "Your worlds, settings, and login are preserved.\n\n"
+                        "The launcher will now restart."
+                    )
+                    ok_flag = True
+                except RelocationError as e:
+                    msg = f"❌ Could not relocate user data:\n{e}"
+                    ok_flag = False
+                except Exception as e:
+                    # Anything unexpected (migrate_data already rolled back
+                    # and restored the pointer on its own known failure
+                    # paths, but this is a defensive catch-all so busy
+                    # state below is always cleared regardless).
+                    msg = f"❌ Could not relocate user data:\n{e}"
+                    ok_flag = False
+                finally:
+                    # Release busy state
+                    ui["busy"] = False
+                    def finish():
+                        loc_status.set("")
+                        if ok_flag:
+                            loc_var.set(str(new_dir))
+                            _update_loc_display()
+                            # Force restart immediately
+                            mb.showinfo("Relocation Successful", msg, parent=d)
+                            relaunch_app()
+                        else:
+                            mb.showerror("Relocation Error", msg, parent=d)
+                    d.after(0, finish)
+
+            # Run the work inside a prefix lock. If acquiring the lock
+            # itself fails (contention, timeout, etc.) work() never
+            # runs, so its own finally-block never fires either -- make
+            # sure busy state is cleared here too, or a lock failure
+            # would leave the UI permanently stuck in "busy".
+            def locked_work():
+                try:
+                    with prefix_operation_lock("relocate user data"):
+                        work()
+                except Exception as e:
+                    err_msg = str(e)  # ← Capture the error message
+                    if ui.get("busy"):
+                        ui["busy"] = False
+                        def fail():
+                            loc_status.set("")
+                            mb.showerror(
+                                "Relocation Error",
+                                f"Could not start relocation:\n{err_msg}",
+                                parent=d)
+                        d.after(0, fail)
+                        
+            threading.Thread(target=locked_work, daemon=False).start()
+            
+        def do_reset():
+            if _relocate_blocked():
+                return
+            from tkinter import messagebox as mb
+            # Check if relocation is allowed
+            if not is_relocation_allowed():
+                mb.showerror(
+                    "Relocation disabled",
+                    "BOL_HOME is set in the environment. The location cannot be reset via the GUI.",
+                    parent=d
+                )
+                return
+            if get_install_location() == default_install_location():
+                return
+            if not mb.askyesno(
+                    "Reset location",
+                    "Reset to the default location "
+                    f"({default_install_location()})?\n\nThis only clears "
+                    "the saved preference — it does not move or delete any "
+                    "files. Restart required.", parent=d):
+                return
+            clear_install_location()
+            loc_var.set(default_install_location())
+            _update_loc_display()
+            # Force restart
+            mb.showinfo("Reset Complete", "Location reset to default. The launcher will now restart.")
+            relaunch_app()
+
+        loc_btns = ctk.CTkFrame(loc_row, fg_color="transparent")
+        loc_btns.pack(side="right")
+        mkbtn(loc_btns, "Browse…", do_browse, kind="ghost", width=84,
+              height=36, font=font(12)).pack(side="left", padx=(0, 4))
+        mkbtn(loc_btns, "Reset", do_reset, kind="flat", width=64,
+              height=36, font=font(12)).pack(side="left")
+
+        ctk.CTkLabel(tab_advanced, textvariable=loc_status,
+                     text_color=T.GOLD, font=font(11)
+                     ).pack(anchor="w", pady=(4, 8), padx=4)
         
         # ---- Tools --------------------------------------------------
         imp_status = tk.StringVar(value="")

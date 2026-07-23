@@ -9,7 +9,35 @@ PRETTY = "BedrockOnLinux"
 VERSION = "2.0.0"
 
 HOME = Path.home()
-DATA = Path(os.environ.get("BOL_HOME", HOME / ".local/share" / APP))
+
+# The app's data directory is itself relocatable (e.g. to a drive with
+# more free space). BOL_HOME always wins if set. Otherwise, a small
+# pointer file at a fixed, never-moving location can record a
+# user-chosen location (set via Settings -> Advanced -> "Game files
+# location" in the GUI). This has to be read here, before DATA is
+# computed below -- nothing later can move DATA retroactively once
+# other modules have already imported it.
+INSTALL_LOCATION_FILE = HOME / ".config" / APP / "install_location"
+
+# Resolve DATA:
+# 1. If BOL_HOME is set in the environment, use it (highest priority).
+# 2. Otherwise, if the pointer file exists, read its content and use that.
+# 3. Otherwise, fall back to the default.
+if "BOL_HOME" in os.environ:
+    _data_path = os.environ["BOL_HOME"]
+elif INSTALL_LOCATION_FILE.exists():
+    try:
+        _custom_home = INSTALL_LOCATION_FILE.read_text(encoding="utf-8").strip()
+        if _custom_home:
+            _data_path = _custom_home
+        else:
+            _data_path = str(HOME / ".local/share" / APP)
+    except OSError:
+        _data_path = str(HOME / ".local/share" / APP)
+else:
+    _data_path = str(HOME / ".local/share" / APP)
+
+DATA = Path(_data_path)
 PROTON_DIR = DATA / "proton"
 UMU_DIR = DATA / "umu"
 COMPAT = DATA / "compatdata"
@@ -82,3 +110,35 @@ WINEGDK_ARCHIVE_SHA256 = "4c0b8b0f147b38bf4e34cef68ecda35172fc1728b43bf604d3554c
 WINEGDK_PREFIX_SHA256 = "bbb249a999bc6000c0cf0cb2654382cb4e0988a6c2424cb1f12d8d2aa90810c6"
 
 SELF_REPO = WINEGDK_PREBUILT_REPO
+
+def get_install_location() -> str:
+    """Where the app's data directory currently resolves to."""
+    return str(DATA)
+
+def default_install_location() -> str:
+    """The location used when no custom install location is set."""
+    return str(HOME / ".local/share" / APP)
+
+def set_install_location(path) -> None:
+    """Persist a custom data-directory location for future runs.
+
+    Raises RuntimeError if BOL_HOME is set externally (relocation disabled).
+    """
+    if "BOL_HOME" in os.environ:
+        raise RuntimeError("Cannot change location when BOL_HOME is set externally")
+    INSTALL_LOCATION_FILE.parent.mkdir(parents=True, exist_ok=True)
+    INSTALL_LOCATION_FILE.write_text(
+        str(Path(path).expanduser()), encoding="utf-8")
+
+def clear_install_location() -> None:
+    """Revert to the default location.
+
+    Raises RuntimeError if BOL_HOME is set externally (relocation disabled).
+    """
+    if "BOL_HOME" in os.environ:
+        raise RuntimeError("Cannot change location when BOL_HOME is set externally")
+    INSTALL_LOCATION_FILE.unlink(missing_ok=True)
+
+def is_relocation_allowed() -> bool:
+    """Return True if the data directory can be relocated via the GUI."""
+    return "BOL_HOME" not in os.environ
