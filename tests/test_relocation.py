@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: MIT
 """Tests for the data directory relocation feature."""
 import json
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -94,6 +95,21 @@ def _make_user_data(base: Path, version="1.21.0"):
     return games_dir
 
 
+def _make_user_data_with_internal_content_symlink(base: Path, version="1.21.0"):
+    """Same as _make_user_data, but "content" is a symlink pointing
+    inside the games dir (e.g. content -> games/<version>/resource_packs)
+    instead of a real directory."""
+    games_dir = _make_user_data(base, version)
+    internal_target = games_dir / "resource_packs"
+    internal_target.mkdir()
+    (internal_target / "pack.mcpack").write_text("internal pack")
+
+    content_link = base / "content"
+    shutil.rmtree(content_link)
+    content_link.symlink_to(internal_target)
+    return games_dir
+
+
 # ===== paths_overlap =====
 
 def test_paths_overlap_same_dir(tmp_path):
@@ -147,7 +163,6 @@ def test_migration_full_workflow(tmp_path, monkeypatch):
     new_dir = tmp_path / "new_data"
     migrate_data(old_dir, new_dir)
 
-    # Data actually moved
     new_games_dir = new_dir / "games" / games_dir.name
     assert (new_games_dir / "Minecraft.Windows.exe").exists()
     assert (new_games_dir / "test.txt").read_text() == "game file"
@@ -155,16 +170,12 @@ def test_migration_full_workflow(tmp_path, monkeypatch):
     assert (new_dir / "content" / "test.txt").read_text() == "content file"
     assert (new_dir / "msa" / "token.json").read_text() == '{"token": "test"}'
 
-    # settings.json moved and game_dir re-anchored to the *exact*
-    # relocated folder (not just "games")
     settings = json.loads((new_dir / "settings.json").read_text())
     assert settings["game_dir"] == str(new_games_dir.resolve())
     assert settings["other"] == "value"
 
-    # Old location no longer has the moved items
     assert not (old_dir / "games").exists()
 
-    # Install location pointer updated
     assert config.get_install_location() == str(config.DATA)  # sanity: importable
     assert config.INSTALL_LOCATION_FILE.read_text().strip() == str(new_dir)
 
@@ -198,24 +209,16 @@ def test_migration_recreates_content_symlink(tmp_path, monkeypatch):
 
 
 def test_migration_recreates_content_symlink_pointing_inside_old_dir(tmp_path, monkeypatch):
-    """Covers content symlinked to somewhere INSIDE old_dir (e.g.
-    content -> games/<version>/resource_packs). That target moves along
-    with everything else, so the recreated link must be re-anchored
-    under new_dir instead of kept pointing at the now-gone old path."""
+    """Covers content symlinked to somewhere INSIDE old_dir. That target
+    moves along with everything else, so the recreated link must be
+    re-anchored under new_dir instead of kept pointing at the now-gone
+    old path."""
     monkeypatch.setattr(
         config, "INSTALL_LOCATION_FILE",
         tmp_path / ".config" / "bedrock-on-linux" / "install_location")
     old_dir = tmp_path / "old_data"
     old_dir.mkdir()
-    games_dir = _make_user_data(old_dir)
-
-    internal_target = games_dir / "resource_packs"
-    internal_target.mkdir()
-    (internal_target / "pack.mcpack").write_text("internal pack")
-
-    content_link = old_dir / "content"
-    shutil.rmtree(content_link)
-    content_link.symlink_to(internal_target)
+    games_dir = _make_user_data_with_internal_content_symlink(old_dir)
 
     new_dir = tmp_path / "new_data"
     migrate_data(old_dir, new_dir)
@@ -245,14 +248,12 @@ def test_migration_rollback_on_failure(tmp_path, monkeypatch):
     with pytest.raises(RelocationError):
         migrate_data(old_dir, new_dir)
 
-    # Everything should be back where it started
     assert (old_dir / "games").exists()
     assert (old_dir / "compatdata" / "pfx" / "test.txt").read_text() == "prefix file"
     assert (old_dir / "content" / "test.txt").read_text() == "content file"
     assert (old_dir / "msa" / "token.json").exists()
     assert (old_dir / "settings.json").exists()
 
-    # Pointer restored to the old location
     assert config.INSTALL_LOCATION_FILE.read_text().strip() == str(old_dir)
 
 
@@ -269,8 +270,6 @@ def test_migration_rollback_restores_backup_when_source_move_fails(tmp_path, mon
 
     new_dir = tmp_path / "new_data"
     new_dir.mkdir()
-    # Pre-populate the destination "games" folder so _move_item has to
-    # back it up (.old) before attempting the source move.
     existing_games = new_dir / "games"
     existing_games.mkdir(parents=True)
     (existing_games / "marker.txt").write_text("pre-existing destination data")
@@ -280,9 +279,6 @@ def test_migration_rollback_restores_backup_when_source_move_fails(tmp_path, mon
 
     def flaky_move(src, dst, *a, **kw):
         call_count["n"] += 1
-        # Call 1 = backup of the pre-existing "games" -> "games.old".
-        # Call 2 = the actual src -> dst move for "games" -- fail here,
-        # *after* the backup has already succeeded.
         if call_count["n"] == 2:
             raise RuntimeError("simulated mid-move failure")
         return real_move(src, dst, *a, **kw)
@@ -292,10 +288,89 @@ def test_migration_rollback_restores_backup_when_source_move_fails(tmp_path, mon
     with pytest.raises(RelocationError):
         migrate_data(old_dir, new_dir)
 
-    # Pre-existing destination data must be restored, not stranded in
-    # "games.old".
     assert (new_dir / "games" / "marker.txt").read_text() == "pre-existing destination data"
     assert not (new_dir / "games.old").exists()
-    # Source data untouched.
     assert (old_dir / "games").exists()
+    assert config.INSTALL_LOCATION_FILE.read_text().strip() == str(old_dir)
+
+
+# ===== failures during the rewrite/recreate steps must be fatal =====
+
+def test_rewrite_game_dir_raises_on_invalid_json(tmp_path):
+    """_rewrite_game_dir must propagate real I/O/parse errors instead of
+    swallowing them -- a corrupt settings.json is not a "success"."""
+    new_dir = tmp_path / "new_data"
+    new_dir.mkdir()
+    (new_dir / "settings.json").write_text("not valid json{")
+
+    with pytest.raises(json.JSONDecodeError):
+        relocation._rewrite_game_dir(new_dir, tmp_path / "old_games")
+
+
+def test_migration_rollback_when_symlink_recreation_fails(tmp_path, monkeypatch):
+    """A failure while recreating the content symlink must abort and
+    roll back the whole migration, not be swallowed and reported as a
+    successful migration."""
+    monkeypatch.setattr(
+        config, "INSTALL_LOCATION_FILE",
+        tmp_path / ".config" / "bedrock-on-linux" / "install_location")
+    old_dir = tmp_path / "old_data"
+    old_dir.mkdir()
+    _make_user_data_with_internal_content_symlink(old_dir)
+
+    new_dir = tmp_path / "new_data"
+
+    def boom(*a, **kw):
+        raise OSError("simulated symlink failure")
+
+    monkeypatch.setattr(relocation, "_recreate_content_symlink", boom)
+
+    with pytest.raises(RelocationError):
+        migrate_data(old_dir, new_dir)
+
+    assert (old_dir / "games").exists()
+    assert (old_dir / "content").is_symlink()
+    assert config.INSTALL_LOCATION_FILE.read_text().strip() == str(old_dir)
+
+
+def test_migration_restores_settings_and_symlink_when_pointer_write_fails(tmp_path, monkeypatch):
+    """The exact scenario Wyze3306 flagged: settings.json and the
+    content symlink have ALREADY been successfully rewritten/recreated
+    at new_dir, and only the final pointer write (set_install_location)
+    fails. _rollback() alone would move the *rewritten* files back --
+    this verifies the original, pre-relocation game_dir and symlink
+    target are what's actually restored at old_dir."""
+    monkeypatch.setattr(
+        config, "INSTALL_LOCATION_FILE",
+        tmp_path / ".config" / "bedrock-on-linux" / "install_location")
+    old_dir = tmp_path / "old_data"
+    old_dir.mkdir()
+    _make_user_data_with_internal_content_symlink(old_dir)
+
+    original_game_dir = json.loads((old_dir / "settings.json").read_text())["game_dir"]
+    original_link_target = os.readlink(str(old_dir / "content"))
+
+    new_dir = tmp_path / "new_data"
+
+    def boom(*a, **kw):
+        raise RuntimeError("simulated pointer write failure")
+
+    # set_install_location is called last, after the real
+    # _rewrite_game_dir and _recreate_content_symlink have already run
+    # and mutated new_dir's copies successfully.
+    monkeypatch.setattr(relocation, "set_install_location", boom)
+
+    with pytest.raises(RelocationError):
+        migrate_data(old_dir, new_dir)
+
+    # settings.json back at old_dir must have the ORIGINAL game_dir,
+    # not the rewritten new_dir-pointing one.
+    restored_settings = json.loads((old_dir / "settings.json").read_text())
+    assert restored_settings["game_dir"] == original_game_dir
+
+    # content symlink back at old_dir must point at its ORIGINAL
+    # target, not the re-anchored new_dir one.
+    assert os.readlink(str(old_dir / "content")) == original_link_target
+    assert (old_dir / "content" / "pack.mcpack").read_text() == "internal pack"
+
     assert config.INSTALL_LOCATION_FILE.read_text().strip() == str(old_dir)
