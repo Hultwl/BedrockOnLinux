@@ -141,9 +141,9 @@ def test_paths_overlap_unrelated_dirs(tmp_path):
 
 
 def test_migrate_data_rejects_overlap(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        config, "INSTALL_LOCATION_FILE",
-        tmp_path / ".config" / "bedrock-on-linux" / "install_location")
+    install_file = tmp_path / ".config" / "bedrock-on-linux" / "install_location"
+    monkeypatch.setattr(config, "INSTALL_LOCATION_FILE", install_file)
+    monkeypatch.setattr(relocation, "INSTALL_LOCATION_FILE", install_file)
     old_dir = tmp_path / "data"
     old_dir.mkdir()
     with pytest.raises(RelocationError):
@@ -153,9 +153,10 @@ def test_migrate_data_rejects_overlap(tmp_path, monkeypatch):
 # ===== end-to-end migration test (calls the real production code) =====
 
 def test_migration_full_workflow(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        config, "INSTALL_LOCATION_FILE",
-        tmp_path / ".config" / "bedrock-on-linux" / "install_location")
+    install_file = tmp_path / ".config" / "bedrock-on-linux" / "install_location"
+    monkeypatch.setattr(config, "INSTALL_LOCATION_FILE", install_file)
+    monkeypatch.setattr(relocation, "INSTALL_LOCATION_FILE", install_file)
+
     old_dir = tmp_path / "old_data"
     old_dir.mkdir()
     games_dir = _make_user_data(old_dir)
@@ -177,17 +178,14 @@ def test_migration_full_workflow(tmp_path, monkeypatch):
     assert not (old_dir / "games").exists()
 
     assert config.get_install_location() == str(config.DATA)  # sanity: importable
-    assert config.INSTALL_LOCATION_FILE.read_text().strip() == str(new_dir)
+    assert install_file.read_text().strip() == str(new_dir)
 
 
 def test_migration_recreates_content_symlink(tmp_path, monkeypatch):
-    """Covers content symlinked to something OUTSIDE old_dir (e.g.
-    imported content kept on a separate drive) -- target is untouched
-    by the move, so the recreated link should point at the exact same
-    external path."""
-    monkeypatch.setattr(
-        config, "INSTALL_LOCATION_FILE",
-        tmp_path / ".config" / "bedrock-on-linux" / "install_location")
+    install_file = tmp_path / ".config" / "bedrock-on-linux" / "install_location"
+    monkeypatch.setattr(config, "INSTALL_LOCATION_FILE", install_file)
+    monkeypatch.setattr(relocation, "INSTALL_LOCATION_FILE", install_file)
+
     old_dir = tmp_path / "old_data"
     old_dir.mkdir()
     _make_user_data(old_dir)
@@ -209,13 +207,10 @@ def test_migration_recreates_content_symlink(tmp_path, monkeypatch):
 
 
 def test_migration_recreates_content_symlink_pointing_inside_old_dir(tmp_path, monkeypatch):
-    """Covers content symlinked to somewhere INSIDE old_dir. That target
-    moves along with everything else, so the recreated link must be
-    re-anchored under new_dir instead of kept pointing at the now-gone
-    old path."""
-    monkeypatch.setattr(
-        config, "INSTALL_LOCATION_FILE",
-        tmp_path / ".config" / "bedrock-on-linux" / "install_location")
+    install_file = tmp_path / ".config" / "bedrock-on-linux" / "install_location"
+    monkeypatch.setattr(config, "INSTALL_LOCATION_FILE", install_file)
+    monkeypatch.setattr(relocation, "INSTALL_LOCATION_FILE", install_file)
+
     old_dir = tmp_path / "old_data"
     old_dir.mkdir()
     games_dir = _make_user_data_with_internal_content_symlink(old_dir)
@@ -231,9 +226,10 @@ def test_migration_recreates_content_symlink_pointing_inside_old_dir(tmp_path, m
 
 
 def test_migration_rollback_on_failure(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        config, "INSTALL_LOCATION_FILE",
-        tmp_path / ".config" / "bedrock-on-linux" / "install_location")
+    install_file = tmp_path / ".config" / "bedrock-on-linux" / "install_location"
+    monkeypatch.setattr(config, "INSTALL_LOCATION_FILE", install_file)
+    monkeypatch.setattr(relocation, "INSTALL_LOCATION_FILE", install_file)
+
     old_dir = tmp_path / "old_data"
     old_dir.mkdir()
     _make_user_data(old_dir)
@@ -254,16 +250,14 @@ def test_migration_rollback_on_failure(tmp_path, monkeypatch):
     assert (old_dir / "msa" / "token.json").exists()
     assert (old_dir / "settings.json").exists()
 
-    assert config.INSTALL_LOCATION_FILE.read_text().strip() == str(old_dir)
+    assert install_file.read_text().strip() == str(old_dir)
 
 
 def test_migration_rollback_restores_backup_when_source_move_fails(tmp_path, monkeypatch):
-    """If a pre-existing destination folder is backed up to '.old' and
-    THEN the source move fails, the backup must be restored -- not left
-    stranded under 'games.old' forever."""
-    monkeypatch.setattr(
-        config, "INSTALL_LOCATION_FILE",
-        tmp_path / ".config" / "bedrock-on-linux" / "install_location")
+    install_file = tmp_path / ".config" / "bedrock-on-linux" / "install_location"
+    monkeypatch.setattr(config, "INSTALL_LOCATION_FILE", install_file)
+    monkeypatch.setattr(relocation, "INSTALL_LOCATION_FILE", install_file)
+
     old_dir = tmp_path / "old_data"
     old_dir.mkdir()
     _make_user_data(old_dir)
@@ -291,7 +285,7 @@ def test_migration_rollback_restores_backup_when_source_move_fails(tmp_path, mon
     assert (new_dir / "games" / "marker.txt").read_text() == "pre-existing destination data"
     assert not (new_dir / "games.old").exists()
     assert (old_dir / "games").exists()
-    assert config.INSTALL_LOCATION_FILE.read_text().strip() == str(old_dir)
+    assert install_file.read_text().strip() == str(old_dir)
 
 
 # ===== failures during the rewrite/recreate steps must be fatal =====
@@ -308,12 +302,10 @@ def test_rewrite_game_dir_raises_on_invalid_json(tmp_path):
 
 
 def test_migration_rollback_when_symlink_recreation_fails(tmp_path, monkeypatch):
-    """A failure while recreating the content symlink must abort and
-    roll back the whole migration, not be swallowed and reported as a
-    successful migration."""
-    monkeypatch.setattr(
-        config, "INSTALL_LOCATION_FILE",
-        tmp_path / ".config" / "bedrock-on-linux" / "install_location")
+    install_file = tmp_path / ".config" / "bedrock-on-linux" / "install_location"
+    monkeypatch.setattr(config, "INSTALL_LOCATION_FILE", install_file)
+    monkeypatch.setattr(relocation, "INSTALL_LOCATION_FILE", install_file)
+
     old_dir = tmp_path / "old_data"
     old_dir.mkdir()
     _make_user_data_with_internal_content_symlink(old_dir)
@@ -330,7 +322,7 @@ def test_migration_rollback_when_symlink_recreation_fails(tmp_path, monkeypatch)
 
     assert (old_dir / "games").exists()
     assert (old_dir / "content").is_symlink()
-    assert config.INSTALL_LOCATION_FILE.read_text().strip() == str(old_dir)
+    assert install_file.read_text().strip() == str(old_dir)
 
 
 def test_migration_restores_settings_and_symlink_when_pointer_write_fails(tmp_path, monkeypatch):
@@ -340,9 +332,10 @@ def test_migration_restores_settings_and_symlink_when_pointer_write_fails(tmp_pa
     fails. _rollback() alone would move the *rewritten* files back --
     this verifies the original, pre-relocation game_dir and symlink
     target are what's actually restored at old_dir."""
-    monkeypatch.setattr(
-        config, "INSTALL_LOCATION_FILE",
-        tmp_path / ".config" / "bedrock-on-linux" / "install_location")
+    install_file = tmp_path / ".config" / "bedrock-on-linux" / "install_location"
+    monkeypatch.setattr(config, "INSTALL_LOCATION_FILE", install_file)
+    monkeypatch.setattr(relocation, "INSTALL_LOCATION_FILE", install_file)  # <-- CRITICAL
+
     old_dir = tmp_path / "old_data"
     old_dir.mkdir()
     _make_user_data_with_internal_content_symlink(old_dir)
@@ -355,9 +348,6 @@ def test_migration_restores_settings_and_symlink_when_pointer_write_fails(tmp_pa
     def boom(*a, **kw):
         raise RuntimeError("simulated pointer write failure")
 
-    # set_install_location is called last, after the real
-    # _rewrite_game_dir and _recreate_content_symlink have already run
-    # and mutated new_dir's copies successfully.
     monkeypatch.setattr(relocation, "set_install_location", boom)
 
     with pytest.raises(RelocationError):
@@ -373,4 +363,4 @@ def test_migration_restores_settings_and_symlink_when_pointer_write_fails(tmp_pa
     assert os.readlink(str(old_dir / "content")) == original_link_target
     assert (old_dir / "content" / "pack.mcpack").read_text() == "internal pack"
 
-    assert config.INSTALL_LOCATION_FILE.read_text().strip() == str(old_dir)
+    assert install_file.read_text().strip() == str(old_dir)
