@@ -1552,7 +1552,6 @@ def gui():
         loc_row.pack(fill="x", pady=(4, 2), padx=4)
 
         loc_status = tk.StringVar(value="")
-        loc_move_v = tk.BooleanVar(value=True)
 
         def _relocate_blocked():
             if ui.get("launch_active"):
@@ -1632,10 +1631,10 @@ def gui():
             if overlap:
                 if not mb.askyesno(
                     "Existing data detected",
-                    f"The new location already contains some user data folders or files.\n\n"
-                    f"Proceeding will move your current data there, overwriting any existing\n"
-                    f"folders with the same name (they will be backed up with a .old suffix).\n\n"
-                    f"Do you want to continue?",
+                    "The new location already contains some user data folders or files.\n\n"
+                    "Proceeding will move your current data there, overwriting any existing\n"
+                    "folders with the same name (they will be backed up with a .old suffix).\n\n"
+                    "Do you want to continue?",
                     parent=d,
                     icon='warning'
                 ):
@@ -1644,8 +1643,6 @@ def gui():
             # ===== Define what to move =====
             # Directories to move (relative to DATA)
             dirs_to_move = ["games", "compatdata/pfx", "content", "msa"]
-            # Files to move (relative to DATA)
-            files_to_move = ["settings.json"]
 
             # ===== Calculate total size of directories to move =====
             total_size = 0
