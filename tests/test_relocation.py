@@ -1,8 +1,8 @@
 # tests/test_relocation.py
 # SPDX-License-Identifier: MIT
 """Tests for the data directory relocation feature."""
-
 import json
+import shutil
 import sys
 from pathlib import Path
 
@@ -12,6 +12,7 @@ if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
 import pytest
+
 from bol import config
 from bol import relocation
 from bol.relocation import migrate_data, paths_overlap, RelocationError
@@ -27,7 +28,6 @@ def test_is_relocation_allowed(monkeypatch):
     """Relocation should be allowed unless BOL_HOME is set."""
     monkeypatch.delenv("BOL_HOME", raising=False)
     assert config.is_relocation_allowed() is True
-
     monkeypatch.setenv("BOL_HOME", "/some/path")
     assert config.is_relocation_allowed() is False
 
@@ -140,13 +140,11 @@ def test_migration_full_workflow(tmp_path, monkeypatch):
     monkeypatch.setattr(
         config, "INSTALL_LOCATION_FILE",
         tmp_path / ".config" / "bedrock-on-linux" / "install_location")
-
     old_dir = tmp_path / "old_data"
     old_dir.mkdir()
     games_dir = _make_user_data(old_dir)
 
     new_dir = tmp_path / "new_data"
-
     migrate_data(old_dir, new_dir)
 
     # Data actually moved
@@ -172,22 +170,21 @@ def test_migration_full_workflow(tmp_path, monkeypatch):
 
 
 def test_migration_recreates_content_symlink(tmp_path, monkeypatch):
+    """Covers content symlinked to something OUTSIDE old_dir (e.g.
+    imported content kept on a separate drive) -- target is untouched
+    by the move, so the recreated link should point at the exact same
+    external path."""
     monkeypatch.setattr(
         config, "INSTALL_LOCATION_FILE",
         tmp_path / ".config" / "bedrock-on-linux" / "install_location")
-
     old_dir = tmp_path / "old_data"
     old_dir.mkdir()
     _make_user_data(old_dir)
 
-    # Replace the real "content" dir with a symlink to an external folder
-    # that isn't part of the migration (e.g. imported content kept on a
-    # separate drive).
     external = tmp_path / "external_content"
     external.mkdir()
     (external / "pack.mcpack").write_text("pack")
     content_link = old_dir / "content"
-    import shutil
     shutil.rmtree(content_link)
     content_link.symlink_to(external)
 
@@ -200,18 +197,46 @@ def test_migration_recreates_content_symlink(tmp_path, monkeypatch):
     assert (new_content / "pack.mcpack").read_text() == "pack"
 
 
+def test_migration_recreates_content_symlink_pointing_inside_old_dir(tmp_path, monkeypatch):
+    """Covers content symlinked to somewhere INSIDE old_dir (e.g.
+    content -> games/<version>/resource_packs). That target moves along
+    with everything else, so the recreated link must be re-anchored
+    under new_dir instead of kept pointing at the now-gone old path."""
+    monkeypatch.setattr(
+        config, "INSTALL_LOCATION_FILE",
+        tmp_path / ".config" / "bedrock-on-linux" / "install_location")
+    old_dir = tmp_path / "old_data"
+    old_dir.mkdir()
+    games_dir = _make_user_data(old_dir)
+
+    internal_target = games_dir / "resource_packs"
+    internal_target.mkdir()
+    (internal_target / "pack.mcpack").write_text("internal pack")
+
+    content_link = old_dir / "content"
+    shutil.rmtree(content_link)
+    content_link.symlink_to(internal_target)
+
+    new_dir = tmp_path / "new_data"
+    migrate_data(old_dir, new_dir)
+
+    new_content = new_dir / "content"
+    expected_target = new_dir / "games" / games_dir.name / "resource_packs"
+    assert new_content.is_symlink()
+    assert new_content.resolve() == expected_target.resolve()
+    assert (new_content / "pack.mcpack").read_text() == "internal pack"
+
+
 def test_migration_rollback_on_failure(tmp_path, monkeypatch):
     monkeypatch.setattr(
         config, "INSTALL_LOCATION_FILE",
         tmp_path / ".config" / "bedrock-on-linux" / "install_location")
-
     old_dir = tmp_path / "old_data"
     old_dir.mkdir()
     _make_user_data(old_dir)
 
     new_dir = tmp_path / "new_data"
 
-    # Force a failure partway through by making _rewrite_game_dir blow up
     def boom(*a, **kw):
         raise RuntimeError("simulated failure")
 
@@ -228,4 +253,49 @@ def test_migration_rollback_on_failure(tmp_path, monkeypatch):
     assert (old_dir / "settings.json").exists()
 
     # Pointer restored to the old location
+    assert config.INSTALL_LOCATION_FILE.read_text().strip() == str(old_dir)
+
+
+def test_migration_rollback_restores_backup_when_source_move_fails(tmp_path, monkeypatch):
+    """If a pre-existing destination folder is backed up to '.old' and
+    THEN the source move fails, the backup must be restored -- not left
+    stranded under 'games.old' forever."""
+    monkeypatch.setattr(
+        config, "INSTALL_LOCATION_FILE",
+        tmp_path / ".config" / "bedrock-on-linux" / "install_location")
+    old_dir = tmp_path / "old_data"
+    old_dir.mkdir()
+    _make_user_data(old_dir)
+
+    new_dir = tmp_path / "new_data"
+    new_dir.mkdir()
+    # Pre-populate the destination "games" folder so _move_item has to
+    # back it up (.old) before attempting the source move.
+    existing_games = new_dir / "games"
+    existing_games.mkdir(parents=True)
+    (existing_games / "marker.txt").write_text("pre-existing destination data")
+
+    real_move = shutil.move
+    call_count = {"n": 0}
+
+    def flaky_move(src, dst, *a, **kw):
+        call_count["n"] += 1
+        # Call 1 = backup of the pre-existing "games" -> "games.old".
+        # Call 2 = the actual src -> dst move for "games" -- fail here,
+        # *after* the backup has already succeeded.
+        if call_count["n"] == 2:
+            raise RuntimeError("simulated mid-move failure")
+        return real_move(src, dst, *a, **kw)
+
+    monkeypatch.setattr(relocation.shutil, "move", flaky_move)
+
+    with pytest.raises(RelocationError):
+        migrate_data(old_dir, new_dir)
+
+    # Pre-existing destination data must be restored, not stranded in
+    # "games.old".
+    assert (new_dir / "games" / "marker.txt").read_text() == "pre-existing destination data"
+    assert not (new_dir / "games.old").exists()
+    # Source data untouched.
+    assert (old_dir / "games").exists()
     assert config.INSTALL_LOCATION_FILE.read_text().strip() == str(old_dir)
