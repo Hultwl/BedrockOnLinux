@@ -28,6 +28,13 @@ from .config import (
     is_relocation_allowed,
     INSTALL_LOCATION_FILE,
 )
+from .relocation import (
+    migrate_data,
+    paths_overlap,
+    RelocationError,
+    DIRS_TO_MOVE,
+    FILES_TO_MOVE,
+)
 from .content import _mojang_dir, import_content
 from .games import list_mc_versions
 from .gamesetup import do_setup
@@ -1623,7 +1630,15 @@ def gui():
                 
             old_dir = Path(get_install_location())
             new_dir = Path(chosen).expanduser()
-            if new_dir == old_dir:
+            if paths_overlap(old_dir, new_dir):
+                if old_dir.resolve() == new_dir.resolve():
+                    return
+                mb.showerror(
+                    "Invalid location",
+                    "The new location can't be inside the current location "
+                    "(or the other way around). Choose a separate folder.",
+                    parent=d
+                )
                 return
 
             # ===== WARNING + EXPLANATION =====
@@ -1642,12 +1657,12 @@ def gui():
 
             # ===== Check if new location already has data =====
             # We need to check for the presence of any of the items we'll move.
-            overlap = False
-            for item in ["games", "compatdata/pfx", "content", "msa", "settings.json"]:
+            existing_data = False
+            for item in DIRS_TO_MOVE + FILES_TO_MOVE:
                 if (new_dir / item).exists():
-                    overlap = True
+                    existing_data = True
                     break
-            if overlap:
+            if existing_data:
                 if not mb.askyesno(
                     "Existing data detected",
                     "The new location already contains some user data folders or files.\n\n"
@@ -1659,22 +1674,18 @@ def gui():
                 ):
                     return
 
-            # ===== Define what to move =====
-            # Directories to move (relative to DATA)
-            dirs_to_move = ["games", "compatdata/pfx", "content", "msa"]
-
-            # ===== Calculate total size of directories to move =====
+            # ===== Calculate total size of data to move =====
             total_size = 0
-            for sub in dirs_to_move:
+            for sub in DIRS_TO_MOVE:
                 src = old_dir / sub
-                if src.exists():
+                if src.exists() and not src.is_symlink():
                     for f in src.rglob('*'):
                         if f.is_file():
                             total_size += f.stat().st_size
-            # Add size of settings.json if exists
-            settings_src = old_dir / "settings.json"
-            if settings_src.exists() and settings_src.is_file():
-                total_size += settings_src.stat().st_size
+            for fname in FILES_TO_MOVE:
+                settings_src = old_dir / fname
+                if settings_src.exists() and settings_src.is_file():
+                    total_size += settings_src.stat().st_size
 
             # ===== Check free space on new location =====
             new_path = new_dir if new_dir.exists() else new_dir.parent
@@ -1703,76 +1714,8 @@ def gui():
             loc_status.set("Moving user data…")
 
             def work():
-                moved_items = []  # For rollback: list of (src, dst, backup_path)
                 try:
-                    # Create the new directory if it doesn't exist
-                    new_dir.mkdir(parents=True, exist_ok=True)
-
-                    # Helper to move a single item (file or dir) with backup
-                    def _move_item(src_path, dst_path):
-                        if not src_path.exists():
-                            return
-                        # If dst exists, rename it to a backup
-                        backup = None
-                        if dst_path.exists():
-                            backup = dst_path.with_suffix(dst_path.suffix + ".old")
-                            # If backup already exists, remove it first (safety)
-                            if backup.exists():
-                                if backup.is_dir():
-                                    shutil.rmtree(backup)
-                                else:
-                                    backup.unlink()
-                            # Rename dst -> backup
-                            shutil.move(str(dst_path), str(backup))
-                        # Now move src -> dst
-                        shutil.move(str(src_path), str(dst_path))
-                        moved_items.append((src_path, dst_path, backup))
-
-                    # Move directories
-                    for sub in dirs_to_move:
-                        src = old_dir / sub
-                        dst = new_dir / sub
-                        _move_item(src, dst)
-
-                    # Move settings.json
-                    src = old_dir / "settings.json"
-                    dst = new_dir / "settings.json"
-                    _move_item(src, dst)
-
-                    # ----- UPDATE SETTINGS.JSON (game_dir) -----
-                    settings_path = new_dir / "settings.json"
-                    if settings_path.exists():
-                        try:
-                            import json
-                            with open(settings_path, "r") as f:
-                                settings_data = json.load(f)
-                            # Update game_dir to a relative path
-                            settings_data["game_dir"] = "games"
-                            with open(settings_path, "w") as f:
-                                json.dump(settings_data, f, indent=2)
-                        except Exception as e:
-                            # Not critical, but log it
-                            log.warn(f"Could not update game_dir in settings.json: {e}")
-
-                    # ----- RE-CREATE CONTENT SYMLINK (if any) -----
-                    old_content = old_dir / "content"
-                    new_content = new_dir / "content"
-                    if old_content.is_symlink():
-                        target = old_content.resolve()
-                        if target.exists():
-                            try:
-                                if new_content.is_symlink() or new_content.exists():
-                                    if new_content.is_dir():
-                                        shutil.rmtree(new_content)
-                                    else:
-                                        new_content.unlink()
-                                new_content.symlink_to(target)
-                            except Exception as e:
-                                log.warn(f"Could not recreate content symlink: {e}")
-
-                    # Update the location pointer
-                    set_install_location(new_dir)
-
+                    migrate_data(old_dir, new_dir)
                     msg = (
                         "✅ User data moved successfully.\n\n"
                         "The game engine will be re‑downloaded on the next start.\n"
@@ -1780,34 +1723,18 @@ def gui():
                         "The launcher will now restart."
                     )
                     ok_flag = True
-
-                except Exception as e:
-                    # Rollback: move everything back
-                    for src, dst, backup in reversed(moved_items):
-                        try:
-                            if dst.exists():
-                                shutil.move(str(dst), str(src))
-                            if backup and backup.exists():
-                                shutil.move(str(backup), str(dst))
-                        except Exception:
-                            pass  # best effort
-
-                    # Restore the pointer file to the old location
-                    try:
-                        set_install_location(old_dir)
-                    except Exception:
-                        # If that fails, at least try to write it directly
-                        try:
-                            INSTALL_LOCATION_FILE.parent.mkdir(parents=True, exist_ok=True)
-                            INSTALL_LOCATION_FILE.write_text(str(old_dir), encoding="utf-8")
-                        except Exception:
-                            pass
-
+                except RelocationError as e:
                     msg = f"❌ Could not relocate user data:\n{e}"
                     ok_flag = False
-
+                except Exception as e:
+                    # Anything unexpected (migrate_data already rolled back
+                    # and restored the pointer on its own known failure
+                    # paths, but this is a defensive catch-all so busy
+                    # state below is always cleared regardless).
+                    msg = f"❌ Could not relocate user data:\n{e}"
+                    ok_flag = False
                 finally:
-                    # Release lock and busy state
+                    # Release busy state
                     ui["busy"] = False
                     def finish():
                         loc_status.set("")
@@ -1821,10 +1748,25 @@ def gui():
                             mb.showerror("Relocation Error", msg, parent=d)
                     d.after(0, finish)
 
-            # Run the work inside a prefix lock
+            # Run the work inside a prefix lock. If acquiring the lock
+            # itself fails (contention, timeout, etc.) work() never
+            # runs, so its own finally-block never fires either -- make
+            # sure busy state is cleared here too, or a lock failure
+            # would leave the UI permanently stuck in "busy".
             def locked_work():
-                with prefix_operation_lock("relocate user data"):
-                    work()
+                try:
+                    with prefix_operation_lock("relocate user data"):
+                        work()
+                except Exception as e:
+                    if ui.get("busy"):
+                        ui["busy"] = False
+                        def fail():
+                            loc_status.set("")
+                            mb.showerror(
+                                "Relocation Error",
+                                f"Could not start relocation:\n{e}",
+                                parent=d)
+                        d.after(0, fail)
             threading.Thread(target=locked_work, daemon=False).start()
             
         def do_reset():
