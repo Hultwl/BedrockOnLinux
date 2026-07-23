@@ -26,6 +26,7 @@ from .config import (
     clear_install_location,
     default_install_location,
     is_relocation_allowed,
+    INSTALL_LOCATION_FILE,
 )
 from .content import _mojang_dir, import_content
 from .games import list_mc_versions
@@ -1745,9 +1746,8 @@ def gui():
                             import json
                             with open(settings_path, "r") as f:
                                 settings_data = json.load(f)
-                            # Update game_dir to point to the new games directory
-                            new_games_dir = str(new_dir / "games")
-                            settings_data["game_dir"] = new_games_dir
+                            # Update game_dir to a relative path
+                            settings_data["game_dir"] = "games"
                             with open(settings_path, "w") as f:
                                 json.dump(settings_data, f, indent=2)
                         except Exception as e:
@@ -1755,19 +1755,23 @@ def gui():
                             log.warn(f"Could not update game_dir in settings.json: {e}")
 
                     # ----- RE-CREATE CONTENT SYMLINK (if any) -----
-                    # The launcher doesn't currently create a symlink for content,
-                    # but if one existed externally, we could recreate it.
-                    # For now, we just check if the new content directory is a symlink
-                    # and point it to the correct place (which it already is after move)
-                    # So we skip this as it's not needed.
+                    old_content = old_dir / "content"
+                    new_content = new_dir / "content"
+                    if old_content.is_symlink():
+                        target = old_content.resolve()
+                        if target.exists():
+                            try:
+                                if new_content.is_symlink() or new_content.exists():
+                                    if new_content.is_dir():
+                                        shutil.rmtree(new_content)
+                                    else:
+                                        new_content.unlink()
+                                new_content.symlink_to(target)
+                            except Exception as e:
+                                log.warn(f"Could not recreate content symlink: {e}")
 
                     # Update the location pointer
                     set_install_location(new_dir)
-
-                    # Validate that DATA now resolves to the new location
-                    import bol.config as cfg
-                    if str(cfg.DATA) != str(new_dir):
-                        raise RuntimeError(f"DATA resolved to {cfg.DATA}, expected {new_dir}")
 
                     msg = (
                         "✅ User data moved successfully.\n\n"
@@ -1781,14 +1785,24 @@ def gui():
                     # Rollback: move everything back
                     for src, dst, backup in reversed(moved_items):
                         try:
-                            # Move dst back to src (undo the move)
                             if dst.exists():
                                 shutil.move(str(dst), str(src))
-                            # If we had a backup, restore it
                             if backup and backup.exists():
                                 shutil.move(str(backup), str(dst))
                         except Exception:
                             pass  # best effort
+
+                    # Restore the pointer file to the old location
+                    try:
+                        set_install_location(old_dir)
+                    except Exception:
+                        # If that fails, at least try to write it directly
+                        try:
+                            INSTALL_LOCATION_FILE.parent.mkdir(parents=True, exist_ok=True)
+                            INSTALL_LOCATION_FILE.write_text(str(old_dir), encoding="utf-8")
+                        except Exception:
+                            pass
+
                     msg = f"❌ Could not relocate user data:\n{e}"
                     ok_flag = False
 
