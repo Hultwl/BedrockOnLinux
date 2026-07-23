@@ -1497,7 +1497,7 @@ def gui():
             padx=12,
         )
         loc_field.pack(side="left", fill="x", expand=True, padx=(0, 4))
-        loc_tip = Tooltip(loc_field, "Full path")  # will update dynamically
+        loc_tip = Tooltip(loc_field, "Full path")
 
         # --- Copy button ---
         def _copy_path():
@@ -1538,13 +1538,11 @@ def gui():
                 loc_free_var.set(
                     f"{fmt_size(shutil.disk_usage(check_p).free)} free "
                     "on this drive")
-                loc_tip.text = loc_var.get()   # update tooltip
+                loc_tip.text = loc_var.get()
             except Exception:
                 loc_free_var.set("")
 
         def _update_loc_display():
-            # No truncation – show full path
-            # If path is very long, the label will wrap or scroll; that's fine.
             _refresh_free_space()
 
         _refresh_free_space()
@@ -1554,6 +1552,7 @@ def gui():
         loc_row.pack(fill="x", pady=(4, 2), padx=4)
 
         loc_status = tk.StringVar(value="")
+        loc_move_v = tk.BooleanVar(value=True)
 
         def _relocate_blocked():
             if ui.get("launch_active"):
@@ -1579,50 +1578,12 @@ def gui():
         def do_browse():
             if _relocate_blocked():
                 return
-            from tkinter import messagebox as mb
-            import subprocess
-
-            chosen = None
-
-            # Try zenity first (GTK native)
-            try:
-                result = subprocess.run(
-                    [
-                        "zenity",
-                        "--file-selection",
-                        "--directory",
-                        "--title=Choose a folder for BedrockOnLinux's files",
-                        f"--filename={str(Path(get_install_location()))}"
-                    ],
-                    capture_output=True,
-                    text=True,
-                    timeout=30
-                )
-                if result.returncode == 0:
-                    chosen = result.stdout.strip()
-                else:
-                    # User cancelled – clean exit, no ugly dialog
-                    return
-            except FileNotFoundError:
-                # Zenity is NOT installed – fallback to Tkinter
-                from tkinter import filedialog
-                chosen = filedialog.askdirectory(
-                    parent=d,
-                    title="Choose a folder for BedrockOnLinux's files",
-                    mustexist=False
-                )
-            except subprocess.SubprocessError:
-                # Some other subprocess error – fallback to Tkinter
-                from tkinter import filedialog
-                chosen = filedialog.askdirectory(
-                    parent=d,
-                    title="Choose a folder for BedrockOnLinux's files",
-                    mustexist=False
-                )
-
+            from tkinter import filedialog, messagebox as mb
+            chosen = filedialog.askdirectory(
+                parent=d, title="Choose a folder for BedrockOnLinux's files",
+                mustexist=False)
             if not chosen:
                 return
-
             old_dir = Path(get_install_location())
             new_dir = Path(chosen).expanduser()
             if new_dir == old_dir:
@@ -1636,40 +1597,49 @@ def gui():
                 f"✅ Your worlds, saves, settings, and login tokens will be **moved** to the new location.\n\n"
                 f"⚠️ The game engine will be **re‑downloaded** to ensure compatibility with the current launcher version.\n\n"
                 f"💡 This preserves your progress and prevents hash‑mismatch errors.\n\n"
-                "Proceed with relocation?"
+                f"Proceed with relocation?"
             )
 
             if not mb.askyesno("Confirm Relocation", warning_msg, parent=d, icon='info'):
                 return
 
             # ===== Check if new location already has data =====
-            if new_dir.exists() and any(new_dir.iterdir()):
-                overlap = False
-                for subdir in ["games", "pfx", "content", "msa"]:
-                    if (new_dir / subdir).exists():
-                        overlap = True
-                        break
-                if overlap:
-                    if not mb.askyesno(
-                        "Existing data detected",
-                        "The new location already contains some user data folders.\n\n"
-                        "Overwriting may cause conflicts. Do you want to continue and overwrite?",
-                        parent=d,
-                        icon='warning'
-                    ):
-                        return
+            # We need to check for the presence of any of the items we'll move.
+            overlap = False
+            for item in ["games", "compatdata/pfx", "content", "msa", "settings.json"]:
+                if (new_dir / item).exists():
+                    overlap = True
+                    break
+            if overlap:
+                if not mb.askyesno(
+                    "Existing data detected",
+                    f"The new location already contains some user data folders or files.\n\n"
+                    f"Proceeding will move your current data there, overwriting any existing\n"
+                    f"folders with the same name (they will be backed up with a .old suffix).\n\n"
+                    f"Do you want to continue?",
+                    parent=d,
+                    icon='warning'
+                ):
+                    return
 
-            # ===== Define which subdirectories are user data (preserve these) =====
-            preserve_dirs = ["games", "pfx", "content", "msa"]
+            # ===== Define what to move =====
+            # Directories to move (relative to DATA)
+            dirs_to_move = ["games", "compatdata/pfx", "content", "msa"]
+            # Files to move (relative to DATA)
+            files_to_move = ["settings.json"]
 
             # ===== Calculate total size of directories to move =====
             total_size = 0
-            for sub in preserve_dirs:
+            for sub in dirs_to_move:
                 src = old_dir / sub
                 if src.exists():
                     for f in src.rglob('*'):
                         if f.is_file():
                             total_size += f.stat().st_size
+            # Add size of settings.json if exists
+            settings_src = old_dir / "settings.json"
+            if settings_src.exists() and settings_src.is_file():
+                total_size += settings_src.stat().st_size
 
             # ===== Check free space on new location =====
             new_path = new_dir if new_dir.exists() else new_dir.parent
@@ -1693,20 +1663,48 @@ def gui():
                 )
                 return
 
+            # ===== Set busy state and acquire lock =====
+            ui["busy"] = True
             loc_status.set("Moving user data…")
 
             def work():
+                moved_items = []  # For rollback: list of (src, dst, backup_path)
                 try:
+                    # Create the new directory if it doesn't exist
                     new_dir.mkdir(parents=True, exist_ok=True)
 
-                    for sub in preserve_dirs:
+                    # Helper to move a single item (file or dir) with backup
+                    def _move_item(src_path, dst_path):
+                        if not src_path.exists():
+                            return
+                        # If dst exists, rename it to a backup
+                        backup = None
+                        if dst_path.exists():
+                            backup = dst_path.with_suffix(dst_path.suffix + ".old")
+                            # If backup already exists, remove it first (safety)
+                            if backup.exists():
+                                if backup.is_dir():
+                                    shutil.rmtree(backup)
+                                else:
+                                    backup.unlink()
+                            # Rename dst -> backup
+                            shutil.move(str(dst_path), str(backup))
+                        # Now move src -> dst
+                        shutil.move(str(src_path), str(dst_path))
+                        moved_items.append((src_path, dst_path, backup))
+
+                    # Move directories
+                    for sub in dirs_to_move:
                         src = old_dir / sub
                         dst = new_dir / sub
-                        if src.exists():
-                            if dst.exists():
-                                shutil.rmtree(dst, ignore_errors=True)
-                            shutil.move(str(src), str(dst))
+                        _move_item(src, dst)
 
+                    # Move settings.json
+                    src = old_dir / "settings.json"
+                    dst = new_dir / "settings.json"
+                    _move_item(src, dst)
+
+                    # Update the location pointer
                     set_install_location(new_dir)
 
                     msg = (
@@ -1718,21 +1716,44 @@ def gui():
                     ok_flag = True
 
                 except Exception as e:
+                    # Rollback: move everything back
+                    for src, dst, backup in reversed(moved_items):
+                        try:
+                            # Move dst back to src (undo the move)
+                            if dst.exists():
+                                shutil.move(str(dst), str(src))
+                            # If we had a backup, restore it
+                            if backup and backup.exists():
+                                # dst might have been moved, but we need to restore backup to dst
+                                # Actually, after rollback of the main item, we restore the backup to dst
+                                # But we already moved dst back to src, so backup is still there
+                                # We should restore backup to dst
+                                shutil.move(str(backup), str(dst))
+                        except Exception:
+                            pass  # best effort
                     msg = f"❌ Could not relocate user data:\n{e}"
                     ok_flag = False
 
-                def finish():
-                    loc_status.set("")
-                    if ok_flag:
-                        loc_var.set(str(new_dir))
-                        _update_loc_display()
-                        if mb.askyesno("Restart now?",
-                                       msg + "\n\nRestart now?", parent=d):
-                            relaunch_app()
-                    else:
-                        mb.showerror("Relocation Error", msg, parent=d)
-                d.after(0, finish)
-            threading.Thread(target=work, daemon=True).start()
+                finally:
+                    # Release lock and busy state
+                    ui["busy"] = False
+                    def finish():
+                        loc_status.set("")
+                        if ok_flag:
+                            loc_var.set(str(new_dir))
+                            _update_loc_display()
+                            if mb.askyesno("Restart now?",
+                                           msg + "\n\nRestart now?", parent=d):
+                                relaunch_app()
+                        else:
+                            mb.showerror("Relocation Error", msg, parent=d)
+                    d.after(0, finish)
+
+            # Run the work inside a prefix lock
+            def locked_work():
+                with prefix_operation_lock("relocate user data"):
+                    work()
+            threading.Thread(target=locked_work, daemon=False).start()
             
         def do_reset():
             if _relocate_blocked():
