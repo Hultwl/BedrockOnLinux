@@ -9,6 +9,7 @@ Advanced) is a thin wrapper that collects a target directory from the
 user and calls migrate_data() on a background thread.
 """
 import json
+import os
 import shutil
 from pathlib import Path
 
@@ -96,6 +97,50 @@ def _rollback(moved_items: list) -> None:
             log.warn(f"Rollback step failed for {src} <- {dst}: {e}")
 
 
+def _restore_original_settings(old_dir: Path, original_bytes) -> None:
+    """After a rollback, put settings.json's original *content* back.
+
+    _rollback() only restores which file lives at old_dir/settings.json
+    -- it doesn't know or care what's inside it. If _rewrite_game_dir
+    already mutated the file in place (pointing game_dir at new_dir)
+    before a later step failed, the moved-back file would still contain
+    that rewritten, now-wrong value unless we explicitly overwrite it
+    with what was there before relocation started.
+    """
+    if original_bytes is None:
+        return
+    try:
+        (old_dir / "settings.json").write_bytes(original_bytes)
+    except Exception as e:
+        log.warn(f"Could not restore original settings.json: {e}")
+
+
+def _restore_original_content_link(old_dir: Path, original_target) -> None:
+    """After a rollback, put the content symlink's original (literal,
+    pre-relocation) target back.
+
+    _recreate_content_symlink() doesn't move the original symlink -- it
+    deletes whatever's at new_dir/content and creates a brand new link
+    with a re-anchored target. If a later step then fails, _rollback()
+    moves that *recreated* link back to old_dir/content, which now
+    points somewhere that only made sense relative to new_dir. This
+    restores the exact original link target captured before anything
+    was touched.
+    """
+    if original_target is None:
+        return
+    old_content = old_dir / "content"
+    try:
+        if old_content.is_symlink() or old_content.exists():
+            if old_content.is_dir() and not old_content.is_symlink():
+                shutil.rmtree(old_content)
+            else:
+                old_content.unlink()
+        old_content.symlink_to(original_target)
+    except Exception as e:
+        log.warn(f"Could not restore original content symlink: {e}")
+
+
 def _rewrite_game_dir(new_dir: Path, old_games_dir: Path) -> None:
     """Update settings.json's game_dir to point at the relocated games
     folder.
@@ -105,31 +150,34 @@ def _rewrite_game_dir(new_dir: Path, old_games_dir: Path) -> None:
     games directory itself -- launch() needs that exact folder. So we
     re-anchor it by preserving its path *relative to* the old games
     directory, rather than collapsing it to "games".
+
+    Any I/O or JSON error here (corrupt file, permission denied, disk
+    full mid-write) is allowed to propagate. migrate_data() must treat
+    that as a fatal relocation failure and roll back -- silently
+    swallowing it here would report success with a stale or corrupted
+    game_dir.
     """
     settings_path = new_dir / "settings.json"
     if not settings_path.exists():
         return
-    try:
-        with open(settings_path, "r") as f:
-            settings_data = json.load(f)
-        old_game_dir = settings_data.get("game_dir")
-        if old_game_dir:
-            try:
-                rel = Path(old_game_dir).resolve().relative_to(
-                    old_games_dir.resolve())
-                settings_data["game_dir"] = str((new_dir / "games" / rel).resolve())
-            except ValueError:
-                # game_dir wasn't under the old games dir (unexpected
-                # layout, e.g. set manually) -- leave it as-is rather
-                # than guess and point launch() at the wrong folder.
-                log.warn(
-                    "game_dir was not under the old games directory; "
-                    "leaving it unchanged")
-        with open(settings_path, "w") as f:
-            json.dump(settings_data, f, indent=2)
-    except Exception as e:
-        # Not fatal to the relocation itself, but worth surfacing.
-        log.warn(f"Could not update game_dir in settings.json: {e}")
+    with open(settings_path, "r") as f:
+        settings_data = json.load(f)
+    old_game_dir = settings_data.get("game_dir")
+    if old_game_dir:
+        try:
+            rel = Path(old_game_dir).resolve().relative_to(
+                old_games_dir.resolve())
+            settings_data["game_dir"] = str((new_dir / "games" / rel).resolve())
+        except ValueError:
+            # game_dir wasn't under the old games dir (unexpected
+            # layout, e.g. set manually) -- leave it as-is rather than
+            # guess. This is a legitimate, non-fatal case, unlike an
+            # I/O or JSON error above.
+            log.warn(
+                "game_dir was not under the old games directory; "
+                "leaving it unchanged")
+    with open(settings_path, "w") as f:
+        json.dump(settings_data, f, indent=2)
 
 
 def _recreate_content_symlink(old_content_target, old_dir: Path, new_dir: Path) -> None:
@@ -146,6 +194,11 @@ def _recreate_content_symlink(old_content_target, old_dir: Path, new_dir: Path) 
     old_content_target must be captured *before* anything is moved --
     once the link itself has been relocated by _move_item, there's
     nothing left at the old path to inspect.
+
+    Any OSError here (unsupported on this filesystem, permission
+    denied, etc.) is allowed to propagate. migrate_data() must treat
+    that as fatal and roll back -- silently swallowing it here would
+    report success with a broken symlink.
     """
     if old_content_target is None:
         return
@@ -156,15 +209,12 @@ def _recreate_content_symlink(old_content_target, old_dir: Path, new_dir: Path) 
         target = new_dir.resolve() / rel
     except ValueError:
         pass  # target isn't under old_dir -- leave it as-is
-    try:
-        if new_content.is_symlink() or new_content.exists():
-            if new_content.is_dir() and not new_content.is_symlink():
-                shutil.rmtree(new_content)
-            else:
-                new_content.unlink()
-        new_content.symlink_to(target)
-    except OSError as e:
-        log.warn(f"Could not recreate content symlink: {e}")
+    if new_content.is_symlink() or new_content.exists():
+        if new_content.is_dir() and not new_content.is_symlink():
+            shutil.rmtree(new_content)
+        else:
+            new_content.unlink()
+    new_content.symlink_to(target)
 
 
 def migrate_data(old_dir, new_dir) -> None:
@@ -172,9 +222,11 @@ def migrate_data(old_dir, new_dir) -> None:
     settings) from old_dir to new_dir, and persist new_dir as the
     install location.
 
-    On any failure, everything moved so far is rolled back and the
-    install location pointer is restored to old_dir, then
-    RelocationError is raised.
+    On any failure, everything moved so far is rolled back, the
+    original settings.json content and content-symlink target are
+    restored (not just "a" settings.json / symlink -- the exact
+    pre-relocation ones), and the install location pointer is restored
+    to old_dir, then RelocationError is raised.
     """
     old_dir = Path(old_dir)
     new_dir = Path(new_dir)
@@ -183,14 +235,25 @@ def migrate_data(old_dir, new_dir) -> None:
             "The new location overlaps with the current location.")
 
     moved_items = []
+
+    # Captured *before* anything is touched. This has to happen up
+    # front, not just before each individual step, because a failure
+    # in ANY later step -- including inside _rewrite_game_dir,
+    # _recreate_content_symlink, or set_install_location itself --
+    # must be fully undoable, not just the plain file-move part.
+    old_content = old_dir / "content"
+    content_target = old_content.resolve() if old_content.is_symlink() else None
+    original_content_link = (
+        os.readlink(str(old_content)) if old_content.is_symlink() else None
+    )
+    settings_src = old_dir / "settings.json"
+    original_settings_bytes = (
+        settings_src.read_bytes() if settings_src.exists() else None
+    )
+    old_games_dir = old_dir / "games"
+
     try:
         new_dir.mkdir(parents=True, exist_ok=True)
-
-        # Capture the "content" symlink's target (if any) before it's
-        # moved out from under us.
-        old_content = old_dir / "content"
-        content_target = old_content.resolve() if old_content.is_symlink() else None
-        old_games_dir = old_dir / "games"
 
         for sub in DIRS_TO_MOVE:
             _move_item(old_dir / sub, new_dir / sub, moved_items)
@@ -202,6 +265,8 @@ def migrate_data(old_dir, new_dir) -> None:
         set_install_location(new_dir)
     except Exception as e:
         _rollback(moved_items)
+        _restore_original_content_link(old_dir, original_content_link)
+        _restore_original_settings(old_dir, original_settings_bytes)
         try:
             set_install_location(old_dir)
         except Exception:
