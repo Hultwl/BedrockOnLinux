@@ -118,3 +118,5 @@ def set_install_location(path) -> None:
 def clear_install_location() -> None:
     """Revert to the default location."""
     INSTALL_LOCATION_FILE.unlink(missing_ok=True)
+    # Also clear the environment variable so the next execv doesn't reuse it.
+    os.environ.pop("BOL_HOME", None)
