@@ -17,31 +17,27 @@ HOME = Path.home()
 # location" in the GUI). This has to be read here, before DATA is
 # computed below -- nothing later can move DATA retroactively once
 # other modules have already imported it.
-#
-# IMPORTANT: we do NOT set os.environ["BOL_HOME"] from the pointer file,
-# because that would persist across execv and cause a second relocation
-# to reuse the old value. Instead we read the pointer file directly when
-# computing DATA, and only honor BOL_HOME if it was set externally.
 INSTALL_LOCATION_FILE = HOME / ".config" / APP / "install_location"
 
-# Resolve DATA with proper precedence:
-# 1) BOL_HOME environment variable (if set externally)
-# 2) content of the pointer file (if it exists)
-# 3) default ~/.local/share/bedrock-on-linux
+# Resolve DATA:
+# 1. If BOL_HOME is set in the environment, use it (highest priority).
+# 2. Otherwise, if the pointer file exists, read its content and use that.
+# 3. Otherwise, fall back to the default.
 if "BOL_HOME" in os.environ:
-    DATA = Path(os.environ["BOL_HOME"])
+    _data_path = os.environ["BOL_HOME"]
 elif INSTALL_LOCATION_FILE.exists():
     try:
         _custom_home = INSTALL_LOCATION_FILE.read_text(encoding="utf-8").strip()
         if _custom_home:
-            DATA = Path(_custom_home)
+            _data_path = _custom_home
         else:
-            DATA = HOME / ".local/share" / APP
+            _data_path = str(HOME / ".local/share" / APP)
     except OSError:
-        DATA = HOME / ".local/share" / APP
+        _data_path = str(HOME / ".local/share" / APP)
 else:
-    DATA = HOME / ".local/share" / APP
+    _data_path = str(HOME / ".local/share" / APP)
 
+DATA = Path(_data_path)
 PROTON_DIR = DATA / "proton"
 UMU_DIR = DATA / "umu"
 COMPAT = DATA / "compatdata"
@@ -52,8 +48,6 @@ CACHE = DATA / "cache"
 LOGS = DATA / "logs"
 MSA_DIR = DATA / "msa"
 SETTINGS = DATA / "settings.json"
-
-# ... (all the repo constants unchanged) ...
 
 GDK_PROTON_REPO = "Weather-OS/GDK-Proton"
 UMU_REPO = "Open-Wine-Components/umu-launcher"
@@ -126,22 +120,25 @@ def default_install_location() -> str:
     return str(HOME / ".local/share" / APP)
 
 def set_install_location(path) -> None:
-    """Persist a custom data-directory location for future runs."""
-    # If BOL_HOME was set externally, we cannot override it.
+    """Persist a custom data-directory location for future runs.
+
+    Raises RuntimeError if BOL_HOME is set externally (relocation disabled).
+    """
     if "BOL_HOME" in os.environ:
-        raise RuntimeError(
-            "Cannot change location while BOL_HOME is set externally. "
-            "Unset BOL_HOME and restart the launcher."
-        )
+        raise RuntimeError("Cannot change location when BOL_HOME is set externally")
     INSTALL_LOCATION_FILE.parent.mkdir(parents=True, exist_ok=True)
     INSTALL_LOCATION_FILE.write_text(
         str(Path(path).expanduser()), encoding="utf-8")
 
 def clear_install_location() -> None:
-    """Revert to the default location."""
+    """Revert to the default location.
+
+    Raises RuntimeError if BOL_HOME is set externally (relocation disabled).
+    """
+    if "BOL_HOME" in os.environ:
+        raise RuntimeError("Cannot change location when BOL_HOME is set externally")
     INSTALL_LOCATION_FILE.unlink(missing_ok=True)
-    # NOTE: we don't need to clear BOL_HOME because we never set it from the pointer.
 
 def is_relocation_allowed() -> bool:
-    """Return True if the user can change the location via the GUI."""
+    """Return True if the data directory can be relocated via the GUI."""
     return "BOL_HOME" not in os.environ
