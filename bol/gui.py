@@ -22,11 +22,9 @@ from .config import (
     PRETTY,
     VERSION,
     get_install_location,
-    set_install_location,
     clear_install_location,
     default_install_location,
     is_relocation_allowed,
-    INSTALL_LOCATION_FILE,
 )
 from .relocation import (
     migrate_data,
@@ -1758,15 +1756,17 @@ def gui():
                     with prefix_operation_lock("relocate user data"):
                         work()
                 except Exception as e:
+                    err_msg = str(e)  # ← Capture the error message
                     if ui.get("busy"):
                         ui["busy"] = False
                         def fail():
                             loc_status.set("")
                             mb.showerror(
                                 "Relocation Error",
-                                f"Could not start relocation:\n{e}",
+                                f"Could not start relocation:\n{err_msg}",
                                 parent=d)
                         d.after(0, fail)
+                        
             threading.Thread(target=locked_work, daemon=False).start()
             
         def do_reset():
