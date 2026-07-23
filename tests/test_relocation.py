@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: MIT
 """Tests for the data directory relocation feature."""
 
+import json
 import sys
 from pathlib import Path
 
@@ -10,9 +11,10 @@ _project_root = Path(__file__).resolve().parent.parent
 if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
-import shutil
 import pytest
 from bol import config
+from bol import relocation
+from bol.relocation import migrate_data, paths_overlap, RelocationError
 
 
 def test_default_install_location():
@@ -67,86 +69,163 @@ def test_get_install_location():
     assert config.get_install_location() == str(config.DATA)
 
 
-# ===== END‑TO‑END MIGRATION / ROLLBACK TEST =====
+# ===== helpers =====
 
-def test_migration_full_workflow(tmp_path):
-    """
-    End‑to‑end test: simulate a full migration of user data and a rollback.
-    """
-    old_data = tmp_path / "old_data"
-    old_data.mkdir()
+def _make_user_data(base: Path, version="1.21.0"):
+    """Populate `base` with a realistic user-data layout."""
+    games_dir = base / "games" / version
+    games_dir.mkdir(parents=True)
+    (games_dir / "Minecraft.Windows.exe").write_text("exe")
+    (games_dir / "test.txt").write_text("game file")
 
-    # Create dummy user data
-    (old_data / "games").mkdir()
-    (old_data / "games" / "test.txt").write_text("game file")
+    (base / "compatdata" / "pfx").mkdir(parents=True)
+    (base / "compatdata" / "pfx" / "test.txt").write_text("prefix file")
 
-    (old_data / "compatdata").mkdir()
-    (old_data / "compatdata" / "pfx").mkdir()
-    (old_data / "compatdata" / "pfx" / "test.txt").write_text("prefix file")
+    (base / "content").mkdir()
+    (base / "content" / "test.txt").write_text("content file")
 
-    (old_data / "content").mkdir()
-    (old_data / "content" / "test.txt").write_text("content file")
+    (base / "msa").mkdir()
+    (base / "msa" / "token.json").write_text('{"token": "test"}')
 
-    (old_data / "msa").mkdir()
-    (old_data / "msa" / "token.json").write_text('{"token": "test"}')
+    (base / "settings.json").write_text(json.dumps({
+        "game_dir": str(games_dir),
+        "other": "value",
+    }))
+    return games_dir
 
-    (old_data / "settings.json").write_text('{"game_dir": "games", "other": "value"}')
 
-    # Create a symlink for content (if it existed)
-    content_link = old_data / "content_symlink"
-    content_link.symlink_to(old_data / "content")
+# ===== paths_overlap =====
 
-    new_data = tmp_path / "new_data"
+def test_paths_overlap_same_dir(tmp_path):
+    a = tmp_path / "data"
+    a.mkdir()
+    assert paths_overlap(a, a) is True
 
-    # Simulate the move (copy of the key parts from do_browse)
-    dirs_to_move = ["games", "compatdata/pfx", "content", "msa"]
-    files_to_move = ["settings.json"]
 
-    # 1. Move
-    new_data.mkdir(parents=True, exist_ok=True)
-    for sub in dirs_to_move:
-        src = old_data / sub
-        dst = new_data / sub
-        if src.exists():
-            shutil.copytree(src, dst)
+def test_paths_overlap_nested_new_inside_old(tmp_path):
+    old_dir = tmp_path / "data"
+    old_dir.mkdir()
+    new_dir = old_dir / "sub" / "deeper"
+    assert paths_overlap(old_dir, new_dir) is True
 
-    for fname in files_to_move:
-        src = old_data / fname
-        dst = new_data / fname
-        if src.exists():
-            shutil.copy2(src, dst)
 
-    # Verify move succeeded
-    assert (new_data / "games").exists()
-    assert (new_data / "games" / "test.txt").read_text() == "game file"
-    assert (new_data / "compatdata" / "pfx").exists()
-    assert (new_data / "compatdata" / "pfx" / "test.txt").read_text() == "prefix file"
-    assert (new_data / "content").exists()
-    assert (new_data / "content" / "test.txt").read_text() == "content file"
-    assert (new_data / "msa").exists()
-    assert (new_data / "msa" / "token.json").read_text() == '{"token": "test"}'
-    assert (new_data / "settings.json").exists()
+def test_paths_overlap_nested_old_inside_new(tmp_path):
+    new_dir = tmp_path / "data"
+    new_dir.mkdir()
+    old_dir = new_dir / "sub"
+    old_dir.mkdir()
+    assert paths_overlap(old_dir, new_dir) is True
 
-    import json
-    with open(new_data / "settings.json") as f:
-        settings = json.load(f)
-    assert settings["game_dir"] == "games"
+
+def test_paths_overlap_unrelated_dirs(tmp_path):
+    a = tmp_path / "old"
+    b = tmp_path / "new"
+    a.mkdir()
+    assert paths_overlap(a, b) is False
+
+
+def test_migrate_data_rejects_overlap(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        config, "INSTALL_LOCATION_FILE",
+        tmp_path / ".config" / "bedrock-on-linux" / "install_location")
+    old_dir = tmp_path / "data"
+    old_dir.mkdir()
+    with pytest.raises(RelocationError):
+        migrate_data(old_dir, old_dir / "nested")
+
+
+# ===== end-to-end migration test (calls the real production code) =====
+
+def test_migration_full_workflow(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        config, "INSTALL_LOCATION_FILE",
+        tmp_path / ".config" / "bedrock-on-linux" / "install_location")
+
+    old_dir = tmp_path / "old_data"
+    old_dir.mkdir()
+    games_dir = _make_user_data(old_dir)
+
+    new_dir = tmp_path / "new_data"
+
+    migrate_data(old_dir, new_dir)
+
+    # Data actually moved
+    new_games_dir = new_dir / "games" / games_dir.name
+    assert (new_games_dir / "Minecraft.Windows.exe").exists()
+    assert (new_games_dir / "test.txt").read_text() == "game file"
+    assert (new_dir / "compatdata" / "pfx" / "test.txt").read_text() == "prefix file"
+    assert (new_dir / "content" / "test.txt").read_text() == "content file"
+    assert (new_dir / "msa" / "token.json").read_text() == '{"token": "test"}'
+
+    # settings.json moved and game_dir re-anchored to the *exact*
+    # relocated folder (not just "games")
+    settings = json.loads((new_dir / "settings.json").read_text())
+    assert settings["game_dir"] == str(new_games_dir.resolve())
     assert settings["other"] == "value"
 
-    # 2. Rollback (simulate failure recovery)
-    for sub in dirs_to_move:
-        src = new_data / sub
-        dst = old_data / sub
-        if src.exists():
-            shutil.copytree(src, dst, dirs_exist_ok=True)
+    # Old location no longer has the moved items
+    assert not (old_dir / "games").exists()
 
-    # Verify rollback restored everything
-    assert (old_data / "games").exists()
-    assert (old_data / "games" / "test.txt").read_text() == "game file"
-    assert (old_data / "compatdata" / "pfx").exists()
-    assert (old_data / "compatdata" / "pfx" / "test.txt").read_text() == "prefix file"
-    assert (old_data / "content").exists()
-    assert (old_data / "content" / "test.txt").read_text() == "content file"
-    assert (old_data / "msa").exists()
-    assert (old_data / "msa" / "token.json").read_text() == '{"token": "test"}'
-    assert (old_data / "settings.json").exists()
+    # Install location pointer updated
+    assert config.get_install_location() == str(config.DATA)  # sanity: importable
+    assert config.INSTALL_LOCATION_FILE.read_text().strip() == str(new_dir)
+
+
+def test_migration_recreates_content_symlink(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        config, "INSTALL_LOCATION_FILE",
+        tmp_path / ".config" / "bedrock-on-linux" / "install_location")
+
+    old_dir = tmp_path / "old_data"
+    old_dir.mkdir()
+    _make_user_data(old_dir)
+
+    # Replace the real "content" dir with a symlink to an external folder
+    # that isn't part of the migration (e.g. imported content kept on a
+    # separate drive).
+    external = tmp_path / "external_content"
+    external.mkdir()
+    (external / "pack.mcpack").write_text("pack")
+    content_link = old_dir / "content"
+    import shutil
+    shutil.rmtree(content_link)
+    content_link.symlink_to(external)
+
+    new_dir = tmp_path / "new_data"
+    migrate_data(old_dir, new_dir)
+
+    new_content = new_dir / "content"
+    assert new_content.is_symlink()
+    assert new_content.resolve() == external.resolve()
+    assert (new_content / "pack.mcpack").read_text() == "pack"
+
+
+def test_migration_rollback_on_failure(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        config, "INSTALL_LOCATION_FILE",
+        tmp_path / ".config" / "bedrock-on-linux" / "install_location")
+
+    old_dir = tmp_path / "old_data"
+    old_dir.mkdir()
+    _make_user_data(old_dir)
+
+    new_dir = tmp_path / "new_data"
+
+    # Force a failure partway through by making _rewrite_game_dir blow up
+    def boom(*a, **kw):
+        raise RuntimeError("simulated failure")
+
+    monkeypatch.setattr(relocation, "_rewrite_game_dir", boom)
+
+    with pytest.raises(RelocationError):
+        migrate_data(old_dir, new_dir)
+
+    # Everything should be back where it started
+    assert (old_dir / "games").exists()
+    assert (old_dir / "compatdata" / "pfx" / "test.txt").read_text() == "prefix file"
+    assert (old_dir / "content" / "test.txt").read_text() == "content file"
+    assert (old_dir / "msa" / "token.json").exists()
+    assert (old_dir / "settings.json").exists()
+
+    # Pointer restored to the old location
+    assert config.INSTALL_LOCATION_FILE.read_text().strip() == str(old_dir)
