@@ -25,6 +25,7 @@ from .config import (
     set_install_location,
     clear_install_location,
     default_install_location,
+    is_relocation_allowed,
 )
 from .content import _mojang_dir, import_content
 from .games import list_mc_versions
@@ -1579,6 +1580,15 @@ def gui():
                 return
             from tkinter import messagebox as mb
 
+            # Check if relocation is allowed (BOL_HOME not externally set)
+            if not is_relocation_allowed():
+                mb.showerror(
+                    "Relocation disabled",
+                    "BOL_HOME is set in the environment. The location cannot be changed via the GUI.",
+                    parent=d
+                )
+                return
+
             # Try Zenity first (modern GTK dialog)
             chosen = None
             try:
@@ -1728,14 +1738,42 @@ def gui():
                     dst = new_dir / "settings.json"
                     _move_item(src, dst)
 
+                    # ----- UPDATE SETTINGS.JSON (game_dir) -----
+                    settings_path = new_dir / "settings.json"
+                    if settings_path.exists():
+                        try:
+                            import json
+                            with open(settings_path, "r") as f:
+                                settings_data = json.load(f)
+                            # Update game_dir to point to the new games directory
+                            new_games_dir = str(new_dir / "games")
+                            settings_data["game_dir"] = new_games_dir
+                            with open(settings_path, "w") as f:
+                                json.dump(settings_data, f, indent=2)
+                        except Exception as e:
+                            # Not critical, but log it
+                            log.warn(f"Could not update game_dir in settings.json: {e}")
+
+                    # ----- RE-CREATE CONTENT SYMLINK (if any) -----
+                    # The launcher doesn't currently create a symlink for content,
+                    # but if one existed externally, we could recreate it.
+                    # For now, we just check if the new content directory is a symlink
+                    # and point it to the correct place (which it already is after move)
+                    # So we skip this as it's not needed.
+
                     # Update the location pointer
                     set_install_location(new_dir)
+
+                    # Validate that DATA now resolves to the new location
+                    import bol.config as cfg
+                    if str(cfg.DATA) != str(new_dir):
+                        raise RuntimeError(f"DATA resolved to {cfg.DATA}, expected {new_dir}")
 
                     msg = (
                         "✅ User data moved successfully.\n\n"
                         "The game engine will be re‑downloaded on the next start.\n"
                         "Your worlds, settings, and login are preserved.\n\n"
-                        "Restart BedrockOnLinux for the changes to take effect."
+                        "The launcher will now restart."
                     )
                     ok_flag = True
 
@@ -1748,10 +1786,6 @@ def gui():
                                 shutil.move(str(dst), str(src))
                             # If we had a backup, restore it
                             if backup and backup.exists():
-                                # dst might have been moved, but we need to restore backup to dst
-                                # Actually, after rollback of the main item, we restore the backup to dst
-                                # But we already moved dst back to src, so backup is still there
-                                # We should restore backup to dst
                                 shutil.move(str(backup), str(dst))
                         except Exception:
                             pass  # best effort
@@ -1766,9 +1800,9 @@ def gui():
                         if ok_flag:
                             loc_var.set(str(new_dir))
                             _update_loc_display()
-                            if mb.askyesno("Restart now?",
-                                           msg + "\n\nRestart now?", parent=d):
-                                relaunch_app()
+                            # Force restart immediately
+                            mb.showinfo("Relocation Successful", msg, parent=d)
+                            relaunch_app()
                         else:
                             mb.showerror("Relocation Error", msg, parent=d)
                     d.after(0, finish)
@@ -1783,6 +1817,14 @@ def gui():
             if _relocate_blocked():
                 return
             from tkinter import messagebox as mb
+            # Check if relocation is allowed
+            if not is_relocation_allowed():
+                mb.showerror(
+                    "Relocation disabled",
+                    "BOL_HOME is set in the environment. The location cannot be reset via the GUI.",
+                    parent=d
+                )
+                return
             if get_install_location() == default_install_location():
                 return
             if not mb.askyesno(
@@ -1795,9 +1837,9 @@ def gui():
             clear_install_location()
             loc_var.set(default_install_location())
             _update_loc_display()
-            if mb.askyesno("Restart now?", "Restart BedrockOnLinux now?",
-                           parent=d):
-                relaunch_app()
+            # Force restart
+            mb.showinfo("Reset Complete", "Location reset to default. The launcher will now restart.")
+            relaunch_app()
 
         loc_btns = ctk.CTkFrame(loc_row, fg_color="transparent")
         loc_btns.pack(side="right")
