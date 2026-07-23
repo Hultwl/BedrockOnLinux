@@ -2480,7 +2480,14 @@ def gui():
             if os.environ.get("APPIMAGE"):
                 os.execv(os.environ["APPIMAGE"], [os.environ["APPIMAGE"], "gui"])
             tgt = os.path.realpath(sys.argv[0] or __file__)
-            os.execv(sys.executable, [sys.executable, tgt, "gui"])
+            if zipfile.is_zipfile(tgt):
+                # Packaged zipapp (.pyz) — safe to re-exec the file directly.
+                os.execv(sys.executable, [sys.executable, tgt, "gui"])
+            # Installed package / venv — re-exec as `-m bol` so relative
+            # imports inside the package resolve correctly. Running the
+            # resolved __main__.py path directly loses package context
+            # and breaks `from .cli import main`.
+            os.execv(sys.executable, [sys.executable, "-m", "bol", "gui"])
         except Exception:
             root.destroy()
 
